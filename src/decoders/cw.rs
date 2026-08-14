@@ -729,6 +729,19 @@ impl Decoder for CwDecoder {
         self.locked
     }
 
+    fn wants_agc(&self) -> bool {
+        // No. This decoder tracks the keying envelope's own peak and floor
+        // and strikes every threshold as a fraction of the span between
+        // them, so it is already indifferent to level — and a block-rate AGC
+        // does not merely fail to help, it actively fights the measurement.
+        // Its gain settles over roughly the same time a dit lasts, so on a
+        // keyed signal it turns down during marks and back up during spaces,
+        // flattening the very on/off contrast the slicer works from.
+        // Measured across 15-28 WPM and 30 down to 8 dB, it cost 2 to 7
+        // points of accuracy everywhere and gained nothing anywhere.
+        false
+    }
+
     fn squelched(&self) -> bool {
         // The passband scout has to keep hearing, or it cannot find a
         // nearby tone when the cursor is sitting on noise.

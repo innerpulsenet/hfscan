@@ -307,6 +307,10 @@ fn ita2_code(c: char) -> Option<(u8, bool)> {
 }
 
 fn gen_rtty(text: &str, baud: f32, shift: f32) -> Vec<Complex32> {
+    gen_rtty_snr(text, baud, shift, 0.03)
+}
+
+fn gen_rtty_snr(text: &str, baud: f32, shift: f32, snr_scale: f32) -> Vec<Complex32> {
     let sps = FS as f32 / baud;
     let mut bits: Vec<bool> = Vec::new();
     // idle mark so the decoder starts in a known state
@@ -345,7 +349,7 @@ fn gen_rtty(text: &str, baud: f32, shift: f32) -> Vec<Complex32> {
             let _ = n;
             out.push(
                 Complex32::from_polar(1.0, phase)
-                    + Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.03,
+                    + Complex32::new(noise(&mut rng), noise(&mut rng)) * snr_scale,
             );
         }
     }
@@ -1388,4 +1392,164 @@ fn psk31_still_rejects_a_plain_carrier() {
         .collect();
     let hits = psk31::scan_span(&sig, FS, &[(0.0, 20.0)]);
     assert!(hits.is_empty(), "a steady carrier confirmed as PSK31: {hits:?}");
+}
+
+// ------------------------------------------------------- AGC benches
+
+/// Decode with the app's software AGC in the path, as auto mode runs it:
+/// one scalar gain per audio block, applied after the tuning chain.
+fn decode_with_agc(
+    sig: &[Complex32],
+    tune: f32,
+    mut d: Box<dyn Decoder>,
+    agc: bool,
+) -> String {
+    let bw = d.bandwidth();
+    let shift = d.offset_shift();
+    let mut chain = crate::dsp::DecodeChain::new(FS, bw, FS);
+    chain.set_offset(tune as f64 + shift);
+    let mut soft = crate::dsp::SoftAgc::new(chain.fs_out());
+    let mut audio = Vec::new();
+    let mut out = String::new();
+    // ~85 ms of audio per block, which is what the radio delivers.
+    let block = (FS * 0.085) as usize;
+    for chunk in sig.chunks(block) {
+        chain.process(chunk, &mut audio);
+        if agc && d.wants_agc() {
+            soft.process(&mut audio);
+        }
+        out.push_str(&d.process(&audio));
+    }
+    out.trim().to_string()
+}
+
+#[test]
+#[ignore]
+fn bench_agc_cost() {
+    let cw_msg = "CQ CQ DE W1AW W1AW K UR RST 599 QTH NEWINGTON DE W1AW K";
+    println!("\n== CW: accuracy with the software AGC on vs off ==");
+    println!("{:>6}{:>8}{:>8}{:>8}", "WPM", "SNR", "AGC on", "AGC off");
+    for wpm in [15.0f32, 20.0, 28.0] {
+        for db in [30.0f32, 15.0, 8.0] {
+            let sig = gen_cw(cw_msg, wpm, scale_for_snr(db));
+            let on = decode_with_agc(&sig, 0.0, Box::new(cw::CwDecoder::new(FS)), true);
+            let off = decode_with_agc(&sig, 0.0, Box::new(cw::CwDecoder::new(FS)), false);
+            println!(
+                "{wpm:>6.0}{:>8}{:>8}{:>8}",
+                format!("{db:.0}dB"),
+                format!("{:.0}%", accuracy(cw_msg, &on) * 100.0),
+                format!("{:.0}%", accuracy(cw_msg, &off) * 100.0),
+            );
+        }
+    }
+
+    let rtty_msg = "RYRY CQ DE W1AW W1AW K";
+    println!("\n== RTTY: accuracy with the software AGC on vs off ==");
+    println!("{:>8}{:>8}{:>8}", "noise", "AGC on", "AGC off");
+    for sc in [0.03f32, 0.15, 0.30] {
+        let sig = gen_rtty_snr(rtty_msg, 45.45, 170.0, sc);
+        let on = decode_with_agc(&sig, 0.0, Box::new(rtty::RttyDecoder::new(FS)), true);
+        let off = decode_with_agc(&sig, 0.0, Box::new(rtty::RttyDecoder::new(FS)), false);
+        println!(
+            "{:>8}{:>8}{:>8}",
+            format!("{sc:.2}"),
+            format!("{:.0}%", accuracy(rtty_msg, &on) * 100.0),
+            format!("{:.0}%", accuracy(rtty_msg, &off) * 100.0),
+        );
+    }
+
+    let psk_msg = "CQ CQ DE W1AW W1AW PSE K";
+    println!("\n== PSK31: accuracy with the software AGC on vs off ==");
+    println!("{:>8}{:>8}{:>8}", "SNR", "AGC on", "AGC off");
+    for db in [30.0f32, 20.0, 15.0, 10.0] {
+        let sig = gen_psk31_snr(psk_msg, 0.0, psk_scale_for_snr(db));
+        let on = decode_with_agc(&sig, 0.0, Box::new(psk31::Psk31Decoder::new(FS)), true);
+        let off = decode_with_agc(&sig, 0.0, Box::new(psk31::Psk31Decoder::new(FS)), false);
+        println!(
+            "{:>8}{:>8}{:>8}",
+            format!("{db:.0}dB"),
+            format!("{:.0}%", accuracy(psk_msg, &on) * 100.0),
+            format!("{:.0}%", accuracy(psk_msg, &off) * 100.0),
+        );
+    }
+}
+
+// ---------------------------------------------- RTTY polarity tests
+
+fn decode_rtty(sig: &[Complex32]) -> String {
+    let mut d = rtty::RttyDecoder::new(FS);
+    let mut out = String::new();
+    for chunk in sig.chunks(4096) {
+        out.push_str(&d.process(chunk));
+    }
+    out.trim().to_string()
+}
+
+/// Which tone is the mark is a matter of which sideband the signal arrived
+/// on, and the receiver is not told. Both polarities are ordinary on the air,
+/// so requiring the operator to notice garbage and press a key means half of
+/// all RTTY reads as garbage until they do.
+#[test]
+fn rtty_decodes_either_shift_polarity_unaided() {
+    let msg = "RYRY CQ DE W1AW W1AW K";
+    for shift in [170.0f32, -170.0] {
+        let sig = gen_rtty(msg, 45.45, shift);
+        let got = decode_rtty(&sig);
+        let acc = accuracy(msg, &got);
+        assert!(
+            acc > 0.9,
+            "{} shift copied {:.0}%: {got:?}",
+            if shift > 0.0 { "normal" } else { "reversed" },
+            acc * 100.0
+        );
+    }
+}
+
+/// The wrong polarity must never be the one that speaks: it decodes the same
+/// bits inverted, which is plausible-looking Baudot, so emitting before the
+/// vote settles would put a line of nonsense ahead of every transmission.
+#[test]
+fn rtty_emits_nothing_from_the_wrong_polarity() {
+    let msg = "RYRY CQ DE W1AW W1AW K";
+    for shift in [170.0f32, -170.0] {
+        let sig = gen_rtty(msg, 45.45, shift);
+        let got = decode_rtty(&sig);
+        // Whatever comes out is the message, not a mirrored prefix of it.
+        assert!(
+            got.starts_with("RYRY") || got.starts_with("YRY") || got.starts_with("RY"),
+            "copy did not start with the transmission: {got:?}"
+        );
+    }
+}
+
+/// Noise must not make up its mind either way.
+#[test]
+fn rtty_stays_quiet_on_noise() {
+    for seed in [0x1234_5678u32, 0xdead_beef] {
+        let mut rng = seed;
+        let sig: Vec<Complex32> = (0..(12.0 * FS) as usize)
+            .map(|_| Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.3)
+            .collect();
+        let got = decode_rtty(&sig);
+        let letters = got.chars().filter(|c| !c.is_whitespace()).count();
+        assert!(letters <= 6, "12 s of noise produced {letters} chars: {got:?}");
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_rtty_polarity() {
+    let msg = "RYRY CQ DE W1AW W1AW K UR RST 599 QTH NEWINGTON DE W1AW K";
+    println!("\n== RTTY: copy by shift polarity and noise, unaided ==");
+    println!("{:>10}{:>10}{:>10}", "noise", "normal", "reversed");
+    for sc in [0.03f32, 0.10, 0.20, 0.30, 0.45] {
+        let n = gen_rtty_snr(msg, 45.45, 170.0, sc);
+        let r = gen_rtty_snr(msg, 45.45, -170.0, sc);
+        println!(
+            "{:>10}{:>10}{:>10}",
+            format!("{sc:.2}"),
+            format!("{:.0}%", accuracy(msg, &decode_rtty(&n)) * 100.0),
+            format!("{:.0}%", accuracy(msg, &decode_rtty(&r)) * 100.0),
+        );
+    }
 }

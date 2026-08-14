@@ -45,6 +45,14 @@ impl Kind {
             Kind::Unknown => "?",
         }
     }
+
+    /// Modes that do not exist as amateur traffic outside the HF allocations.
+    fn amateur_only(self) -> bool {
+        matches!(
+            self,
+            Kind::Cw | Kind::Psk31 | Kind::Rtty | Kind::Ft8 | Kind::Ft4
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +89,11 @@ pub fn classify_span(
         }
         let abs = abs_center + o.offset_hz as f64;
         let (kind, score) = classify_one(&audio, o.bw_hz, abs, &mut fft);
+        // Nyquist-edge junk, mixed to audio, often looks like an FT8
+        // forest. Ham modes do not live outside the allocations.
+        if kind.amateur_only() && !bands::in_amateur(abs) {
+            continue;
+        }
         if kind == Kind::Unknown && score < 0.35 {
             continue;
         }
@@ -98,12 +111,7 @@ pub fn classify_span(
             score,
         });
     }
-    out.sort_by(|a, b| {
-        a.offset_hz
-            .partial_cmp(&b.offset_hz)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    out
+    cluster_ft(out)
 }
 
 struct Occ {
@@ -120,6 +128,11 @@ fn occupancies(spectrum: &[f32], rate: f64) -> Vec<Occ> {
     let thr = med + 8.0;
     let dc = n / 2;
     let bin = rate as f32 / n as f32;
+    // The fftshifted periodogram puts Nyquist at the ends. Those bins
+    // ring and get classified as a phantom digital signal ~fs/2 below
+    // the dial (e.g. 13978 kHz on a 14074 kHz / 192 kHz span).
+    let edge = (n / 50).max(2);
+    let usable = |i: usize| i >= edge && i + edge < n && i.abs_diff(dc) > 2;
     let mut out = Vec::new();
     let mut i = 0;
     while i < n {
@@ -132,7 +145,7 @@ fn occupancies(spectrum: &[f32], rate: f64) -> Vec<Occ> {
         while i < n && spectrum[i] >= thr {
             // The LO spike is not a signal, but do not split a wide
             // occupancy that happens to straddle DC.
-            if i.abs_diff(dc) > 2 && best.is_none_or(|b| spectrum[i] > spectrum[b]) {
+            if usable(i) && best.is_none_or(|b| spectrum[i] > spectrum[b]) {
                 best = Some(i);
             }
             i += 1;
@@ -141,6 +154,11 @@ fn occupancies(spectrum: &[f32], rate: f64) -> Vec<Occ> {
             continue;
         };
         let bw = ((i - start) as f32 * bin).max(bin);
+        // A run tens of kHz wide is the noise floor, not a mode.
+        // (SSB / AM / an FT8 pile-up all sit under ~3–10 kHz.)
+        if bw > 12_000.0 {
+            continue;
+        }
         let off = (best as f32 - n as f32 / 2.0) * bin;
         out.push(Occ {
             offset_hz: off,
@@ -151,55 +169,64 @@ fn occupancies(spectrum: &[f32], rate: f64) -> Vec<Occ> {
     out
 }
 
+fn ft_kind(abs_hz: f64) -> Option<Kind> {
+    match bands::ft_mode(abs_hz) {
+        Some("FT8") => Some(Kind::Ft8),
+        Some("FT4") => Some(Kind::Ft4),
+        _ => None,
+    }
+}
+
 fn classify_one(audio: &[Complex32], coarse_bw: f32, abs_hz: f64, psd: &mut Psd) -> (Kind, f32) {
     let spec = psd.power(audio);
     let fine = features(&spec, AUDIO / spec.len() as f32, audio);
+    let ft = ft_kind(abs_hz);
 
-    // Known-mode probes first — they are specific and cheap enough.
-    // Keep them on narrow occupancies so a 2 kHz SSB passband with
-    // syllabic AM cannot look like keyed CW.
-    let psk = psk31::scan_span(audio, AUDIO as f64, &[(0.0, 20.0)]);
-    if let Some(h) = psk.iter().max_by(|a, b| {
-        a.quality
-            .partial_cmp(&b.quality)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    }) {
-        if h.quality > 0.7 && coarse_bw < 250.0 && fine.obw_hz < 250.0 {
-            return (Kind::Psk31, h.quality);
+    // One-off modes only outside the FT USB windows — a single FT8 tone
+    // looks like a carrier / CW / a 170 Hz neighbour pair (RTTY).
+    if ft.is_none() {
+        let psk = psk31::scan_span(audio, AUDIO as f64, &[(0.0, 20.0)]);
+        if let Some(h) = psk.iter().max_by(|a, b| {
+            a.quality
+                .partial_cmp(&b.quality)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            if h.quality > 0.7 && coarse_bw < 250.0 && fine.obw_hz < 250.0 {
+                return (Kind::Psk31, h.quality);
+            }
+        }
+        let cw = cw::scan_span(audio, AUDIO as f64, &[(0.0, 20.0)]);
+        if let Some(h) = cw.iter().max_by(|a, b| {
+            a.quality
+                .partial_cmp(&b.quality)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            if h.quality > 0.45 && coarse_bw < 250.0 && fine.obw_hz < 200.0 {
+                return (Kind::Cw, h.quality);
+            }
         }
     }
-    let cw = cw::scan_span(audio, AUDIO as f64, &[(0.0, 20.0)]);
-    if let Some(h) = cw.iter().max_by(|a, b| {
-        a.quality
-            .partial_cmp(&b.quality)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    }) {
-        if h.quality > 0.45 && coarse_bw < 250.0 && fine.obw_hz < 200.0 {
-            return (Kind::Cw, h.quality);
-        }
-    }
 
+    // RTTY is rare. Demand a clean 170 Hz pair with almost no extra
+    // peaks. Two FT8 stations 170 Hz apart fail the peak-count test
+    // and, in the FT8 window, never get here as RTTY.
     if let Some(sep) = fine.dual_hz {
-        if (150.0..220.0).contains(&sep) && fine.env_cv < 0.35 && fine.obw_hz < 600.0 {
-            return (Kind::Rtty, 0.75);
+        let clean = (160.0..185.0).contains(&sep)
+            && fine.env_cv < 0.30
+            && fine.n_peaks <= 8
+            && fine.obw_hz < 450.0
+            && !matches!(ft, Some(Kind::Ft8));
+        if clean {
+            return (Kind::Rtty, 0.78);
         }
     }
 
-    let marker = marker_kind(abs_hz);
-
-    if fine.obw_hz > 1500.0 && fine.n_peaks >= 6 {
-        if let Some(sp) = fine.spacing_hz {
-            if (5.0..9.0).contains(&sp) || (11.0..14.0).contains(&sp) {
-                return (Kind::Ft8, 0.8);
-            }
-            if (18.0..26.0).contains(&sp) {
-                return (Kind::Ft4, 0.78);
-            }
+    if let Some(k) = ft {
+        let wide = coarse_bw.max(fine.obw_hz);
+        if fine.speech > 0.55 && (1800.0..3600.0).contains(&wide) && fine.n_peaks < 5 {
+            return (Kind::Ssb, 0.55);
         }
-        // A 2–3 kHz forest of narrow tones on an FT8 calling frequency.
-        if matches!(marker, Some(Kind::Ft8) | Some(Kind::Ft4)) && fine.n_peaks >= 8 {
-            return (marker.unwrap(), 0.7);
-        }
+        return (k, 0.74);
     }
 
     if fine.carrier && fine.obw_hz > 3500.0 {
@@ -224,21 +251,60 @@ fn classify_one(audio: &[Complex32], coarse_bw: f32, abs_hz: f64, psd: &mut Psd)
     if coarse_bw < 150.0 && fine.tonality > 10.0 && fine.env_cv < 0.15 {
         return (Kind::Carrier, 0.5);
     }
-    // A lone FT8/FT4 is only ~50–80 Hz of tones; the pile-up test above
-    // misses it. Trust the calling-frequency marker when the occupancy
-    // is that narrow and not a dead carrier.
-    if let Some(k @ (Kind::Ft8 | Kind::Ft4)) = marker {
-        if (35.0..140.0).contains(&fine.obw_hz) && !fine.carrier {
-            return (k, 0.55);
-        }
-    }
-    // Calling-frequency markers are a last-ditch hint, not a vote.
-    if let Some(k) = marker {
-        if coarse_bw < 200.0 && fine.n_peaks <= 4 {
-            return (k, 0.35);
-        }
-    }
     (Kind::Unknown, 0.2)
+}
+
+/// Collapse neighbouring FT8/FT4 blobs into one pile-up so the spectrum
+/// and the activity strip show a single group, not fifty carriers.
+pub fn cluster_ft(idents: Vec<Ident>) -> Vec<Ident> {
+    let (mut ft, mut rest): (Vec<Ident>, Vec<Ident>) = idents
+        .into_iter()
+        .partition(|i| matches!(i.kind, Kind::Ft8 | Kind::Ft4));
+    ft.sort_by(|a, b| {
+        a.kind
+            .label()
+            .cmp(b.kind.label())
+            .then(
+                a.offset_hz
+                    .partial_cmp(&b.offset_hz)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+    let mut i = 0;
+    while i < ft.len() {
+        let mut lo = ft[i].offset_hz - ft[i].bw_hz * 0.5;
+        let mut hi = ft[i].offset_hz + ft[i].bw_hz * 0.5;
+        let kind = ft[i].kind;
+        let mut snr = ft[i].snr_db;
+        let mut score = ft[i].score;
+        let mut j = i + 1;
+        while j < ft.len() && ft[j].kind == kind {
+            let flo = ft[j].offset_hz - ft[j].bw_hz * 0.5;
+            let fhi = ft[j].offset_hz + ft[j].bw_hz * 0.5;
+            if flo - hi > 800.0 {
+                break;
+            }
+            lo = lo.min(flo);
+            hi = hi.max(fhi);
+            snr = snr.max(ft[j].snr_db);
+            score = score.max(ft[j].score);
+            j += 1;
+        }
+        rest.push(Ident {
+            offset_hz: (lo + hi) * 0.5,
+            bw_hz: (hi - lo).max(80.0),
+            snr_db: snr,
+            kind,
+            score,
+        });
+        i = j;
+    }
+    rest.sort_by(|a, b| {
+        a.offset_hz
+            .partial_cmp(&b.offset_hz)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rest
 }
 
 /// Compact "3 CW  2 SSB  1 PSK" tally for the status line / spectrum title.
@@ -264,23 +330,10 @@ pub fn summary(idents: &[Ident]) -> String {
     parts.join("  ")
 }
 
-fn marker_kind(abs_hz: f64) -> Option<Kind> {
-    let m = bands::MARKERS
-        .iter()
-        .find(|m| (m.freq - abs_hz).abs() < 2500.0)?;
-    match m.label {
-        "FT8" => Some(Kind::Ft8),
-        "PSK" => Some(Kind::Psk31),
-        "RTTY" => Some(Kind::Rtty),
-        _ => None,
-    }
-}
-
 struct Feat {
     obw_hz: f32,
     tonality: f32,
     n_peaks: usize,
-    spacing_hz: Option<f32>,
     dual_hz: Option<f32>,
     carrier: bool,
     env_cv: f32,
@@ -322,37 +375,8 @@ fn features(psd: &[f32], bin_hz: f32, audio: &[Complex32]) -> Feat {
         (Some(a), Some(b)) => (b - a).max(bin_hz),
         _ => bin_hz,
     };
-    let mut freqs: Vec<f32> = peaks.iter().map(|p| p.1).collect();
-    freqs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mut diffs: Vec<f32> = freqs
-        .windows(2)
-        .map(|w| w[1] - w[0])
-        .filter(|d| *d > 2.0)
-        .collect();
-    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    // Prefer a FT8/FT4-like grid if one is present; otherwise the median gap.
-    let ftish: Vec<f32> = diffs
-        .iter()
-        .copied()
-        .filter(|d| (5.0..28.0).contains(d))
-        .collect();
-    let spacing = if ftish.len() >= 2 {
-        Some(ftish[ftish.len() / 2])
-    } else if diffs.len() >= 2 {
-        Some(diffs[diffs.len() / 2])
-    } else {
-        None
-    };
     peaks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    // Prefer a 170 Hz pair (RTTY) among the strong peaks. The two
-    // loudest bins are often neighbouring keying sidebands of one tone.
-    let dual = rtty_sep(&peaks).or_else(|| {
-        if peaks.len() >= 2 {
-            Some((peaks[0].1 - peaks[1].1).abs())
-        } else {
-            None
-        }
-    });
+    let dual = rtty_sep(&peaks);
 
     let dc = psd[0];
     let neigh = psd.get(1).copied().unwrap_or(dc);
@@ -363,7 +387,6 @@ fn features(psd: &[f32], bin_hz: f32, audio: &[Complex32]) -> Feat {
         obw_hz: obw.min(AUDIO / 2.0),
         tonality: peak / med,
         n_peaks: peaks.len(),
-        spacing_hz: spacing,
         dual_hz: dual,
         carrier,
         env_cv,
@@ -388,7 +411,7 @@ fn rtty_sep(peaks: &[(f32, f32)]) -> Option<f32> {
                 continue;
             }
             let sep = (peaks[i].1 - peaks[j].1).abs();
-            if (150.0..230.0).contains(&sep) {
+            if (160.0..185.0).contains(&sep) && peaks[j].0 > top * 0.25 {
                 let weak = peaks[i].0.min(peaks[j].0);
                 if weak > best_weak {
                     best_weak = weak;
@@ -610,11 +633,121 @@ mod tests {
             sig.push(Complex32::from_polar(1.0, phase));
         }
         let spec = spec_peak(256, 8000.0, 400.0, 3);
-        let ids = classify_span(&sig, 8000.0, &spec, 14_080_000.0);
+        let ids = classify_span(&sig, 8000.0, &spec, 7_047_000.0);
         assert!(
             ids.iter().any(|i| i.kind == Kind::Rtty),
             "expected RTTY, got {ids:?}"
         );
+    }
+
+    #[test]
+    fn ignores_nyquist_edge_as_ft8() {
+        // Hot bins at the left edge of an fftshifted 192 kHz span are
+        // Nyquist, not a signal 96 kHz below the dial.
+        let mut spec = vec![-85.0f32; 256];
+        spec[0] = -25.0;
+        spec[1] = -28.0;
+        spec[2] = -32.0;
+        spec[3] = -40.0;
+        let mut sig = Vec::with_capacity(48_000);
+        let mut phase = 0.0f32;
+        for _ in 0..48_000 {
+            phase += 2.0 * PI * 96_000.0 / 192_000.0;
+            sig.push(Complex32::from_polar(0.3, phase));
+        }
+        let ids = classify_span(&sig, 192_000.0, &spec, 14_074_000.0);
+        assert!(
+            !ids.iter().any(|i| {
+                let f = 14_074_000.0 + i.offset_hz as f64;
+                matches!(i.kind, Kind::Ft8 | Kind::Ft4) || f < 14_000_000.0
+            }),
+            "edge spur must not become out-of-band FT8, got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn ham_modes_stay_inside_amateur_bands() {
+        assert!(bands::in_amateur(14_074_000.0));
+        assert!(!bands::in_amateur(13_978_700.0));
+        assert!(!bands::in_amateur(13_978_700.0 + 200.0));
+        assert_eq!(bands::ft_mode(14_075_500.0), Some("FT8"));
+        assert_eq!(bands::ft_mode(14_026_000.0), None);
+    }
+
+    fn tone(n: usize, fs: f32, hz: f32) -> Vec<Complex32> {
+        let mut phase = 0.0f32;
+        let step = 2.0 * PI * hz / fs;
+        (0..n)
+            .map(|_| {
+                let s = Complex32::from_polar(1.0, phase);
+                phase += step;
+                s
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ft8_window_tone_is_ft8_not_carrier() {
+        let sig = tone(8000, 8000.0, 400.0);
+        let spec = spec_peak(256, 8000.0, 400.0, 1);
+        let ids = classify_span(&sig, 8000.0, &spec, 14_074_000.0);
+        assert!(
+            ids.iter().any(|i| i.kind == Kind::Ft8),
+            "a tone in the FT8 USB window should be FT8, got {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|i| i.kind == Kind::Carrier || i.kind == Kind::Rtty),
+            "must not call FT8 traffic CAR/RTTY: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn rtty_pair_in_ft8_window_is_not_rtty() {
+        let mut sig = Vec::with_capacity(8000);
+        let mut phase = 0.0f32;
+        for i in 0..8000 {
+            let mark = (i / 176) % 2 == 0;
+            let f = 400.0 + if mark { 85.0 } else { -85.0 };
+            phase += 2.0 * PI * f / 8000.0;
+            sig.push(Complex32::from_polar(1.0, phase));
+        }
+        let spec = spec_peak(256, 8000.0, 400.0, 3);
+        let ids = classify_span(&sig, 8000.0, &spec, 14_074_000.0);
+        assert!(
+            !ids.iter().any(|i| i.kind == Kind::Rtty),
+            "170 Hz pair inside the FT8 window is not RTTY, got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn clusters_nearby_ft8() {
+        let ids = cluster_ft(vec![
+            Ident {
+                offset_hz: 200.0,
+                bw_hz: 80.0,
+                snr_db: 10.0,
+                kind: Kind::Ft8,
+                score: 0.7,
+            },
+            Ident {
+                offset_hz: 400.0,
+                bw_hz: 80.0,
+                snr_db: 12.0,
+                kind: Kind::Ft8,
+                score: 0.8,
+            },
+            Ident {
+                offset_hz: 5000.0,
+                bw_hz: 60.0,
+                snr_db: 8.0,
+                kind: Kind::Cw,
+                score: 0.6,
+            },
+        ]);
+        let ft: Vec<_> = ids.iter().filter(|i| i.kind == Kind::Ft8).collect();
+        assert_eq!(ft.len(), 1, "two close FT8 blobs should be one pile-up: {ids:?}");
+        assert!(ft[0].bw_hz > 200.0, "cluster should span both, bw={}", ft[0].bw_hz);
+        assert!(ids.iter().any(|i| i.kind == Kind::Cw));
     }
 
     #[test]

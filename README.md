@@ -127,9 +127,13 @@ baseband and scored the way a person reads a waterfall: occupied bandwidth,
 tonality, tone spacing, envelope keying, a residual carrier, and (for
 CW / PSK31) the same probes the hop-scouts use. The result is a label —
 **CW**, **PSK**, **RTTY**, **FT8**, **FT4**, **SSB**, **AM**, **CAR** — not a
-decode. Labels sit on the spectrum and a tally (`3 CW  2 SSB`) is in the
-status line and the spectrum title. Band scan (`s`) prints the same tags
-next to each hit. Park the cursor on a label and press `d` to copy it.
+decode. Live signals get a coloured chip on the spectrum sitting on a
+shelf as wide as the occupancy. Chips hold for a few seconds and
+fade rather than blinking off when a classify pass misses. A thin **activity** strip at the bottom
+keeps every detection in this span (frequency, mode, SNR) after the
+chip fades, and shows the latest status message. Band scan (`s`) prints
+the same tags next to each hit. Park the cursor on a chip and press `d`
+to copy it.
 
 ### The decoders
 

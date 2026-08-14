@@ -37,23 +37,30 @@ pub const MARKERS: &[Marker] = &[
     Marker { freq: 5_357_000.0,  label: "FT8" },
     Marker { freq: 7_040_000.0,  label: "PSK" },
     Marker { freq: 7_047_000.0,  label: "RTTY" },
+    Marker { freq: 7_047_500.0,  label: "FT4" },
     Marker { freq: 7_074_000.0,  label: "FT8" },
     Marker { freq: 10_136_000.0, label: "FT8" },
+    Marker { freq: 10_140_000.0, label: "FT4" },
     Marker { freq: 10_140_000.0, label: "PSK" },
     Marker { freq: 10_142_000.0, label: "RTTY" },
     Marker { freq: 14_070_000.0, label: "PSK" },
     Marker { freq: 14_074_000.0, label: "FT8" },
     Marker { freq: 14_080_000.0, label: "RTTY" },
+    Marker { freq: 14_080_000.0, label: "FT4" },
     Marker { freq: 18_100_000.0, label: "PSK" },
     Marker { freq: 18_100_000.0, label: "RTTY" },
     Marker { freq: 18_104_000.0, label: "FT8" },
+    Marker { freq: 18_108_000.0, label: "FT4" },
     Marker { freq: 21_070_000.0, label: "PSK" },
     Marker { freq: 21_074_000.0, label: "FT8" },
     Marker { freq: 21_080_000.0, label: "RTTY" },
+    Marker { freq: 21_140_000.0, label: "FT4" },
     Marker { freq: 24_915_000.0, label: "FT8" },
+    Marker { freq: 24_919_000.0, label: "FT4" },
     Marker { freq: 28_070_000.0, label: "PSK" },
     Marker { freq: 28_074_000.0, label: "FT8" },
     Marker { freq: 28_080_000.0, label: "RTTY" },
+    Marker { freq: 28_180_000.0, label: "FT4" },
     Marker { freq: 5_000_000.0,  label: "WWV" },
     Marker { freq: 10_000_000.0, label: "WWV" },
     Marker { freq: 15_000_000.0, label: "WWV" },
@@ -63,4 +70,29 @@ pub fn band_for(freq: f64) -> Option<&'static Band> {
     BANDS
         .iter()
         .find(|b| freq >= b.start && freq <= b.end && b.name != "WWV")
+}
+
+/// True if `freq` sits inside a real amateur allocation (not the WWV preset).
+pub fn in_amateur(freq: f64) -> bool {
+    band_for(freq).is_some()
+}
+
+/// FT8 / FT4 live in the 200–3000 Hz USB passband above the dial, not
+/// as one-off carriers scattered across the band.
+pub fn ft_mode(freq: f64) -> Option<&'static str> {
+    let mut best: Option<(&'static str, f64)> = None;
+    for m in MARKERS {
+        let label = match m.label {
+            "FT8" | "FT4" => m.label,
+            _ => continue,
+        };
+        let off = freq - m.freq;
+        if (150.0..3200.0).contains(&off) {
+            let d = (off - 1500.0).abs();
+            if best.is_none_or(|(_, bd)| d < bd) {
+                best = Some((label, d));
+            }
+        }
+    }
+    best.map(|(l, _)| l)
 }

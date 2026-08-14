@@ -236,12 +236,99 @@ struct App {
     cw_hits: Vec<CwHit>,
     /// Occupied slices labelled CW / PSK / SSB / … from the last classify.
     idents: Vec<identify::Ident>,
+    /// Held, fading spectrum labels. `idents` is the visible snapshot of these.
+    tracks: Vec<LabelTrack>,
+    /// Detections that linger after the live label fades, for the activity strip.
+    heard: Vec<Heard>,
+    /// Status / detection lines shown in the bottom activity window.
+    notes: VecDeque<Note>,
+    /// How many activity-log lines to step back from live.
+    note_scroll: usize,
     scout_at: Instant,
     ident_at: Instant,
     /// Set by a finished PSK31 band scan so the UI loop can retune.
     pending_tune: Option<f64>,
     /// Slow hardware-gain nudge from the software AGC supervisor.
     pending_gain: Option<f64>,
+}
+
+/// How long a chip stays fully readable after the last classify hit.
+const LABEL_HOLD: Duration = Duration::from_millis(5000);
+/// Rise time of a new chip, seconds.
+const LABEL_FADE_IN: f32 = 0.28;
+/// Fall time after the hold expires, seconds.
+const LABEL_FADE_OUT: f32 = 1.6;
+
+/// One spectrum label with hold / fade so a single missed classify
+/// cannot blink the chip off.
+struct LabelTrack {
+    offset_hz: f32,
+    bw_hz: f32,
+    snr_db: f32,
+    kind: identify::Kind,
+    score: f32,
+    first: Instant,
+    last_seen: Instant,
+    pending_kind: identify::Kind,
+    pending_hits: u8,
+}
+
+impl LabelTrack {
+    fn from_ident(id: &identify::Ident, now: Instant) -> Self {
+        Self {
+            offset_hz: id.offset_hz,
+            bw_hz: id.bw_hz,
+            snr_db: id.snr_db,
+            kind: id.kind,
+            score: id.score,
+            first: now,
+            last_seen: now,
+            pending_kind: id.kind,
+            pending_hits: 0,
+        }
+    }
+
+    fn ident(&self) -> identify::Ident {
+        identify::Ident {
+            offset_hz: self.offset_hz,
+            bw_hz: self.bw_hz,
+            snr_db: self.snr_db,
+            kind: self.kind,
+            score: self.score,
+        }
+    }
+
+    fn alpha(&self, now: Instant) -> f32 {
+        let age = now.saturating_duration_since(self.first).as_secs_f32();
+        let since = now.saturating_duration_since(self.last_seen).as_secs_f32();
+        let hold = LABEL_HOLD.as_secs_f32();
+        // Appear nearly solid so a first-frame chip is readable; the
+        // fade that matters is on the way out.
+        let fade_in = 0.78 + 0.22 * (age / LABEL_FADE_IN).clamp(0.0, 1.0);
+        let fade_out = if since <= hold {
+            1.0
+        } else {
+            (1.0 - (since - hold) / LABEL_FADE_OUT).clamp(0.0, 1.0)
+        };
+        fade_in * fade_out
+    }
+}
+
+/// A signal we have labelled in this span. Lives on after the live
+/// spectrum chip drops, so the bottom strip can still name the frequency.
+struct Heard {
+    freq_hz: f64,
+    freq_lo: f64,
+    freq_hi: f64,
+    kind: identify::Kind,
+    snr_db: f32,
+    count: u32,
+    last: Instant,
+}
+
+struct Note {
+    text: String,
+    kind: Option<identify::Kind>,
 }
 
 /// Station settings dialog state.
@@ -308,6 +395,10 @@ impl App {
             psk_hits: Vec::new(),
             cw_hits: Vec::new(),
             idents: Vec::new(),
+            tracks: Vec::new(),
+            heard: Vec::new(),
+            notes: VecDeque::new(),
+            note_scroll: 0,
             scout_at: Instant::now(),
             ident_at: Instant::now(),
             pending_tune: None,
@@ -331,6 +422,7 @@ impl App {
         self.psk_hits.clear();
         self.cw_hits.clear();
         self.idents.clear();
+        self.tracks.clear();
         self.scout_iq.clear();
         self.apply_station();
         self.log(format!("decoder: {}", mode.label()));
@@ -409,10 +501,19 @@ impl App {
     }
 
     fn log(&mut self, msg: String) {
-        self.log.push_back(msg);
+        self.log.push_back(msg.clone());
         while self.log.len() > 6 {
             self.log.pop_front();
         }
+        self.push_note(msg, None);
+    }
+
+    fn push_note(&mut self, text: String, kind: Option<identify::Kind>) {
+        self.notes.push_back(Note { text, kind });
+        while self.notes.len() > 80 {
+            self.notes.pop_front();
+        }
+        self.note_scroll = 0;
     }
 
     fn tuned_freq(&self) -> f64 {
@@ -1073,6 +1174,12 @@ fn scroll_pane_at(app: &mut App, area: Rect, col: u16, row: u16, delta: isize) {
         }
     } else if inside(chunks[2]) {
         adj(&mut app.wf_scroll);
+    } else if inside(chunks[4]) {
+        adj(&mut app.note_scroll);
+        let max = app.notes.len().saturating_sub(1);
+        if app.note_scroll > max {
+            app.note_scroll = max;
+        }
     }
 }
 
@@ -1139,7 +1246,165 @@ fn refresh_idents(app: &mut App) {
     if app.smoothed.is_empty() || app.scout_iq.len() < (app.rate * 0.25) as usize {
         return;
     }
-    app.idents = identify::classify_span(&app.scout_iq, app.rate, &app.smoothed, app.center);
+    let raw = identify::classify_span(&app.scout_iq, app.rate, &app.smoothed, app.center);
+    apply_idents(app, raw);
+    merge_heard(app);
+}
+
+/// Merge a classify pass into held tracks: smooth position, keep the chip
+/// up through a few misses, and only switch kind after a second vote.
+fn apply_idents(app: &mut App, raw: Vec<identify::Ident>) {
+    let now = Instant::now();
+    for id in raw {
+        if id.kind == identify::Kind::Unknown {
+            continue;
+        }
+        if let Some(i) = match_track(&app.tracks, &id) {
+            let t = &mut app.tracks[i];
+            if matches!(t.kind, identify::Kind::Ft8 | identify::Kind::Ft4)
+                && t.kind == id.kind
+            {
+                let lo = (t.offset_hz - t.bw_hz * 0.5).min(id.offset_hz - id.bw_hz * 0.5);
+                let hi = (t.offset_hz + t.bw_hz * 0.5).max(id.offset_hz + id.bw_hz * 0.5);
+                t.offset_hz = (lo + hi) * 0.5;
+                t.bw_hz = (hi - lo).max(80.0);
+            } else {
+                t.offset_hz = 0.6 * t.offset_hz + 0.4 * id.offset_hz;
+                t.bw_hz = 0.7 * t.bw_hz + 0.3 * id.bw_hz;
+            }
+            t.snr_db = 0.6 * t.snr_db + 0.4 * id.snr_db;
+            t.score = t.score.max(id.score);
+            t.last_seen = now;
+            if id.kind == t.kind {
+                t.pending_hits = 0;
+                t.pending_kind = t.kind;
+            } else if id.kind == t.pending_kind {
+                t.pending_hits = t.pending_hits.saturating_add(1);
+                if t.pending_hits >= 2 {
+                    t.kind = id.kind;
+                    t.pending_hits = 0;
+                }
+            } else {
+                t.pending_kind = id.kind;
+                t.pending_hits = 1;
+            }
+        } else {
+            app.tracks.push(LabelTrack::from_ident(&id, now));
+        }
+    }
+    let hold_out = LABEL_HOLD + Duration::from_secs_f32(LABEL_FADE_OUT);
+    app.tracks.retain(|t| {
+        let abs = app.center + t.offset_hz as f64;
+        let ham = matches!(
+            t.kind,
+            identify::Kind::Cw
+                | identify::Kind::Psk31
+                | identify::Kind::Rtty
+                | identify::Kind::Ft8
+                | identify::Kind::Ft4
+        );
+        !(ham && !bands::in_amateur(abs)) && t.last_seen.elapsed() < hold_out
+    });
+    app.idents = app
+        .tracks
+        .iter()
+        .filter(|t| t.alpha(now) >= 0.12)
+        .map(|t| t.ident())
+        .collect();
+}
+
+fn match_track(tracks: &[LabelTrack], id: &identify::Ident) -> Option<usize> {
+    tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            let ft = matches!(
+                (t.kind, id.kind),
+                (identify::Kind::Ft8, identify::Kind::Ft8)
+                    | (identify::Kind::Ft4, identify::Kind::Ft4)
+            );
+            let slack = if ft {
+                t.bw_hz.max(id.bw_hz) * 0.5 + 2500.0
+            } else {
+                t.bw_hz.max(id.bw_hz).max(120.0) * 0.7
+            };
+            (t.offset_hz - id.offset_hz).abs() < slack
+        })
+        .min_by(|(_, a), (_, b)| {
+            let da = (a.offset_hz - id.offset_hz).abs()
+                + if a.kind == id.kind { 0.0 } else { 800.0 };
+            let db = (b.offset_hz - id.offset_hz).abs()
+                + if b.kind == id.kind { 0.0 } else { 800.0 };
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+}
+
+/// Keep a per-span memory of labelled signals so the activity strip can
+/// name a frequency after the live spectrum chip has gone.
+fn merge_heard(app: &mut App) {
+    let now = Instant::now();
+    let mut fresh: Vec<(f64, identify::Kind, f32)> = Vec::new();
+    for id in &app.idents {
+        if id.kind == identify::Kind::Unknown {
+            continue;
+        }
+        let freq = app.center + id.offset_hz as f64;
+        let half = id.bw_hz as f64 * 0.5;
+        let ft = matches!(id.kind, identify::Kind::Ft8 | identify::Kind::Ft4);
+        let slack = if ft {
+            3500.0
+        } else {
+            id.bw_hz.max(80.0) as f64 * 0.6
+        };
+        if let Some(h) = app
+            .heard
+            .iter_mut()
+            .find(|h| h.kind == id.kind && (h.freq_hz - freq).abs() < slack)
+        {
+            h.freq_lo = h.freq_lo.min(freq - half);
+            h.freq_hi = h.freq_hi.max(freq + half);
+            h.freq_hz = 0.5 * (h.freq_lo + h.freq_hi);
+            h.snr_db = h.snr_db.max(id.snr_db);
+            h.count = h.count.saturating_add(1).max(1);
+            h.last = now;
+        } else {
+            app.heard.push(Heard {
+                freq_hz: freq,
+                freq_lo: freq - half,
+                freq_hi: freq + half,
+                kind: id.kind,
+                snr_db: id.snr_db,
+                count: 1,
+                last: now,
+            });
+            fresh.push((freq, id.kind, id.snr_db));
+        }
+    }
+    for (freq, kind, snr) in fresh {
+        let text = if matches!(kind, identify::Kind::Ft8 | identify::Kind::Ft4) {
+            format!("{:.3} kHz  {}  pile-up", freq / 1000.0, kind.label())
+        } else {
+            format!("{:.3} kHz  {}  {:+.0} dB", freq / 1000.0, kind.label(), snr)
+        };
+        app.push_note(text, Some(kind));
+    }
+    app.heard.retain(|h| {
+        let ham = matches!(
+            h.kind,
+            identify::Kind::Cw
+                | identify::Kind::Psk31
+                | identify::Kind::Rtty
+                | identify::Kind::Ft8
+                | identify::Kind::Ft4
+        );
+        !(ham && !bands::in_amateur(h.freq_hz)) && h.last.elapsed() < Duration::from_secs(180)
+    });
+    app.heard.sort_by(|a, b| {
+        a.freq_hz
+            .partial_cmp(&b.freq_hz)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 fn cycle_agc(app: &mut App, radio: &radio::Radio) {
@@ -1391,6 +1656,8 @@ fn retune(app: &mut App, radio: &radio::Radio, freq: f64) {
     app.psk_hits.clear();
     app.cw_hits.clear();
     app.idents.clear();
+    app.tracks.clear();
+    app.heard.clear();
     app.scout_iq.clear();
     app.ident_at = Instant::now();
     if let Some(d) = &mut app.decoder {
@@ -1623,7 +1890,10 @@ fn find_peaks(spectrum: &[f32], center: f64, rate: f64) -> Vec<(f64, f32)> {
     let thr = med + SIGNAL_SNR_DB;
     // The LO leaks a spike at the centre of the span; it is not a signal.
     let dc = n / 2;
-    let usable = |i: usize| i.abs_diff(dc) > 2 && spectrum[i] >= thr;
+    let edge = (n / 50).max(2);
+    let usable = |i: usize| {
+        i >= edge && i + edge < n && i.abs_diff(dc) > 2 && spectrum[i] >= thr
+    };
 
     let mut out = Vec::new();
     let mut i = 0;
@@ -1647,14 +1917,14 @@ fn find_peaks(spectrum: &[f32], center: f64, rate: f64) -> Vec<(f64, f32)> {
 
 // ---------------------------------------------------------------- rendering
 
-/// The four vertical panes (status, spectrum, waterfall, decode). Shared by
-/// the renderer and mouse hit-testing so they can never disagree.
-fn pane_rects(area: Rect, app: &App) -> [Rect; 4] {
+/// Status, spectrum, waterfall, decode, activity. Shared by the renderer
+/// and mouse hit-testing so they can never disagree.
+fn pane_rects(area: Rect, app: &App) -> [Rect; 5] {
     let wide = matches!(app.mode, Mode::Ft8 | Mode::Ft4 | Mode::Cw | Mode::Psk31);
     // `v` enlarges the decode pane at the expense of the waterfall.
     let dec = match (wide, app.decode_zoom) {
         (false, 0) => Constraint::Length(9),
-        (true, 0) => Constraint::Length(14),
+        (true, 0) => Constraint::Length(13),
         (_, 1) => Constraint::Percentage(45),
         (_, _) => Constraint::Percentage(65),
     };
@@ -1664,9 +1934,11 @@ fn pane_rects(area: Rect, app: &App) -> [Rect; 4] {
         Constraint::Length(10),
         Constraint::Min(3),
         dec,
+        // 1 content line + 2 border rows
+        Constraint::Length(3),
     ])
     .split(area);
-    [chunks[0], chunks[1], chunks[2], chunks[3]]
+    [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]]
 }
 
 /// The three FT sub-panes (activity, messages, stations).
@@ -1692,6 +1964,7 @@ fn draw(f: &mut Frame, app: &App) {
         Mode::Psk31 => draw_psk(f, chunks[3], app),
         _ => draw_decode(f, chunks[3], app),
     }
+    draw_activity(f, chunks[4], app);
 
     if let Some(ed) = &app.settings {
         draw_settings(f, f.area(), ed);
@@ -1977,14 +2250,6 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Green),
         ));
     }
-    if let Some(msg) = app.log.back() {
-        spans2.push(Span::styled(
-            format!("  {msg}"),
-            Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::ITALIC),
-        ));
-    }
     let line2 = Line::from(spans2);
 
     let title = if app.my_call.is_empty() {
@@ -1996,6 +2261,124 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Block::default().borders(Borders::ALL).title(title),
     );
     f.render_widget(p, area);
+}
+
+/// Thin full-width strip: remembered detections, then the latest status note.
+fn draw_activity(f: &mut Frame, area: Rect, app: &App) {
+    let live_n = app
+        .idents
+        .iter()
+        .filter(|i| i.kind != identify::Kind::Unknown)
+        .count();
+    let title = if app.heard.is_empty() {
+        " activity ".to_string()
+    } else {
+        format!(
+            " activity  {} heard{} ",
+            app.heard.len(),
+            if live_n > 0 {
+                format!(" · {live_n} live")
+            } else {
+                String::new()
+            }
+        )
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let w = inner.width as usize;
+    let mut spans: Vec<Span> = Vec::new();
+    let mut used = 0usize;
+    let mut shown = 0usize;
+    for h in &app.heard {
+        let live = app.idents.iter().any(|i| {
+            i.kind == h.kind
+                && ((app.center + i.offset_hz as f64) - h.freq_hz).abs()
+                    < i.bw_hz.max(80.0) as f64
+                        + if matches!(h.kind, identify::Kind::Ft8 | identify::Kind::Ft4) {
+                            2500.0
+                        } else {
+                            0.0
+                        }
+        });
+        let ft = matches!(h.kind, identify::Kind::Ft8 | identify::Kind::Ft4);
+        let span = h.freq_hi - h.freq_lo;
+        let chip = if ft && span > 400.0 {
+            format!(
+                "{:.1}–{:.1} {} ×{}",
+                h.freq_lo / 1000.0,
+                h.freq_hi / 1000.0,
+                h.kind.label(),
+                h.count.max(1)
+            )
+        } else {
+            format!(
+                "{:.3} {} {:+.0}",
+                h.freq_hz / 1000.0,
+                h.kind.label(),
+                h.snr_db
+            )
+        };
+        let extra = if shown == 0 { 0 } else { 3 };
+        if used + extra + chip.len() + 4 > w {
+            break;
+        }
+        if shown > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+            used += 3;
+        }
+        let style = if live {
+            Style::default()
+                .fg(Color::Black)
+                .bg(ident_color(h.kind))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(ident_color(h.kind))
+        };
+        spans.push(Span::styled(format!(" {chip} "), style));
+        used += chip.len() + 2;
+        shown += 1;
+    }
+    let hidden = app.heard.len().saturating_sub(shown);
+    if hidden > 0 && used + 4 <= w {
+        let more = format!(" +{hidden}");
+        if used + more.len() <= w {
+            spans.push(Span::styled(more, Style::default().fg(Color::DarkGray)));
+            used += 4;
+        }
+    }
+    if let Some(note) = app
+        .notes
+        .iter()
+        .rev()
+        .nth(app.note_scroll)
+    {
+        let room = w.saturating_sub(used);
+        if room > 8 {
+            let sep = if used == 0 { "" } else { " │ " };
+            let budget = room.saturating_sub(sep.len());
+            let mut text = note.text.clone();
+            if text.len() > budget {
+                text.truncate(budget.saturating_sub(1));
+                text.push('…');
+            }
+            spans.push(Span::styled(sep, Style::default().fg(Color::DarkGray)));
+            let style = match note.kind {
+                Some(k) => Style::default().fg(ident_color(k)),
+                None => Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
+            };
+            spans.push(Span::styled(text, style));
+        }
+    } else if spans.is_empty() {
+        spans.push(Span::styled(
+            "listening…",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
 /// Map the visible frequency window onto bin indices.
@@ -2042,18 +2425,52 @@ fn freq_col(app: &App, width: usize, offset_hz: f64) -> usize {
     ((frac * width as f64) as isize).clamp(0, width as isize - 1) as usize
 }
 
-fn ident_color(kind: identify::Kind) -> Color {
+fn ident_rgb(kind: identify::Kind) -> (u8, u8, u8) {
     match kind {
-        identify::Kind::Cw => Color::Yellow,
-        identify::Kind::Psk31 => Color::LightBlue,
-        identify::Kind::Rtty => Color::Magenta,
-        identify::Kind::Ft8 => Color::Green,
-        identify::Kind::Ft4 => Color::LightGreen,
-        identify::Kind::Ssb => Color::White,
-        identify::Kind::Am => Color::LightYellow,
-        identify::Kind::Carrier => Color::DarkGray,
-        identify::Kind::Unknown => Color::Gray,
+        identify::Kind::Cw => (240, 196, 48),
+        identify::Kind::Psk31 => (80, 176, 255),
+        identify::Kind::Rtty => (224, 96, 196),
+        identify::Kind::Ft8 => (48, 208, 88),
+        identify::Kind::Ft4 => (132, 228, 116),
+        identify::Kind::Ssb => (228, 228, 236),
+        identify::Kind::Am => (255, 208, 80),
+        identify::Kind::Carrier => (148, 148, 156),
+        identify::Kind::Unknown => (160, 160, 160),
     }
+}
+
+fn ident_color(kind: identify::Kind) -> Color {
+    let (r, g, b) = ident_rgb(kind);
+    Color::Rgb(r, g, b)
+}
+
+fn mix_rgb(c: (u8, u8, u8), bg: (u8, u8, u8), a: f32) -> Color {
+    let a = a.clamp(0.0, 1.0);
+    Color::Rgb(
+        (c.0 as f32 * a + bg.0 as f32 * (1.0 - a)).round() as u8,
+        (c.1 as f32 * a + bg.1 as f32 * (1.0 - a)).round() as u8,
+        (c.2 as f32 * a + bg.2 as f32 * (1.0 - a)).round() as u8,
+    )
+}
+
+fn ident_fade_fg(kind: identify::Kind, a: f32) -> Color {
+    mix_rgb(ident_rgb(kind), (18, 18, 24), a)
+}
+
+fn ident_fade_bg(kind: identify::Kind, a: f32) -> Color {
+    let (r, g, b) = ident_rgb(kind);
+    mix_rgb((r / 6, g / 6, b / 6), (18, 18, 24), a)
+}
+
+fn ident_chip(kind: identify::Kind) -> String {
+    format!("▌{}▐", kind.label())
+}
+
+fn ident_col_span(app: &App, w: usize, offset_hz: f32, bw_hz: f32) -> (usize, usize) {
+    let lo = freq_col(app, w, (offset_hz - bw_hz * 0.5) as f64);
+    let hi = freq_col(app, w, (offset_hz + bw_hz * 0.5) as f64);
+    let (a, b) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+    (a, b.max(a))
 }
 
 fn draw_spectrum(f: &mut Frame, area: Rect, app: &App) {
@@ -2118,10 +2535,19 @@ fn draw_spectrum(f: &mut Frame, area: Rect, app: &App) {
     for h in &app.cw_hits {
         hit_cols.push(freq_col(app, w, h.offset_hz as f64));
     }
-    let ident_cols: Vec<(usize, identify::Kind)> = app
-        .idents
+    let now = Instant::now();
+    let ident_spans: Vec<(usize, usize, usize, identify::Kind, f32)> = app
+        .tracks
         .iter()
-        .map(|i| (freq_col(app, w, i.offset_hz as f64), i.kind))
+        .filter_map(|t| {
+            let a = t.alpha(now);
+            if a < 0.12 {
+                return None;
+            }
+            let (lo, hi) = ident_col_span(app, w, t.offset_hz, t.bw_hz);
+            let mid = freq_col(app, w, t.offset_hz as f64);
+            Some((lo, hi, mid, t.kind, a))
+        })
         .collect();
     if let Some(d) = &app.decoder {
         for hz in d.candidate_hz() {
@@ -2147,7 +2573,10 @@ fn draw_spectrum(f: &mut Frame, area: Rect, app: &App) {
             let eighths = (norm * (bars_h * 8) as f32) as usize;
             let cell = eighths.saturating_sub(from_bottom * 8).min(8);
             let ch = BARS[cell];
-            let ident = ident_cols.iter().find(|(c, _)| *c == x).map(|(_, k)| *k);
+            let on_peak = ident_spans.iter().find(|(_, _, mid, _, _)| *mid == x);
+            let in_occ = ident_spans
+                .iter()
+                .find(|(lo, hi, _, _, _)| x >= *lo && x <= *hi);
             let style = if x == cur {
                 Style::default().fg(Color::Magenta).bg(Color::Rgb(40, 0, 40))
             } else if lock_col == Some(x) {
@@ -2158,10 +2587,12 @@ fn draw_spectrum(f: &mut Frame, area: Rect, app: &App) {
                 Style::default()
                     .fg(Color::Cyan)
                     .bg(Color::Rgb(0, 24, 32))
-            } else if let Some(k) = ident {
+            } else if let Some((_, _, _, k, a)) = on_peak {
                 Style::default()
-                    .fg(ident_color(k))
-                    .bg(Color::Rgb(20, 20, 28))
+                    .fg(ident_fade_fg(*k, *a))
+                    .bg(ident_fade_bg(*k, *a))
+            } else if let Some((_, _, _, k, a)) = in_occ {
+                Style::default().fg(heat(norm)).bg(ident_fade_bg(*k, *a))
             } else {
                 let mut s = Style::default().fg(heat(norm));
                 if in_band(x) {
@@ -2180,49 +2611,89 @@ fn draw_spectrum(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Overlay short kind labels on the top spectrum row, strongest first.
+/// Overlay occupancy shelves and kind chips on the top spectrum row.
 fn paint_ident_labels(lines: &mut [Line], app: &App, w: usize) {
-    if lines.is_empty() || w == 0 || app.idents.is_empty() {
+    if lines.is_empty() || w == 0 || app.tracks.is_empty() {
         return;
     }
-    let mut order: Vec<&identify::Ident> = app.idents.iter().collect();
+    let now = Instant::now();
+    let mut order: Vec<&LabelTrack> = app
+        .tracks
+        .iter()
+        .filter(|t| t.alpha(now) >= 0.12)
+        .collect();
     order.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
+        a.score
+            .partial_cmp(&b.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(
-                b.snr_db
-                    .partial_cmp(&a.snr_db)
+                a.snr_db
+                    .partial_cmp(&b.snr_db)
                     .unwrap_or(std::cmp::Ordering::Equal),
             )
     });
-    let mut used = vec![false; w];
     let row = lines[0].spans.clone();
     if row.len() != w {
         return;
     }
     let mut cells: Vec<Span> = row;
-    for id in order {
-        let label = id.kind.label();
-        if label.is_empty() {
+    // Weakest first so a stronger neighbour overwrites the shelf.
+    for t in &order {
+        let a = t.alpha(now);
+        let (lo, hi) = ident_col_span(app, w, t.offset_hz, t.bw_hz);
+        let shelf = Style::default()
+            .fg(ident_fade_fg(t.kind, a))
+            .bg(ident_fade_bg(t.kind, a));
+        for x in lo..=hi {
+            cells[x] = Span::styled("▀", shelf);
+        }
+    }
+    let mut used = vec![false; w];
+    // Strongest chips on top. Dim ones lose the inverse fill so they
+    // fade into the shelf instead of popping off as a solid block.
+    order.reverse();
+    for t in order {
+        let a = t.alpha(now);
+        if a < 0.28 {
             continue;
         }
-        let col = freq_col(app, w, id.offset_hz as f64);
-        let start = col.min(w.saturating_sub(label.len()));
-        let end = start + label.len();
+        let chip: Vec<char> = ident_chip(t.kind).chars().collect();
+        if chip.is_empty() {
+            continue;
+        }
+        let col = freq_col(app, w, t.offset_hz as f64);
+        let start = col
+            .saturating_sub(chip.len() / 2)
+            .min(w.saturating_sub(chip.len()));
+        let end = start + chip.len();
         if end > w || used[start..end].iter().any(|&u| u) {
             continue;
         }
-        let style = Style::default()
-            .fg(ident_color(id.kind))
-            .add_modifier(Modifier::BOLD);
-        for (i, ch) in label.chars().enumerate() {
+        let fg = ident_fade_fg(t.kind, a);
+        let bg = ident_fade_bg(t.kind, a);
+        let body = if a > 0.65 {
+            Style::default()
+                .fg(Color::Rgb(
+                    (18.0 * (1.0 - a) + 0.0) as u8,
+                    (18.0 * (1.0 - a)) as u8,
+                    (24.0 * (1.0 - a)) as u8,
+                ))
+                .bg(fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD)
+        };
+        let cap = Style::default().fg(fg).bg(bg);
+        for (i, ch) in chip.iter().enumerate() {
+            let style = if *ch == '▌' || *ch == '▐' { cap } else { body };
             cells[start + i] = Span::styled(ch.to_string(), style);
             used[start + i] = true;
         }
-        // One-column gap so adjacent labels stay readable.
         if end < w {
             used[end] = true;
+        }
+        if start > 0 {
+            used[start - 1] = true;
         }
     }
     lines[0] = Line::from(cells);
@@ -3145,7 +3616,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  r           RTTY normal/reverse shift"),
         Line::from("              PSK31 auto-locks to a nearby carrier (AFC)"),
         Line::from("  s           scan the current band; results are labelled"),
-        Line::from("              spectrum tags: CW PSK RTTY FT8 FT4 SSB AM CAR"),
+        Line::from("              spectrum chips + bottom activity strip (heard)"),
         Line::from("  v           enlarge the decode pane (cycles sizes)"),
         Line::from("  w / W       waterfall speed / hi-res frequency mode"),
         Line::from("  f / F       FFT size (frequency resolution)"),
@@ -3222,6 +3693,53 @@ mod tests {
         ] {
             assert!(!is_callsign(not), "{not} should not be a callsign");
         }
+    }
+
+    #[test]
+    fn labels_hold_across_a_missed_classify() {
+        let mut app = App::new(14_070_000.0, 192_000.0, Mode::Off);
+        let hit = super::identify::Ident {
+            offset_hz: 4000.0,
+            bw_hz: 80.0,
+            snr_db: 14.0,
+            kind: super::identify::Kind::Cw,
+            score: 0.8,
+        };
+        super::apply_idents(&mut app, vec![hit]);
+        assert_eq!(app.tracks.len(), 1);
+        assert_eq!(app.idents.len(), 1);
+        super::apply_idents(&mut app, Vec::new());
+        assert_eq!(app.tracks.len(), 1, "a miss must not drop the track");
+        assert_eq!(app.idents.len(), 1, "chip stays visible through the hold");
+        let a = app.tracks[0].alpha(std::time::Instant::now());
+        assert!(a > 0.7, "just-missed label should still be bright, got {a}");
+    }
+
+    #[test]
+    fn heard_lingers_after_live_idents_drop() {
+        let mut app = App::new(14_070_000.0, 192_000.0, Mode::Off);
+        app.idents = vec![super::identify::Ident {
+            offset_hz: 4000.0,
+            bw_hz: 80.0,
+            snr_db: 14.0,
+            kind: super::identify::Kind::Cw,
+            score: 0.8,
+        }];
+        super::merge_heard(&mut app);
+        assert_eq!(app.heard.len(), 1);
+        assert!(
+            app.notes
+                .iter()
+                .any(|n| n.text.contains("CW") && n.text.contains("14074")),
+            "first sighting should land in the activity log: {:?}",
+            app.notes.iter().map(|n| n.text.as_str()).collect::<Vec<_>>()
+        );
+        let notes = app.notes.len();
+        super::merge_heard(&mut app);
+        assert_eq!(app.heard.len(), 1, "same signal must not duplicate");
+        assert_eq!(app.notes.len(), notes, "re-detect must not spam the log");
+        app.idents.clear();
+        assert_eq!(app.heard.len(), 1, "memory stays after the live chip fades");
     }
 
     /// Stations must keep their first-heard order as decodes arrive, so the
@@ -3316,6 +3834,7 @@ mod tests {
         assert!(text.contains("eye"), "eye pane missing:\n{text}");
         assert!(text.contains("tuner"), "tuner pane missing:\n{text}");
         assert!(text.contains("copy"), "copy pane missing:\n{text}");
+        assert!(text.contains("activity"), "activity strip missing:\n{text}");
     }
 
     #[test]

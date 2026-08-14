@@ -5495,7 +5495,7 @@ mod psk_auto_tests {
     /// Drive one span of IQ through auto mode, including the periodic passes
     /// that `feed` gates on wall-clock time — a test loop runs far faster
     /// than real time and would otherwise never trigger them.
-    fn run_auto(app: &mut App, iq: &[Complex32], fs: f64) {
+    pub(super) fn run_auto(app: &mut App, iq: &[Complex32], fs: f64) {
         let mut spec = Spectrum::new(4096);
         let mut out = Vec::new();
         let per_pass = ((fs * 1.2) as usize / 16_384).max(1);
@@ -5792,6 +5792,57 @@ mod scout_cost {
         println!(
             "  candidates: {} peaks",
             scout_peaks(&app.smoothed, 0.0, app.rate).len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod band_plan_tests {
+    use super::*;
+
+    /// The band plan overlaps: FT4 shares a dial frequency with 30 m PSK31
+    /// and with 20 m RTTY. Those sub-bands used to be inside an FT window,
+    /// which vetoed every other classification, so they were invisible.
+    #[test]
+    fn narrowband_subbands_inside_ft_windows_are_still_classified() {
+        // 30 m: PSK31 and FT4 share 10.140.
+        assert_eq!(bands::narrow_mode(10_140_800.0), Some("PSK"));
+        assert_eq!(bands::ft_mode(10_140_800.0), Some("FT4"));
+        // 20 m: RTTY and FT4 share 14.080.
+        assert_eq!(bands::narrow_mode(14_080_800.0), Some("RTTY"));
+        // 20 m PSK31 is not shared and must stay unshadowed.
+        assert_eq!(bands::narrow_mode(14_070_800.0), Some("PSK"));
+        assert_eq!(bands::ft_mode(14_070_800.0), None);
+        // The FT8 calling frequency itself is not a narrowband sub-band.
+        assert_eq!(bands::narrow_mode(14_075_500.0), None);
+        assert_eq!(bands::ft_mode(14_075_500.0), Some("FT8"));
+    }
+
+    /// End to end on 30 m, where PSK31 sits on top of FT4's dial frequency.
+    #[test]
+    fn psk31_reaches_the_screen_on_30m() {
+        let fs = 192_000.0f64;
+        let center = 10_140_000.0f64;
+        let n_total = (1.0f32 / 6.0).sqrt();
+        let in_bw = n_total * (31.25 / fs as f32).sqrt();
+        let scale = 10f32.powf(-15.0 / 20.0) / in_bw;
+        // 800 Hz into the passband: inside FT4's window as well.
+        let iq =
+            decoders::tests::gen_psk31_at("CQ CQ DE W1AW W1AW K ", fs, 800.0, scale, 14.0);
+        let mut app = App::new(center, fs, Mode::Auto);
+        app.agc = AgcMode::Off;
+        super::psk_auto_tests::run_auto(&mut app, &iq, fs);
+
+        let copy: String = app
+            .rows
+            .iter()
+            .filter(|r| r.kind == identify::Kind::Psk31)
+            .map(|r| r.copy.clone())
+            .collect();
+        assert!(
+            copy.contains("W1AW"),
+            "30 m PSK31 produced no copy; idents were {:?}",
+            app.idents.iter().map(|i| i.kind.label()).collect::<Vec<_>>()
         );
     }
 }

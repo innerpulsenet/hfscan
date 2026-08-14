@@ -196,7 +196,17 @@ fn classify_one(
 
     // One-off modes only outside the FT USB windows — a single FT8 tone
     // looks like a carrier / CW / a 170 Hz neighbour pair (RTTY).
-    if ft.is_none() {
+    //
+    // Except where the band plan puts a narrowband sub-band inside an FT
+    // window, which it does in five places: FT4 shares a dial frequency with
+    // 30 m PSK31 and with 20 m RTTY, and sits 500 Hz above 40 m RTTY. Vetoing
+    // those outright means those sub-bands can never be classified as
+    // anything, so 30 m PSK31 and 20 m RTTY were simply invisible. The
+    // confirmations are strong enough to be trusted there: a real FT8 message
+    // rendered as complex baseband neither confirms as PSK31 nor frames as
+    // Baudot (see the tests of exactly that).
+    let shared = bands::narrow_mode(abs_hz).is_some();
+    if ft.is_none() || shared {
         let psk = psk31::scan_span(audio, fs_a as f64, &[(0.0, 20.0)]);
         if let Some(h) = psk.iter().max_by(|a, b| {
             a.quality
@@ -227,7 +237,7 @@ fn classify_one(
             && fine.env_cv < 0.30
             && fine.n_peaks <= 8
             && fine.obw_hz < 450.0
-            && !matches!(ft, Some(Kind::Ft8));
+            && (shared || !matches!(ft, Some(Kind::Ft8)));
         if clean {
             return (Kind::Rtty, 0.78);
         }

@@ -66,6 +66,23 @@ pub const MARKERS: &[Marker] = &[
     Marker { freq: 15_000_000.0, label: "WWV" },
 ];
 
+/// The narrowband sub-band `freq` falls in, on the same USB convention the
+/// FT windows use: the marker is a dial frequency and the signals sit in the
+/// audio passband above it.
+///
+/// PSK31 and RTTY are packed into a couple of kHz above their marker, so this
+/// is deliberately narrower than the FT window. It exists because the two
+/// overlap: FT4 shares a dial frequency with 30 m PSK31 and with 20 m RTTY,
+/// and sits 500 Hz above 40 m RTTY. Without it those sub-bands are inside an
+/// FT window and can never be classified as anything else at all.
+pub fn narrow_mode(freq: f64) -> Option<&'static str> {
+    MARKERS
+        .iter()
+        .filter(|m| matches!(m.label, "PSK" | "RTTY"))
+        .find(|m| (100.0..2600.0).contains(&(freq - m.freq)))
+        .map(|m| m.label)
+}
+
 pub fn band_for(freq: f64) -> Option<&'static Band> {
     BANDS
         .iter()

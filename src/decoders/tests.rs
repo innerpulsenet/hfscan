@@ -1553,3 +1553,126 @@ fn bench_rtty_polarity() {
         );
     }
 }
+
+// ------------------------------------------------- sideband / inversion
+
+/// Receiving a signal on the opposite sideband conjugates its baseband —
+/// the spectrum comes out mirrored about the tuned frequency. This is what
+/// that does to each mode.
+fn invert(sig: &[Complex32]) -> Vec<Complex32> {
+    sig.iter().map(|s| s.conj()).collect()
+}
+
+/// Sideband cannot matter to CW or PSK31, and it is worth having that on
+/// record rather than reasoned about.
+///
+/// CW is detected by envelope, and |s| is unchanged by conjugation. PSK31 is
+/// differentially encoded, and conjugation negates every phase difference —
+/// which maps 0 to 0 and pi to -pi, the same symbol. So both decode the same
+/// either way up, and neither needs to know which sideband it arrived on.
+/// (Data modes are USB by convention on every band regardless, including the
+/// bands where voice is LSB, so this should never arise — but it costs
+/// nothing to be immune to it.)
+#[test]
+fn cw_and_psk31_are_indifferent_to_sideband() {
+    let cw_msg = "CQ CQ DE W1AW W1AW K UR RST 599 QTH NEWINGTON DE W1AW K";
+    let cw = gen_cw(cw_msg, 20.0, scale_for_snr(15.0));
+    let up = decode_cw(&cw, 0.0);
+    let down = decode_cw(&invert(&cw), 0.0);
+    assert!(
+        accuracy(cw_msg, &up) > 0.9 && accuracy(cw_msg, &down) > 0.9,
+        "CW differed by sideband: {up:?} vs {down:?}"
+    );
+
+    let psk_msg = "CQ CQ DE W1AW W1AW PSE K";
+    let psk = gen_psk31_snr(psk_msg, 0.0, psk_scale_for_snr(15.0));
+    let up = decode_psk(&psk, 0.0);
+    let down = decode_psk(&invert(&psk), 0.0);
+    assert!(
+        accuracy(psk_msg, &up) > 0.85 && accuracy(psk_msg, &down) > 0.85,
+        "PSK31 differed by sideband: {up:?} vs {down:?}"
+    );
+}
+
+/// RTTY is the one narrowband mode sideband does change, because inverting
+/// the spectrum swaps mark and space. That is the same thing as a reversed
+/// shift, and is now detected rather than assumed.
+#[test]
+fn rtty_is_indifferent_to_sideband() {
+    let msg = "RYRY CQ DE W1AW W1AW K";
+    let sig = gen_rtty(msg, 45.45, 170.0);
+    let up = decode_rtty(&sig);
+    let down = decode_rtty(&invert(&sig));
+    assert!(
+        accuracy(msg, &up) > 0.9 && accuracy(msg, &down) > 0.9,
+        "RTTY differed by sideband: {up:?} vs {down:?}"
+    );
+}
+
+// ------------------------------- narrowband modes inside the FT windows
+
+/// A real FT8 message as complex baseband: the encoder's own tone sequence,
+/// rendered as continuous-phase 8-FSK at 6.25 baud and 6.25 Hz spacing.
+///
+/// Rendered complex rather than as real audio on purpose. A real-valued
+/// signal carries its own mirror image, and squaring the pair produces a
+/// strong DC term that fakes a BPSK carrier — an artefact of the synthesis,
+/// not of FT8, and one that would make this test lie in the flattering
+/// direction. An SDR delivers complex baseband with no such image.
+fn ft8_as_iq(audio_hz: f32) -> Vec<Complex32> {
+    use mfsk_core::msg::wsjt77::pack77;
+    use mfsk_core::ft8::wave_gen::message_to_tones;
+    let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack77");
+    let tones = message_to_tones(&msg77);
+    let sps = (FS as f32 / 6.25) as usize; // 0.16 s per symbol
+    let mut out = Vec::with_capacity(tones.len() * sps);
+    let mut rng = 0x77aa_3311u32;
+    let mut phase = 0.0f32;
+    for &t in tones.iter() {
+        let hz = audio_hz + t as f32 * 6.25;
+        let step = 2.0 * PI * hz / FS as f32;
+        for _ in 0..sps {
+            phase += step;
+            if phase > PI {
+                phase -= 2.0 * PI;
+            }
+            out.push(
+                Complex32::from_polar(1.0, phase)
+                    + Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.01,
+            );
+        }
+    }
+    out
+}
+
+/// The FT windows shadow whole narrowband sub-bands — 30 m PSK31 sits on top
+/// of FT4, and 20 m and 30 m RTTY on top of FT4 as well. Letting the
+/// narrowband modes be considered there is only safe if their confirmations
+/// reject FT traffic, so that is checked directly rather than assumed.
+#[test]
+fn ft8_traffic_does_not_confirm_as_psk31() {
+    let iq = ft8_as_iq(1500.0);
+    // Look where the FT8 signal actually is, which is the hostile case.
+    let hits = psk31::scan_span(&iq, FS, &[(1500.0, 20.0), (0.0, 20.0)]);
+    assert!(
+        hits.is_empty(),
+        "FT8 traffic confirmed as PSK31: {hits:?}"
+    );
+}
+
+/// And the RTTY framer must not spell Baudot out of 8-FSK either.
+#[test]
+fn ft8_traffic_does_not_frame_as_rtty() {
+    let iq = ft8_as_iq(1500.0);
+    let mut d = rtty::RttyDecoder::new(FS);
+    let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+    chain.set_offset(1500.0);
+    let mut audio = Vec::new();
+    let mut out = String::new();
+    for chunk in iq.chunks(4096) {
+        chain.process(chunk, &mut audio);
+        out.push_str(&d.process(&audio));
+    }
+    let letters = out.chars().filter(|c| !c.is_whitespace()).count();
+    assert!(letters <= 4, "FT8 traffic framed as {letters} chars of RTTY: {out:?}");
+}

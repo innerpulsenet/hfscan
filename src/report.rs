@@ -30,7 +30,7 @@ const SEND_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_RECORDS: usize = 60;
 /// Re-report a station after this long, or sooner on a band change.
 const REREPORT_SECS: u32 = 3600;
-const SOFTWARE: &str = concat!("hfscan ", env!("CARGO_PKG_VERSION"));
+const SOFTWARE: &str = concat!("HFScan by KQ2Y v", env!("CARGO_PKG_VERSION"));
 
 pub struct Spot {
     call: String,

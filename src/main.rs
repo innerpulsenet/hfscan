@@ -114,6 +114,64 @@ const AUTO_LINE: usize = 48;
 /// also how far back the pane can be scrolled.
 const DECODE_LOG_MAX: usize = 800;
 
+/// Characters of rolling copy a held row keeps. Only the tail that fits the
+/// pane is ever drawn; the rest is what survives a narrow pane being widened.
+const ROW_COPY_MAX: usize = 512;
+/// A row with copy this recent counts as live, and sorts above the rest.
+const ROW_ACTIVE: Duration = Duration::from_secs(20);
+/// A row silent this long is forgotten entirely.
+const ROW_RETIRE: Duration = Duration::from_secs(600);
+/// Most held rows kept. The oldest silent row goes first.
+const MAX_ROWS: usize = 60;
+
+/// Which face the auto pane is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AutoView {
+    /// One held row per signal, copy accumulating in place.
+    Rows,
+    /// Every line of copy in the order it arrived.
+    Log,
+}
+
+/// One signal the auto decoders are holding, and everything heard on it.
+///
+/// The chronological log emits a line only when a decoder finishes one, so a
+/// slow CW station shows a few characters at a time and they scroll away.
+/// A held row instead accumulates into a buffer that stays put on screen, so
+/// the copy builds up in place and can be read as it arrives.
+struct SignalRow {
+    dial_hz: f64,
+    kind: identify::Kind,
+    mode: &'static str,
+    /// Rolling copy, oldest trimmed off the front. Already sanitised.
+    copy: String,
+    /// When copy last arrived — decides live versus silent, and the order.
+    last_copy: Instant,
+}
+
+impl SignalRow {
+    fn live(&self, now: Instant) -> bool {
+        now.duration_since(self.last_copy) < ROW_ACTIVE
+    }
+
+    /// Add what just came off the decoder, keeping the buffer bounded.
+    fn push_copy(&mut self, text: &str) {
+        self.copy.push_str(text);
+        self.last_copy = Instant::now();
+        // Trimmed on a character boundary, from the front, so the newest copy
+        // — the part actually on screen — is never what gets dropped.
+        let over = self.copy.chars().count().saturating_sub(ROW_COPY_MAX);
+        if over > 0 {
+            let cut = self
+                .copy
+                .char_indices()
+                .nth(over)
+                .map_or(self.copy.len(), |(i, _)| i);
+            self.copy.drain(..cut);
+        }
+    }
+}
+
 /// One line of copy from one automatic decoder, kept in columns.
 ///
 /// Keeping the pieces apart is what makes the pane both structured (the
@@ -425,6 +483,10 @@ struct App {
     /// many decoders talking at once, so its output is kept as records with
     /// their own columns rather than folded into the flat transcript.
     decode_log: VecDeque<DecodeEntry>,
+    /// One held row per signal heard in `Mode::Auto`. Live signals sort to
+    /// the top, signals that have gone quiet sink to the bottom.
+    rows: Vec<SignalRow>,
+    auto_view: AutoView,
     /// Structured FT8/FT4 decodes, newest last; drives the FT panes.
     ft_msgs: VecDeque<FtMessage>,
     /// Stations heard, in first-heard order so the list updates in place.
@@ -608,6 +670,8 @@ impl App {
             chain: DecodeChain::new(rate, 400.0, Mode::Off.audio_rate()),
             text: String::new(),
             decode_log: VecDeque::new(),
+            rows: Vec::new(),
+            auto_view: AutoView::Rows,
             ft_msgs: VecDeque::new(),
             stations: Vec::new(),
             decode_zoom: 0,
@@ -659,6 +723,7 @@ impl App {
         self.ft_msgs.clear();
         self.stations.clear();
         self.decode_log.clear();
+        self.rows.clear();
         self.msg_scroll = 0;
         self.st_scroll = 0;
         self.act_scroll = 0;
@@ -750,6 +815,7 @@ impl App {
     /// bound — the render clamps the offset to the wrapped length anyway.
     fn transcript_len(&self) -> usize {
         match self.mode {
+            Mode::Auto if self.auto_view == AutoView::Rows => self.rows.len(),
             Mode::Auto => self.decode_log.len(),
             // In FT modes the same offset scrolls the message table.
             Mode::Ft8 | Mode::Ft4 => self.ft_msgs.len(),
@@ -757,14 +823,81 @@ impl App {
         }
     }
 
-    /// Move the decode pane up (positive) or down (negative), clamped to the
-    /// copy that actually exists above the viewport. Letting the offset run
-    /// past the top is what makes a scrolled-back pane take dozens of dead
-    /// keypresses to get back to live, and puts a nonsense count in the title.
-    fn scroll_transcript(&mut self, delta: isize) {
+    /// Move the decode pane's viewport `up` lines up the screen (negative to
+    /// go down), clamped to the content outside it.
+    ///
+    /// The two auto faces anchor at opposite ends — the log at its newest
+    /// line, the roster at its top row — so the stored offset counts
+    /// backwards from live in one and forwards from the top in the other.
+    /// Taking a screen direction rather than a raw offset delta keeps that a
+    /// rendering detail: up is up in both, for the keys and the wheel alike.
+    ///
+    /// Clamping matters as much as direction: an offset allowed to run past
+    /// the end costs a dozen dead keypresses to unwind and puts a nonsense
+    /// count in the title.
+    fn scroll_transcript(&mut self, up: isize) {
+        let rows_view = self.mode == Mode::Auto && self.auto_view == AutoView::Rows;
+        let delta = if rows_view { -up } else { up };
         let max = self.transcript_len().saturating_sub(self.msg_rows.get());
         let next = self.msg_scroll as isize + delta;
         self.msg_scroll = next.clamp(0, max as isize) as usize;
+    }
+
+    /// The held row for a signal, created on first copy.
+    ///
+    /// Matched the same way the auto slots themselves are matched, so a
+    /// station drifting a little stays on its own row instead of sprouting a
+    /// new one every time the classifier re-reports it a few hertz over.
+    fn row_for(&mut self, dial_hz: f64, kind: identify::Kind, mode: &'static str) -> usize {
+        let slack = match kind {
+            identify::Kind::Rtty => 300.0,
+            identify::Kind::Ft8 | identify::Kind::Ft4 => 2000.0,
+            _ => 120.0,
+        };
+        if let Some(i) = self
+            .rows
+            .iter()
+            .position(|r| r.kind == kind && (r.dial_hz - dial_hz).abs() < slack)
+        {
+            // Follow the signal as it drifts, so the frequency shown is
+            // where it is now rather than where it was first heard.
+            self.rows[i].dial_hz = dial_hz;
+            return i;
+        }
+        self.rows.push(SignalRow {
+            dial_hz,
+            kind,
+            mode,
+            copy: String::new(),
+            last_copy: Instant::now(),
+        });
+        self.rows.len() - 1
+    }
+
+    /// Forget rows that have been silent too long, and order the rest: live
+    /// signals first by frequency, then the silent ones most-recent first, so
+    /// a station that stops sending sinks down the pane rather than vanishing
+    /// out from under whoever was reading it.
+    fn sort_rows(&mut self) {
+        let now = Instant::now();
+        self.rows
+            .retain(|r| now.duration_since(r.last_copy) < ROW_RETIRE);
+        self.rows.sort_by(|a, b| {
+            match b.live(now).cmp(&a.live(now)) {
+                std::cmp::Ordering::Equal => {}
+                other => return other,
+            }
+            if a.live(now) {
+                a.dial_hz
+                    .partial_cmp(&b.dial_hz)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                b.last_copy.cmp(&a.last_copy)
+            }
+        });
+        // Over the cap, the longest-silent rows are the ones to lose — they
+        // are already at the bottom after the sort.
+        self.rows.truncate(MAX_ROWS);
     }
 
     /// Put a remark of the scanner's own — a scan summary, a state change —
@@ -812,6 +945,9 @@ impl App {
         // (message, dial, mode) — spotting needs `&self.reporter`, so it
         // cannot happen while `self.auto` is mutably borrowed.
         let mut spots: Vec<(FtMessage, f64, &'static str)> = Vec::new();
+        // (dial, kind, mode, copy) for the held rows, applied after the loop
+        // for the same borrow reason.
+        let mut copies: Vec<(f64, identify::Kind, &'static str, String)> = Vec::new();
 
         for slot in &mut self.auto {
             slot.chain.process(block, &mut slot.audio);
@@ -832,6 +968,9 @@ impl App {
             // character-at-a-time modes need collecting into readable ones.
             if matches!(slot.kind, identify::Kind::Ft8 | identify::Kind::Ft4) {
                 for m in slot.decoder.take_messages() {
+                    // The held row reads as a stream of recent traffic on
+                    // this calling frequency; the log keeps the full detail.
+                    copies.push((dial_hz, kind, mode, format!("  {}  ", m.text)));
                     lines.push(row(m.format()));
                     spots.push((m, slot.dial_hz, slot.decoder.name()));
                 }
@@ -842,6 +981,10 @@ impl App {
                 if text.is_empty() {
                     slot.quiet += slot.audio.len();
                 } else {
+                    // Held rows take characters the moment they arrive, so a
+                    // slow CW station builds up copy in place instead of
+                    // waiting on a full line to be flushed to the log.
+                    copies.push((dial_hz, kind, mode, text.clone()));
                     slot.partial.push_str(&text);
                     slot.quiet = 0;
                 }
@@ -869,6 +1012,13 @@ impl App {
                 }
             }
         }
+
+        for (dial_hz, kind, mode, text) in copies {
+            let text = sanitize(&text);
+            let i = self.row_for(dial_hz, kind, mode);
+            self.rows[i].push_copy(&text);
+        }
+        self.sort_rows();
 
         // A row of nothing but spaces survives sanitising but says nothing.
         let mut added = 0usize;
@@ -1418,6 +1568,20 @@ fn run_app<B: Backend>(
                         let size = ["normal", "large", "huge"][app.decode_zoom as usize];
                         app.log(format!("decode pane: {size}"));
                     }
+                    KeyCode::Char('V') => {
+                        // The two faces anchor at opposite ends, so an offset
+                        // carried across would land somewhere arbitrary.
+                        app.msg_scroll = 0;
+                        app.auto_view = match app.auto_view {
+                            AutoView::Rows => AutoView::Log,
+                            AutoView::Log => AutoView::Rows,
+                        };
+                        let what = match app.auto_view {
+                            AutoView::Rows => "held rows",
+                            AutoView::Log => "chronological log",
+                        };
+                        app.log(format!("auto decode view: {what}"));
+                    }
                     KeyCode::Char('[') => retune(app, radio, app.center - 10_000.0),
                     KeyCode::Char(']') => retune(app, radio, app.center + 10_000.0),
                     KeyCode::PageUp => retune(app, radio, app.center - app.rate / 2.0),
@@ -1467,6 +1631,7 @@ fn run_app<B: Backend>(
                     KeyCode::Char('x') => {
                         app.text.clear();
                         app.decode_log.clear();
+                        app.rows.clear();
                         app.ft_msgs.clear();
                         app.stations.clear();
                         app.msg_scroll = 0;
@@ -1616,19 +1781,23 @@ fn scroll_pane_at(app: &mut App, area: Rect, col: u16, row: u16, delta: isize) {
             if inside(cols[0]) {
                 adj(&mut app.act_scroll);
             } else if inside(cols[1]) {
-                app.scroll_transcript(delta);
+                // `delta` counts rows down the pane; the transcript takes a
+                // direction, and wheel-up means older.
+                app.scroll_transcript(-delta);
             } else {
                 adj(&mut app.st_scroll);
             }
         } else if matches!(app.mode, Mode::Cw | Mode::Psk31) {
             let cols = cw_cols(chunks[3]);
             if inside(cols[1]) {
-                app.scroll_transcript(delta);
+                // `delta` counts rows down the pane; the transcript takes a
+                // direction, and wheel-up means older.
+                app.scroll_transcript(-delta);
             } else if inside(cols[2]) {
                 adj(&mut app.st_scroll);
             }
         } else {
-            app.scroll_transcript(delta);
+            app.scroll_transcript(-delta);
         }
     } else if inside(chunks[2]) {
         adj(&mut app.wf_scroll);
@@ -3413,12 +3582,24 @@ fn draw_decode(f: &mut Frame, area: Rect, app: &App) {
         _ => String::new(),
     };
     let mut title = format!(" decode: {}{extra} ", app.mode.label());
+    if app.mode == Mode::Auto {
+        let now = Instant::now();
+        let live = app.rows.iter().filter(|r| r.live(now)).count();
+        title = match app.auto_view {
+            // The roster's own counts say more than the slot tally does.
+            AutoView::Rows if !app.rows.is_empty() => {
+                format!(" decode: AUTO — {live} live / {} held ", app.rows.len())
+            }
+            AutoView::Rows => format!(" decode: AUTO{extra} "),
+            AutoView::Log => format!(" decode: AUTO — log{extra} "),
+        };
+    }
     if app.msg_scroll > 0 {
-        title = format!(
-            " decode: {}{extra} (scrolled up {}) ",
-            app.mode.label(),
-            app.msg_scroll
-        );
+        let what = match (app.mode, app.auto_view) {
+            (Mode::Auto, AutoView::Rows) => "scrolled down",
+            _ => "scrolled up",
+        };
+        title = format!("{}({what} {}) ", title, app.msg_scroll);
     }
     // A title wider than the box overruns the top border and takes the frame
     // with it, so it is cut to what the border can hold.
@@ -3434,11 +3615,108 @@ fn draw_decode(f: &mut Frame, area: Rect, app: &App) {
     }
 
     if app.mode == Mode::Auto {
-        f.render_widget(Paragraph::new(decode_log_lines(app, inner)), inner);
+        let body = match app.auto_view {
+            AutoView::Rows => signal_rows_lines(app, inner),
+            AutoView::Log => decode_log_lines(app, inner),
+        };
+        f.render_widget(Paragraph::new(body), inner);
         return;
     }
     let body = transcript_lines(app, inner.width as usize, inner.height as usize, false);
     f.render_widget(Paragraph::new(body), inner);
+}
+
+/// A silence long enough to matter, as a short human span: `12s`, `4m`, `1h`.
+fn short_age(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h", s / 3600)
+    }
+}
+
+/// The held rows: one line per signal, its copy accumulating in place.
+///
+/// The list is already ordered — live signals first, silent ones sinking to
+/// the bottom — so this only windows it. `msg_scroll` counts rows skipped
+/// from the top here, because the interesting end of a roster is the top,
+/// unlike the log where it is the newest line at the bottom.
+///
+/// Each row draws its copy right-aligned to the newest character, so a slow
+/// station's text fills the width and then scrolls, rather than appearing a
+/// character or two at a time and being flushed away.
+fn signal_rows_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
+    let rows = inner.height as usize;
+    let width = inner.width as usize;
+    app.msg_rows.set(rows);
+    let now = Instant::now();
+
+    let dim = Style::default().fg(Color::DarkGray);
+    if app.rows.is_empty() {
+        return vec![Line::from(Span::styled(
+            "  age    kHz  mode  copy — nothing heard yet",
+            dim,
+        ))];
+    }
+
+    // age (4) + gap, freq (9) + gap, mode (4) + two gaps before the copy.
+    const HEAD: usize = 5 + 10 + 6;
+    let copy_width = width.saturating_sub(HEAD).max(8);
+
+    app.rows
+        .iter()
+        .skip(app.msg_scroll.min(app.rows.len().saturating_sub(1)))
+        .take(rows)
+        .map(|r| {
+            let live = r.live(now);
+            let (cr, cg, cb) = ident_rgb(r.kind);
+            let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
+
+            let age = if live {
+                Span::styled(format!("{:<4} ", "live"), Style::default().fg(Color::Green))
+            } else {
+                let a = short_age(now.duration_since(r.last_copy));
+                Span::styled(format!("{a:<4} "), dim)
+            };
+            spans.push(age);
+            spans.push(Span::styled(
+                format!("{:>9.1} ", r.dial_hz / 1000.0),
+                Style::default().fg(if live { Color::Gray } else { Color::DarkGray }),
+            ));
+            spans.push(Span::styled(
+                format!("{:<4}  ", r.mode),
+                Style::default().fg(if live {
+                    Color::Rgb(cr, cg, cb)
+                } else {
+                    Color::DarkGray
+                }),
+            ));
+
+            // The tail, so the newest copy is always on screen. A leading
+            // ellipsis marks that there is more behind it.
+            let n = r.copy.chars().count();
+            let copy: String = if n > copy_width {
+                let skip = n - copy_width + 1;
+                std::iter::once('…')
+                    .chain(r.copy.chars().skip(skip))
+                    .collect()
+            } else {
+                r.copy.clone()
+            };
+            let style = if !live {
+                Style::default().fg(Color::Gray)
+            } else if r.copy.contains("CQ") {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            spans.push(Span::styled(copy, style));
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// The automatic transcript as fixed columns: time, frequency, mode, copy.
@@ -4210,7 +4488,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("  ← →         tune by one step   (shift: 10 steps)"),
         Line::from("  ↑ / ↓       scroll the decode transcript (shift: 10 lines)"),
-        Line::from("              auto mode lists time, kHz, mode, then the copy"),
+        Line::from("  V           auto decode view: held rows / chronological log"),
+        Line::from("              rows hold one signal each, copy building in place;"),
+        Line::from("              signals that go quiet sink to the bottom of the list"),
         Line::from("  wheel       scroll the pane under the mouse (waterfall too)"),
         Line::from("  z / Z       zoom in / out — also sets the tuning step"),
         Line::from("  n / N       next / previous signal (CW/PSK31: confirmed)"),
@@ -4804,30 +5084,162 @@ mod tests {
             mode: "CW",
             text: "X".repeat(500),
         });
+        // The same, held in rows: what a decoder chewing on noise builds up.
+        for i in 0..12 {
+            let k = app.row_for(14_000_000.0 + i as f64 * 900.0, identify::Kind::Cw, "CW");
+            app.rows[k].push_copy(&super::sanitize(&junk.repeat(9)));
+        }
+        app.rows[0].last_copy = super::Instant::now() - Duration::from_secs(300);
 
-        for (w, h) in [(80u16, 24u16), (40, 12), (200, 60)] {
-            for scroll in [0usize, 7, 9999] {
-                app.msg_scroll = scroll;
-                let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-                t.draw(|f| super::draw(f, &app)).unwrap();
-                let buf = t.backend().buffer();
-                for y in 0..h {
-                    for x in 0..w {
-                        let sym = buf[(x, y)].symbol();
-                        assert_eq!(
-                            sym.chars().count(),
-                            1,
-                            "cell ({x},{y}) is not one character: {sym:?}"
-                        );
-                        let c = sym.chars().next().unwrap();
-                        assert!(
-                            !c.is_control(),
-                            "control character reached cell ({x},{y}): {c:?}"
-                        );
+        for view in [super::AutoView::Rows, super::AutoView::Log] {
+            app.auto_view = view;
+            for (w, h) in [(80u16, 24u16), (40, 12), (200, 60)] {
+                for scroll in [0usize, 7, 9999] {
+                    app.msg_scroll = scroll;
+                    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+                    t.draw(|f| super::draw(f, &app)).unwrap();
+                    let buf = t.backend().buffer();
+                    for y in 0..h {
+                        for x in 0..w {
+                            let sym = buf[(x, y)].symbol();
+                            assert_eq!(
+                                sym.chars().count(),
+                                1,
+                                "cell ({x},{y}) is not one character: {sym:?}"
+                            );
+                            let c = sym.chars().next().unwrap();
+                            assert!(
+                                !c.is_control(),
+                                "control character reached cell ({x},{y}): {c:?}"
+                            );
+                        }
                     }
                 }
             }
         }
+    }
+
+    fn row(app: &mut App, freq: f64, kind: identify::Kind, copy: &str, ago_secs: u64) {
+        app.rows.push(super::SignalRow {
+            dial_hz: freq,
+            kind,
+            mode: kind.label(),
+            copy: copy.into(),
+            last_copy: super::Instant::now() - Duration::from_secs(ago_secs),
+        });
+    }
+
+    /// The point of a held row: copy from one signal accumulates in place
+    /// instead of being flushed away a few characters at a time, and once it
+    /// outgrows the pane the row shows the newest end of it.
+    #[test]
+    fn a_held_row_accumulates_copy_and_shows_the_newest_end() {
+        let mut app = App::new(7_030_000.0, 192_000.0, Mode::Auto);
+        let i = app.row_for(7_033_000.0, identify::Kind::Cw, "CW");
+        for chunk in ["CQ ", "CQ ", "DE ", "W1AW ", "W1AW ", "K"] {
+            app.rows[i].push_copy(chunk);
+        }
+        assert_eq!(app.rows[i].copy, "CQ CQ DE W1AW W1AW K");
+
+        // The same signal drifting a little stays on its own row.
+        let j = app.row_for(7_033_060.0, identify::Kind::Cw, "CW");
+        assert_eq!(i, j, "a small drift started a second row");
+        assert_eq!(app.rows.len(), 1);
+
+        let text_of = |l: &super::Line| {
+            l.spans.iter().map(|s| s.content.to_string()).collect::<String>()
+        };
+        // Copy wider than the pane shows its tail, marked as continuing.
+        app.rows[0].push_copy(&"-".repeat(400));
+        let rect = ratatui::layout::Rect::new(0, 0, 60, 4);
+        let drawn = text_of(&super::signal_rows_lines(&app, rect)[0]);
+        assert!(drawn.contains('…'), "no continuation mark: {drawn:?}");
+        assert!(drawn.ends_with('-'), "not showing the newest copy: {drawn:?}");
+        assert!(drawn.chars().count() <= 60, "row overran the pane: {drawn:?}");
+
+        // The buffer stays bounded however long the station transmits.
+        for _ in 0..50 {
+            app.rows[0].push_copy(&"x".repeat(100));
+        }
+        assert!(app.rows[0].copy.chars().count() <= super::ROW_COPY_MAX);
+    }
+
+    /// A signal that stops sending must sink below the live ones rather than
+    /// disappearing, and must eventually be forgotten.
+    #[test]
+    fn silent_rows_sink_to_the_bottom_then_retire() {
+        let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
+        row(&mut app, 14_083_000.0, identify::Kind::Rtty, "old", 120);
+        row(&mut app, 14_074_000.0, identify::Kind::Ft8, "new", 0);
+        row(&mut app, 14_030_000.0, identify::Kind::Cw, "recent", 30);
+        row(&mut app, 14_040_000.0, identify::Kind::Cw, "live too", 5);
+        row(&mut app, 14_025_000.0, identify::Kind::Cw, "ancient", 9_999);
+        app.sort_rows();
+
+        // The long-silent row is gone; the rest are live-first by frequency,
+        // then silent by how recently they were last heard.
+        let order: Vec<f64> = app.rows.iter().map(|r| r.dial_hz).collect();
+        assert_eq!(
+            order,
+            vec![14_040_000.0, 14_074_000.0, 14_030_000.0, 14_083_000.0],
+            "rows out of order"
+        );
+
+        // A row that goes quiet moves down; it is not dropped.
+        app.rows[0].last_copy = super::Instant::now() - Duration::from_secs(60);
+        app.sort_rows();
+        assert!(
+            app.rows.iter().any(|r| r.dial_hz == 14_040_000.0),
+            "a row that went quiet was dropped instead of sinking"
+        );
+        assert_eq!(app.rows[0].dial_hz, 14_074_000.0, "live row not on top");
+    }
+
+    /// The roster anchors at its top row and the log at its newest line, so
+    /// the stored offset counts in opposite directions. What the keys and the
+    /// wheel ask for is a direction on screen, and up must mean up in both.
+    #[test]
+    fn both_auto_views_scroll_the_same_direction() {
+        let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
+        for i in 0..30 {
+            row(&mut app, 14_000_000.0 + i as f64 * 1000.0, identify::Kind::Cw, "x", 0);
+        }
+        let rect = ratatui::layout::Rect::new(0, 0, 60, 5);
+        let text_of = |l: &super::Line| {
+            l.spans.iter().map(|s| s.content.to_string()).collect::<String>()
+        };
+        let _ = super::signal_rows_lines(&app, rect); // records the row count
+
+        // The roster starts at its top row; scrolling down walks the list.
+        assert!(text_of(&super::signal_rows_lines(&app, rect)[0]).contains("14000.0"));
+        app.scroll_transcript(-3);
+        assert!(text_of(&super::signal_rows_lines(&app, rect)[0]).contains("14003.0"));
+        app.scroll_transcript(3);
+        assert!(text_of(&super::signal_rows_lines(&app, rect)[0]).contains("14000.0"));
+        // And it cannot be scrolled up past the top, or down past the end.
+        app.scroll_transcript(50);
+        assert_eq!(app.msg_scroll, 0);
+        app.scroll_transcript(-500);
+        assert_eq!(app.msg_scroll, app.rows.len() - 5);
+        let tail = super::signal_rows_lines(&app, rect);
+        assert_eq!(tail.len(), 5, "the last page must still be full");
+        assert!(text_of(&tail[4]).contains("14029.0"));
+
+        // The log counts the other way but answers the same directions: up
+        // shows older lines, and the top clamps.
+        app.auto_view = super::AutoView::Log;
+        app.msg_scroll = 0;
+        for i in 0..30 {
+            app.push_decode_note(format!("note {i}"));
+        }
+        let _ = super::decode_log_lines(&app, rect);
+        assert!(text_of(&super::decode_log_lines(&app, rect)[4]).contains("note 29"));
+        app.scroll_transcript(3);
+        assert!(text_of(&super::decode_log_lines(&app, rect)[4]).contains("note 26"));
+        app.scroll_transcript(-3);
+        assert!(text_of(&super::decode_log_lines(&app, rect)[4]).contains("note 29"));
+        app.scroll_transcript(500);
+        assert_eq!(app.msg_scroll, app.decode_log.len() - 5);
     }
 
     /// Scrolling the auto pane must never move content past its own border,
@@ -4835,6 +5247,7 @@ mod tests {
     #[test]
     fn auto_pane_scrolls_within_its_bounds() {
         let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
+        app.auto_view = super::AutoView::Log;
         for i in 0..50 {
             app.decode_log.push_back(super::DecodeEntry {
                 stamp: "00:00:00".into(),
@@ -4930,4 +5343,5 @@ mod tests {
         assert!(text.contains("14074.2"), "activity RF range missing:\n{text}");
     }
 }
+
 

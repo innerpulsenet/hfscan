@@ -97,6 +97,12 @@ pub trait Decoder: Send {
     fn squelched(&self) -> bool {
         true
     }
+    /// Whether the soft AGC may ride this decoder's audio. Modes that
+    /// normalise a whole capture themselves must say no: a running gain
+    /// tracker moves the noise floor underneath their own soft metrics.
+    fn wants_agc(&self) -> bool {
+        true
+    }
     /// Drain structured messages decoded since the last call. FT8/FT4 produce
     /// one per decode; PSK31 produces one when a CQ/DE callsign is recognised.
     fn take_messages(&mut self) -> Vec<FtMessage> {
@@ -146,16 +152,20 @@ pub enum Mode {
     Psk31,
     Ft8,
     Ft4,
+    /// Decode every digital signal in the span at once, each on its own
+    /// tuning chain. Not a decoder itself — see `AutoSlot` in main.
+    Auto,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 6] = [
+    pub const ALL: [Mode; 7] = [
         Mode::Off,
         Mode::Cw,
         Mode::Rtty,
         Mode::Psk31,
         Mode::Ft8,
         Mode::Ft4,
+        Mode::Auto,
     ];
 
     pub fn next(self) -> Mode {
@@ -171,6 +181,7 @@ impl Mode {
             Mode::Psk31 => "PSK31",
             Mode::Ft8 => "FT8",
             Mode::Ft4 => "FT4",
+            Mode::Auto => "AUTO",
         }
     }
 
@@ -185,7 +196,8 @@ impl Mode {
 
     pub fn make(self, fs: f64) -> Option<Box<dyn Decoder>> {
         match self {
-            Mode::Off => None,
+            // Auto builds its own decoders, one per signal found.
+            Mode::Off | Mode::Auto => None,
             Mode::Cw => Some(Box::new(cw::CwDecoder::new(fs))),
             Mode::Rtty => Some(Box::new(rtty::RttyDecoder::new(fs))),
             Mode::Psk31 => Some(Box::new(psk31::Psk31Decoder::new(fs))),

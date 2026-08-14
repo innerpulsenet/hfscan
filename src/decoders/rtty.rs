@@ -1,8 +1,12 @@
 //! Baudot RTTY decoder. Default 45.45 baud / 170 Hz shift, which covers almost
 //! all amateur HF RTTY. Uses an FM discriminator plus start-bit clock recovery.
 //!
-//! Tune so the cursor sits midway between the mark and space tones; if the text
-//! comes out as garbage try the reverse-shift toggle (`r`).
+//! The slicer threshold is not fixed at 0 Hz: envelope trackers follow the
+//! mark and space tone extremes and slice midway between them, so the cursor
+//! only has to be near the pair, not exactly centred. Bits are decided from
+//! the discriminator averaged over the middle of each bit rather than one
+//! instantaneous sample. If the text comes out as garbage try the
+//! reverse-shift toggle (`r`).
 
 use super::Decoder;
 use crate::dsp::OnePole;
@@ -24,6 +28,16 @@ pub struct RttyDecoder {
     text: String,
     locked_bits: u32,
     err_bits: u32,
+    /// Discriminator extremes (fast attack, slow decay); the slicer sits
+    /// midway, which is what makes an off-centre tuning still decode.
+    fmax: f32,
+    fmin: f32,
+    thr: f32,
+    track_fast: f32,
+    track_slow: f32,
+    /// Integrate-and-dump over the middle of the current bit.
+    bit_acc: f32,
+    bit_n: u32,
 }
 
 #[derive(PartialEq)]
@@ -54,6 +68,13 @@ impl RttyDecoder {
             text: String::new(),
             locked_bits: 0,
             err_bits: 0,
+            fmax: 0.0,
+            fmin: 0.0,
+            thr: 0.0,
+            track_fast: 1.0 - (-1.0f32 / (0.004 * fs)).exp(),
+            track_slow: 1.0 - (-1.0f32 / (1.5 * fs)).exp(),
+            bit_acc: 0.0,
+            bit_n: 0,
         }
     }
 
@@ -109,8 +130,25 @@ impl Decoder for RttyDecoder {
                 f = -f;
             }
             let f = self.disc.process(f);
+
+            // Follow the tone extremes (fast out, slow back) and slice midway
+            // between them. Only trust the midpoint once the spread looks
+            // like a real FSK pair, so noise alone does not drag it around.
+            if f > self.fmax {
+                self.fmax += (f - self.fmax) * self.track_fast;
+            } else {
+                self.fmax += (f - self.fmax) * self.track_slow;
+            }
+            if f < self.fmin {
+                self.fmin += (f - self.fmin) * self.track_fast;
+            } else {
+                self.fmin += (f - self.fmin) * self.track_slow;
+            }
+            if self.fmax - self.fmin > 0.35 * self.shift {
+                self.thr = 0.5 * (self.fmax + self.fmin);
+            }
             // Mark is the high tone, space the low one.
-            let mark = f > 0.0;
+            let mark = f > self.thr;
 
             match self.state {
                 State::Idle => {
@@ -124,6 +162,8 @@ impl Decoder for RttyDecoder {
                             self.counter = 0.0;
                             self.bits = 0;
                             self.nbits = 0;
+                            self.bit_acc = 0.0;
+                            self.bit_n = 0;
                         }
                     } else {
                         self.counter = 0.0;
@@ -131,17 +171,32 @@ impl Decoder for RttyDecoder {
                 }
                 State::Data => {
                     self.counter += 1.0;
+                    // Average the discriminator across the middle of the bit
+                    // (15%..50% of the way in, given the mid-bit dump below):
+                    // one noisy sample can no longer flip the decision.
+                    if self.counter >= self.samples_per_bit * 0.65 {
+                        self.bit_acc += f;
+                        self.bit_n += 1;
+                    }
                     if self.counter >= self.samples_per_bit {
                         self.counter -= self.samples_per_bit;
+                        let avg = if self.bit_n > 0 {
+                            self.bit_acc / self.bit_n as f32
+                        } else {
+                            f
+                        };
+                        self.bit_acc = 0.0;
+                        self.bit_n = 0;
+                        let m = avg > self.thr;
                         if self.nbits < 5 {
                             // Baudot sends the least significant bit first.
-                            if mark {
+                            if m {
                                 self.bits |= 1 << self.nbits;
                             }
                             self.nbits += 1;
                         } else {
                             // Stop bit must be mark; otherwise we lost framing.
-                            if mark {
+                            if m {
                                 let code = self.bits;
                                 self.emit(code);
                                 self.locked_bits = self.locked_bits.saturating_add(1);
@@ -165,8 +220,13 @@ impl Decoder for RttyDecoder {
         } else {
             0.0
         };
+        let off = if self.thr.abs() > 5.0 {
+            format!(" {:+.0}Hz", self.thr)
+        } else {
+            String::new()
+        };
         format!(
-            "{:.2} baud/{:.0}Hz {} {:.0}% framed",
+            "{:.2} baud/{:.0}Hz {}{off} {:.0}% framed",
             self.baud,
             self.shift,
             if self.reverse { "REV" } else { "NOR" },
@@ -187,6 +247,11 @@ impl Decoder for RttyDecoder {
         self.text.clear();
         self.locked_bits = 0;
         self.err_bits = 0;
+        self.fmax = 0.0;
+        self.fmin = 0.0;
+        self.thr = 0.0;
+        self.bit_acc = 0.0;
+        self.bit_n = 0;
     }
 }
 

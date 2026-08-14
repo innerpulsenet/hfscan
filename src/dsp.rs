@@ -123,6 +123,57 @@ pub fn smooth_bins(src: &[f32], taps: usize, out: &mut Vec<f32>) {
     }
 }
 
+/// Mix `iq` down by `hz` and decimate by `decim` for the scouts and the
+/// signature classifier. The decimation window is triangular (two boxcars
+/// back to back), giving a sinc² response — roughly double the stopband dB
+/// of a plain block average for one extra accumulator — so a strong
+/// neighbour elsewhere in the span aliases far less into the analysis audio.
+pub fn mix_decim(iq: &[Complex32], fs: f32, hz: f32, decim: usize) -> Vec<Complex32> {
+    let step = -2.0 * PI * hz / fs;
+    let mut phase = 0.0f32;
+    let mut out = Vec::with_capacity(iq.len() / decim.max(1) + 1);
+    if decim <= 1 {
+        for &s in iq {
+            let (sin, cos) = phase.sin_cos();
+            phase += step;
+            if phase > PI {
+                phase -= 2.0 * PI;
+            } else if phase < -PI {
+                phase += 2.0 * PI;
+            }
+            out.push(s * Complex32::new(cos, sin));
+        }
+        return out;
+    }
+    let d = decim as f32;
+    // Each sample feeds the falling half of the window ending this block and
+    // the rising half of the one ending next block; the halves sum to D+1.
+    let norm = 1.0 / (d + 1.0);
+    let mut fall = Complex32::new(0.0, 0.0);
+    let mut rise = Complex32::new(0.0, 0.0);
+    let mut r = 0usize;
+    for &s in iq {
+        let (sin, cos) = phase.sin_cos();
+        phase += step;
+        if phase > PI {
+            phase -= 2.0 * PI;
+        } else if phase < -PI {
+            phase += 2.0 * PI;
+        }
+        let m = s * Complex32::new(cos, sin);
+        fall += m * (1.0 - r as f32 / d);
+        rise += m * ((r + 1) as f32 / d);
+        r += 1;
+        if r == decim {
+            out.push(fall * norm);
+            fall = rise;
+            rise = Complex32::new(0.0, 0.0);
+            r = 0;
+        }
+    }
+    out
+}
+
 /// Numerically controlled oscillator used to shift a signal of interest to 0 Hz.
 pub struct Nco {
     phase: f64,
@@ -180,6 +231,12 @@ impl DecimFir {
         self.taps = lowpass_taps(cutoff_hz, fs, n);
     }
 
+    /// Redesign at a new length as well as a new cutoff. The sample history
+    /// is kept, so changing the filter does not click.
+    pub fn set_taps(&mut self, cutoff_hz: f32, fs: f32, ntaps: usize) {
+        self.taps = lowpass_taps(cutoff_hz, fs, ntaps | 1);
+    }
+
     pub fn decim(&self) -> usize {
         self.decim
     }
@@ -201,6 +258,23 @@ impl DecimFir {
             self.buf.drain(..i);
         }
     }
+}
+
+/// A Blackman-windowed sinc moves from passband to stopband in about
+/// `5.5 / ntaps` of the sample rate. Every filter length below is derived
+/// from that relationship rather than guessed, because a cutoff far narrower
+/// than the transition width is not a filter you designed — it is whatever
+/// the window happened to give you.
+const TRANSITION_K: f32 = 5.5;
+
+fn transition_hz(fs: f32, ntaps: usize) -> f32 {
+    TRANSITION_K * fs / ntaps.max(1) as f32
+}
+
+/// Shortest odd tap count whose transition is no wider than `want_hz`.
+fn taps_for_transition(fs: f32, want_hz: f32, lo: usize, hi: usize) -> usize {
+    let n = (TRANSITION_K * fs / want_hz.max(1e-3)).ceil() as usize;
+    n.clamp(lo, hi) | 1
 }
 
 fn lowpass_taps(cutoff_hz: f32, fs: f32, ntaps: usize) -> Vec<f32> {
@@ -226,12 +300,23 @@ fn lowpass_taps(cutoff_hz: f32, fs: f32, ntaps: usize) -> Vec<f32> {
     taps
 }
 
+/// Radio-rate taps. Only the samples the decimator keeps are evaluated, so
+/// this costs `taps × fs_out` multiplies per second regardless of `fs_in`.
+const RADIO_TAPS: usize = 511;
+const AUDIO_TAPS_MIN: usize = 129;
+const AUDIO_TAPS_MAX: usize = 1023;
+
 /// NCO + decimating lowpass: takes wideband IQ at the radio rate and produces
 /// narrowband complex baseband centred on the cursor at the mode's audio rate.
 ///
-/// A second FIR at the audio rate sharpens the skirt — the radio-rate
-/// decimator cannot resolve a 80 Hz cutoff at 192 kHz with a practical
-/// tap count, but 129 taps at 8 kHz can.
+/// The two FIRs have distinct jobs. The radio-rate stage is *only* an
+/// anti-alias filter: it passes the whole channel flat and is stopped before
+/// `fs_out - bw/2`, the lowest frequency that folds into the channel when
+/// decimating. It deliberately does not try to realise the channel width
+/// itself — an 80 Hz cutoff at 192 kHz is 35× narrower than 511 taps can
+/// resolve there, so asking for it yields the window's own shape, not an
+/// 80 Hz filter. The audio-rate stage is the channel filter, and its length
+/// is sized from the transition the requested bandwidth actually needs.
 pub struct DecodeChain {
     nco: Nco,
     fir: DecimFir,
@@ -250,16 +335,18 @@ impl DecodeChain {
     pub fn new(fs_in: f64, bandwidth: f32, target_rate: f64) -> Self {
         let decim = (fs_in / target_rate).round().max(1.0) as usize;
         let fs_out = fs_in / decim as f64;
-        let audio_cut = (bandwidth / 2.0).min(fs_out as f32 * 0.45);
-        Self {
+        let mut chain = Self {
             nco: Nco::new(),
-            fir: DecimFir::new(bandwidth / 2.0, fs_in as f32, decim, 255),
-            audio: DecimFir::new(audio_cut, fs_out as f32, 1, 129),
+            fir: DecimFir::new(fs_out as f32 * 0.5, fs_in as f32, decim, RADIO_TAPS),
+            audio: DecimFir::new(bandwidth / 2.0, fs_out as f32, 1, AUDIO_TAPS_MIN),
             fs_in,
             fs_out,
             mixed: Vec::new(),
             decimated: Vec::new(),
-        }
+        };
+        // One place decides both cutoffs and the audio length.
+        chain.set_bandwidth(bandwidth);
+        chain
     }
 
     pub fn fs_out(&self) -> f64 {
@@ -271,9 +358,25 @@ impl DecodeChain {
     }
 
     pub fn set_bandwidth(&mut self, bw: f32) {
-        self.fir.set_cutoff(bw / 2.0, self.fs_in as f32);
-        let audio_cut = (bw / 2.0).min(self.fs_out as f32 * 0.45).max(20.0);
-        self.audio.set_cutoff(audio_cut, self.fs_out as f32);
+        let fs_out = self.fs_out as f32;
+        let half = (bw * 0.5).clamp(10.0, fs_out * 0.45);
+
+        // Anti-alias stage. Flat across the channel, stopped by the time
+        // the spectrum folds back onto it.
+        let tr = transition_hz(self.fs_in as f32, RADIO_TAPS);
+        let lo = half + tr * 0.5;
+        let hi = (fs_out - half - tr * 0.5).max(lo);
+        let radio_cut = (fs_out * 0.5).clamp(lo, hi);
+        self.fir.set_cutoff(radio_cut, self.fs_in as f32);
+
+        // Channel stage. FT8/FT4 set the tightest requirement: the chain sits
+        // 1600 Hz above the dial and the decoder searches 200–3000 Hz, so the
+        // lower skirt has to be flat at 200 Hz and already stopped at 0 Hz —
+        // 129 taps could not do that and cost the edges of the waterfall
+        // several dB. Ask for a transition that fits inside the setting.
+        let want_tr = (0.06 * bw).max(0.01 * fs_out);
+        let ntaps = taps_for_transition(fs_out, want_tr, AUDIO_TAPS_MIN, AUDIO_TAPS_MAX);
+        self.audio.set_taps(half, fs_out, ntaps);
     }
 
     pub fn process(&mut self, input: &[Complex32], out: &mut Vec<Complex32>) {
@@ -432,11 +535,106 @@ mod tests {
     fn decode_chain_still_emits_audio() {
         let mut chain = DecodeChain::new(192_000.0, 400.0, 8000.0);
         chain.set_bandwidth(200.0);
-        let input: Vec<Complex32> = (0..4096)
+        // A quarter second of IQ, fed in the ~16k blocks the radio delivers.
+        let input: Vec<Complex32> = (0..48_000)
             .map(|i| Complex32::new((i as f32 * 0.01).sin() * 0.05, 0.0))
             .collect();
         let mut out = Vec::new();
-        chain.process(&input, &mut out);
-        assert!(!out.is_empty(), "audio FIR should emit samples");
+        let mut total = 0usize;
+        for c in input.chunks(16_384) {
+            chain.process(c, &mut out);
+            total += out.len();
+        }
+        assert!(total > 0, "audio FIR should emit samples");
+        // Both FIRs swallow half their length once, at startup. Past that the
+        // chain must keep up with the input or audio would drift behind.
+        let expect = input.len() / 24;
+        assert!(
+            total > expect - 1200 && total <= expect,
+            "emitted {total} of an expected ~{expect} samples"
+        );
+    }
+
+    /// Gain of the whole chain at `hz` off centre, relative to DC, in dB.
+    fn chain_resp_db(fs_in: f64, bw: f32, target: f64, hz: f64) -> f32 {
+        let tone = |hz: f64| -> f32 {
+            let mut chain = DecodeChain::new(fs_in, bw, target);
+            let n = (fs_in * 0.4) as usize;
+            let mut phase = 0.0f64;
+            let step = 2.0 * std::f64::consts::PI * hz / fs_in;
+            let input: Vec<Complex32> = (0..n)
+                .map(|_| {
+                    let s = Complex32::from_polar(1.0, phase as f32);
+                    phase += step;
+                    s
+                })
+                .collect();
+            let mut out = Vec::new();
+            let mut all = Vec::new();
+            for c in input.chunks(16384) {
+                chain.process(c, &mut out);
+                all.extend_from_slice(&out);
+            }
+            if all.len() < 200 {
+                return -200.0;
+            }
+            let tail = &all[all.len() / 2..];
+            let p: f32 = tail.iter().map(|c| c.norm_sqr()).sum::<f32>() / tail.len() as f32;
+            10.0 * (p + 1e-30).log10()
+        };
+        tone(hz) - tone(0.0)
+    }
+
+    /// FT8/FT4 put the chain 1600 Hz above the dial and search 200–3000 Hz,
+    /// so the passband has to be flat across ±1400 Hz. A filter too soft to
+    /// manage that quietly costs the top and bottom of the waterfall several
+    /// dB — the stations that were already marginal.
+    #[test]
+    fn ft8_passband_is_flat_across_the_search_range() {
+        for off in [-1400.0, -1200.0, -600.0, 600.0, 1200.0, 1400.0] {
+            let r = chain_resp_db(192_000.0, 3000.0, 12_000.0, off);
+            assert!(
+                r > -1.0,
+                "FT8 audio {:.0} Hz is {r:.1} dB down; passband must be flat",
+                off + 1600.0
+            );
+        }
+        // ...and still stopped before the real part folds it onto itself.
+        let fold = chain_resp_db(192_000.0, 3000.0, 12_000.0, -1750.0);
+        assert!(fold < -30.0, "below the dial should be rejected, got {fold:.1} dB");
+    }
+
+    /// A filter setting has to mean what it says: the narrow positions are
+    /// the ones that dig a signal out of QRM, and they are also the ones a
+    /// fixed tap count cannot resolve.
+    #[test]
+    fn narrow_filters_are_the_width_they_claim() {
+        for bw in [80.0f32, 200.0, 500.0] {
+            let edge = chain_resp_db(192_000.0, bw, 8000.0, (bw / 2.0) as f64);
+            assert!(
+                (-9.0..-3.0).contains(&edge),
+                "{bw:.0} Hz filter is {edge:.1} dB at its own edge, so it is not {bw:.0} Hz wide"
+            );
+            // An octave out must be genuinely gone, not merely rolling off.
+            let out = chain_resp_db(192_000.0, bw, 8000.0, bw as f64);
+            assert!(
+                out < -40.0,
+                "{bw:.0} Hz filter passes {out:.1} dB at {bw:.0} Hz off centre"
+            );
+        }
+    }
+
+    /// Everything within half a channel of `fs_out` folds straight onto the
+    /// signal when the decimator drops samples, and no later filter can
+    /// separate it again.
+    #[test]
+    fn decimation_does_not_alias_into_the_channel() {
+        for hz in [7900.0, 8000.0, 8100.0, 16_000.0] {
+            let r = chain_resp_db(192_000.0, 400.0, 8000.0, hz);
+            assert!(
+                r < -60.0,
+                "{hz:.0} Hz folds into the channel at {r:.1} dB"
+            );
+        }
     }
 }

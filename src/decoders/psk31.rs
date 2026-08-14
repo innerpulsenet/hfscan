@@ -16,6 +16,7 @@
 
 use super::{Decoder, FtMessage, PskView};
 use std::collections::VecDeque;
+use crate::dsp::mix_decim;
 use crate::report::is_callsign;
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
@@ -546,21 +547,28 @@ fn dc_focus(buf: &[Complex32], fs: f32, hz: f32) -> f32 {
     let bin_hz = fs / N as f32;
     let mut low = 0.0f32;
     let mut high = 0.0f32;
-    // Only the first few DFT bins are needed (0–50 Hz).
+    // Only a few DFT bins are needed (|f| ≤ 50 Hz) — but both signs: a
+    // residual offset a few hertz *below* DC puts the carrier's energy in
+    // the negative-frequency bins, and ignoring those rejects real PSK31.
     let k_max = ((50.0 / bin_hz).ceil() as usize).min(N / 2);
     for k in 0..=k_max {
-        let mut acc = Complex32::new(0.0, 0.0);
-        let w = -2.0 * PI * k as f32 / N as f32;
-        for (i, &s) in mixed.iter().enumerate() {
-            let (sin, cos) = (w * i as f32).sin_cos();
-            acc += s * Complex32::new(cos, sin);
-        }
-        let p = acc.norm_sqr();
-        let f = k as f32 * bin_hz;
-        if f <= 20.0 {
-            low += p;
-        } else if f <= 50.0 {
-            high += p;
+        for &bin in &[k, N - k] {
+            if bin == N || (k == 0 && bin != 0) {
+                continue; // N-0 aliases bin 0; count DC once
+            }
+            let mut acc = Complex32::new(0.0, 0.0);
+            let w = -2.0 * PI * bin as f32 / N as f32;
+            for (i, &s) in mixed.iter().enumerate() {
+                let (sin, cos) = (w * i as f32).sin_cos();
+                acc += s * Complex32::new(cos, sin);
+            }
+            let p = acc.norm_sqr();
+            let f = k as f32 * bin_hz;
+            if f <= 20.0 {
+                low += p;
+            } else if f <= 50.0 {
+                high += p;
+            }
         }
     }
     low / (low + high).max(1e-20)
@@ -575,6 +583,11 @@ fn env_notch(buf: &[Complex32], fs: f32, hz: f32, sps: usize) -> f32 {
     let mut acc = vec![0.0f32; sps];
     let mut cnt = vec![0u32; sps];
     let mut i = 0usize;
+    // ~60 Hz low-pass after the mix: the notch belongs to the candidate
+    // alone, and a neighbour elsewhere in the audio would otherwise fill
+    // it in and get real PSK31 rejected as a CW ghost.
+    let lpf_a = 1.0 - (-2.0 * PI * 60.0 / fs).exp();
+    let mut lpf = Complex32::new(0.0, 0.0);
     for &s in buf {
         let (sin, cos) = phase.sin_cos();
         phase += step;
@@ -583,7 +596,8 @@ fn env_notch(buf: &[Complex32], fs: f32, hz: f32, sps: usize) -> f32 {
         } else if phase < -PI {
             phase += 2.0 * PI;
         }
-        acc[i] += (s * Complex32::new(cos, sin)).norm();
+        lpf += (s * Complex32::new(cos, sin) - lpf) * lpf_a;
+        acc[i] += lpf.norm();
         cnt[i] += 1;
         i += 1;
         if i == sps {
@@ -612,43 +626,63 @@ fn score_bpsk(buf: &[Complex32], fs: f32, hz: f32, sps: usize) -> (f32, f32) {
     if buf.len() < sps * 8 {
         return (0.0, 0.0);
     }
+    // Mix once, then try four symbol-clock phases and keep the best: an
+    // integrate-and-dump straddling the reversals scores a real signal as
+    // noise, and the search has no other timing recovery.
     let step = -2.0 * PI * hz / fs;
     let mut phase = 0.0f32;
-    let mut prev = Complex32::new(0.0, 0.0);
-    let mut have = false;
-    let mut q_sum = 0.0;
-    let mut n = 0u32;
-    let mut revs = 0u32;
-    let mut i = 0;
-    while i + sps <= buf.len() {
-        let mut acc = Complex32::new(0.0, 0.0);
-        for k in 0..sps {
+    let mixed: Vec<Complex32> = buf
+        .iter()
+        .map(|&s| {
             let (sin, cos) = phase.sin_cos();
             phase += step;
-            acc += buf[i + k] * Complex32::new(cos, sin);
-        }
-        i += sps;
-        if !have {
+            if phase > PI {
+                phase -= 2.0 * PI;
+            } else if phase < -PI {
+                phase += 2.0 * PI;
+            }
+            s * Complex32::new(cos, sin)
+        })
+        .collect();
+    let mut best = (0.0f32, 0.0f32);
+    for off in [0, sps / 4, sps / 2, 3 * sps / 4] {
+        let mut prev = Complex32::new(0.0, 0.0);
+        let mut have = false;
+        let mut q_sum = 0.0;
+        let mut n = 0u32;
+        let mut revs = 0u32;
+        let mut i = off;
+        while i + sps <= mixed.len() {
+            let mut acc = Complex32::new(0.0, 0.0);
+            for k in 0..sps {
+                acc += mixed[i + k];
+            }
+            i += sps;
+            if !have {
+                prev = acc;
+                have = true;
+                continue;
+            }
+            let d = acc * prev.conj();
             prev = acc;
-            have = true;
-            continue;
+            let nrm = d.norm();
+            if nrm < 1e-12 {
+                continue;
+            }
+            q_sum += d.re.abs() / nrm;
+            if d.re < 0.0 {
+                revs += 1;
+            }
+            n += 1;
         }
-        let d = acc * prev.conj();
-        prev = acc;
-        let nrm = d.norm();
-        if nrm < 1e-12 {
-            continue;
+        if n > 0 {
+            let q = q_sum / n as f32;
+            if q > best.0 {
+                best = (q, revs as f32 / n as f32);
+            }
         }
-        q_sum += d.re.abs() / nrm;
-        if d.re < 0.0 {
-            revs += 1;
-        }
-        n += 1;
     }
-    if n == 0 {
-        return (0.0, 0.0);
-    }
-    (q_sum / n as f32, revs as f32 / n as f32)
+    best
 }
 
 fn utc_hhmmss() -> String {
@@ -883,32 +917,6 @@ pub fn scan_span(iq: &[Complex32], fs: f64, peaks: &[(f64, f32)]) -> Vec<PskHit>
             .partial_cmp(&b.offset_hz)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    out
-}
-
-fn mix_decim(iq: &[Complex32], fs: f32, hz: f32, decim: usize) -> Vec<Complex32> {
-    let step = -2.0 * PI * hz / fs;
-    let mut phase = 0.0f32;
-    let mut acc = Complex32::new(0.0, 0.0);
-    let mut n = 0usize;
-    let mut out = Vec::with_capacity(iq.len() / decim + 1);
-    let scale = 1.0 / decim as f32;
-    for &s in iq {
-        let (sin, cos) = phase.sin_cos();
-        phase += step;
-        if phase > PI {
-            phase -= 2.0 * PI;
-        } else if phase < -PI {
-            phase += 2.0 * PI;
-        }
-        acc += s * Complex32::new(cos, sin);
-        n += 1;
-        if n == decim {
-            out.push(acc * scale);
-            acc = Complex32::new(0.0, 0.0);
-            n = 0;
-        }
-    }
     out
 }
 

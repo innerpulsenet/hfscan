@@ -7,7 +7,7 @@
 //! near the cursor and mixes the best one to DC; `n` hops to the next.
 
 use super::{CwView, Decoder};
-use crate::dsp::OnePole;
+use crate::dsp::{mix_decim, OnePole};
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::collections::VecDeque;
@@ -46,7 +46,14 @@ pub struct CwDecoder {
     decim_ctr: usize,
     key_down: bool,
     run: f32,
+    /// Samples the raw slicer has disagreed with `key_down`. An edge is
+    /// only committed once this outlasts the debounce, so a QSB dropout
+    /// cannot split a dah and a static crash cannot invent a dit.
+    pending: f32,
     dit: f32,
+    /// Tracked dah length; with `dit` it sets the dit/dah boundary so a
+    /// heavy or light fist is classified by the operator's own weighting.
+    dah: f32,
     marks: VecDeque<f32>,
     /// Fast-adapt elements remaining after idle or a speed-change snap.
     acquire: u32,
@@ -100,7 +107,9 @@ impl CwDecoder {
             decim_ctr: 0,
             key_down: false,
             run: 0.0,
+            pending: 0.0,
             dit: 0.06 * env_rate, // start at 20 WPM
+            dah: 0.18 * env_rate,
             marks: VecDeque::with_capacity(MARK_HIST + 1),
             acquire: 16,
             symbol: String::new(),
@@ -156,6 +165,14 @@ impl CwDecoder {
         let lo = DIT_MIN_S * self.env_rate;
         let hi = DIT_MAX_S * self.env_rate;
         self.dit = self.dit.clamp(lo, hi);
+        self.dah = self.dah.clamp(2.0 * self.dit, 4.4 * self.dit);
+    }
+
+    /// How long the slicer must hold a new state before the edge is real.
+    /// Scales with the dit so QRQ is not smeared, floored so a single
+    /// noisy envelope sample can never key the decoder.
+    fn debounce_env(&self) -> f32 {
+        (0.25 * self.dit).clamp(0.006 * self.env_rate, 0.030 * self.env_rate)
     }
 
     fn push_symbol(&mut self) {
@@ -168,12 +185,14 @@ impl CwDecoder {
     }
 
     fn on_mark_end(&mut self, len: f32) {
-        let ratio = len / self.dit.max(1e-6);
-        if ratio < 2.0 {
-            self.symbol.push('.');
-        } else {
-            self.symbol.push('-');
-        }
+        let dit = self.dit.max(1e-6);
+        let ratio = len / dit;
+        // Classify against the midpoint of the *tracked* dit and dah, not a
+        // fixed 2.0: a fist with light dahs (or stretched dits) moves the
+        // boundary with it instead of straddling it.
+        let boundary = ((self.dit + self.dah) / (2.0 * dit)).clamp(1.55, 2.6);
+        let is_dah = ratio >= boundary;
+        self.symbol.push(if is_dah { '-' } else { '.' });
 
         self.marks.push_back(len);
         if self.marks.len() > MARK_HIST {
@@ -187,11 +206,17 @@ impl CwDecoder {
         if self.acquire > 0 {
             self.acquire -= 1;
         }
-        if ratio < 1.65 {
+        let dah_r = (self.dah / dit).clamp(2.0, 4.0);
+        if !is_dah && ratio < 1.65 {
             self.dit = (1.0 - alpha) * self.dit + alpha * len;
-        } else if (2.35..4.6).contains(&ratio) {
+        } else if is_dah && ratio < 5.0 {
             let a = alpha * 0.55;
-            self.dit = (1.0 - a) * self.dit + a * (len / 3.0);
+            self.dah = (1.0 - a) * self.dah + a * len;
+            if ratio > boundary * 1.15 {
+                // Unambiguous dah: it carries the clock too, scaled by the
+                // operator's own dah/dit ratio rather than an assumed 3.
+                self.dit = (1.0 - a) * self.dit + a * (len / dah_r);
+            }
         }
         self.clamp_dit();
 
@@ -200,10 +225,10 @@ impl CwDecoder {
         }
 
         // Confidence: how cleanly this mark sat in a dit or dah bucket.
-        let fit = if ratio < 2.0 {
-            1.0 - (ratio - 1.0).abs().min(1.0)
+        let fit = if is_dah {
+            1.0 - (len / self.dah.max(1e-6) - 1.0).abs().min(1.0)
         } else {
-            1.0 - (ratio / 3.0 - 1.0).abs().min(1.0)
+            1.0 - (ratio - 1.0).abs().min(1.0)
         };
         self.quality = 0.9 * self.quality + 0.1 * fit;
     }
@@ -251,16 +276,19 @@ impl CwDecoder {
             return;
         }
         let r = long / short;
-        if !(2.2..=4.4).contains(&r) {
+        // Down to 1.9: a light fist's dahs can sit near 2× the dit.
+        if !(1.9..=4.4).contains(&r) {
             return;
         }
         let rel = (short - self.dit).abs() / self.dit.max(1e-6);
         if rel > 0.28 {
             // Speed changed: adopt most of the new dit in one go.
             self.dit = 0.40 * self.dit + 0.60 * short;
+            self.dah = 0.40 * self.dah + 0.60 * long;
             self.acquire = 10;
         } else {
             self.dit = 0.82 * self.dit + 0.18 * short;
+            self.dah = 0.82 * self.dah + 0.18 * long;
         }
         self.clamp_dit();
     }
@@ -396,6 +424,7 @@ impl CwDecoder {
         self.symbol.clear();
         self.key_down = false;
         self.run = 0.0;
+        self.pending = 0.0;
         self.started = false;
         self.acquire = 16;
         self.idle = 0.0;
@@ -570,35 +599,41 @@ impl Decoder for CwDecoder {
             }
 
             if next == self.key_down {
-                self.run += 1.0;
-                if !self.key_down {
-                    self.idle += 1.0;
-                    if self.idle > 8.0 * self.dit && !self.symbol.is_empty() {
-                        self.push_symbol();
+                // Any sub-debounce flicker is folded back into the element
+                // it interrupted, so its length is not lost.
+                self.run += 1.0 + self.pending;
+                self.pending = 0.0;
+            } else {
+                // Tentative edge: only commit it once the new state has
+                // outlived the debounce.
+                self.pending += 1.0;
+                if self.pending >= self.debounce_env() {
+                    let len = self.run;
+                    self.run = self.pending;
+                    self.pending = 0.0;
+                    if self.key_down {
+                        if len > 0.010 * self.env_rate {
+                            self.on_mark_end(len);
+                        }
+                    } else if self.started {
+                        self.on_space_end(len);
                     }
-                    // New station after a pause: learn their speed quickly.
-                    if self.idle > 1.6 * self.env_rate {
-                        self.acquire = self.acquire.max(12);
-                    }
+                    self.started = true;
+                    self.idle = 0.0;
+                    self.key_down = next;
                 }
-                continue;
             }
 
-            let len = self.run;
-            self.run = 1.0;
-            if self.key_down {
-                if len > 0.010 * self.env_rate {
-                    self.on_mark_end(len);
+            if !self.key_down {
+                self.idle += 1.0;
+                if self.idle > 8.0 * self.dit && !self.symbol.is_empty() {
+                    self.push_symbol();
                 }
-                self.idle = 0.0;
-            } else {
-                if self.started {
-                    self.on_space_end(len);
+                // New station after a pause: learn their speed quickly.
+                if self.idle > 1.6 * self.env_rate {
+                    self.acquire = self.acquire.max(12);
                 }
-                self.started = true;
-                self.idle = 0.0;
             }
-            self.key_down = next;
         }
         std::mem::take(&mut self.text)
     }
@@ -621,6 +656,7 @@ impl Decoder for CwDecoder {
         self.text.clear();
         self.marks.clear();
         self.dit = 0.06 * self.env_rate;
+        self.dah = 0.18 * self.env_rate;
         self.clear_lock_state();
     }
 }
@@ -657,32 +693,6 @@ pub fn scan_span(iq: &[Complex32], fs: f64, peaks: &[(f64, f32)]) -> Vec<CwHit> 
             .partial_cmp(&b.offset_hz)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    out
-}
-
-fn mix_decim(iq: &[Complex32], fs: f32, hz: f32, decim: usize) -> Vec<Complex32> {
-    let step = -2.0 * PI * hz / fs;
-    let mut phase = 0.0f32;
-    let mut acc = Complex32::new(0.0, 0.0);
-    let mut n = 0usize;
-    let mut out = Vec::with_capacity(iq.len() / decim + 1);
-    let scale = 1.0 / decim as f32;
-    for &s in iq {
-        let (sin, cos) = phase.sin_cos();
-        phase += step;
-        if phase > PI {
-            phase -= 2.0 * PI;
-        } else if phase < -PI {
-            phase += 2.0 * PI;
-        }
-        acc += s * Complex32::new(cos, sin);
-        n += 1;
-        if n == decim {
-            out.push(acc * scale);
-            acc = Complex32::new(0.0, 0.0);
-            n = 0;
-        }
-    }
     out
 }
 

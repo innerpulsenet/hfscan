@@ -39,7 +39,15 @@ fn gen_cw(text: &str, wpm: f32, snr_scale: f32) -> Vec<Complex32> {
 }
 
 fn gen_cw_at(text: &str, wpm: f32, snr_scale: f32, tone: f32) -> Vec<Complex32> {
+    key_to_iq(&gen_cw_key(text, wpm, 3.0, &[1.0]), snr_scale, tone)
+}
+
+/// Key line for `text`: dahs are `dah_units` dits long and every element's
+/// length is multiplied by the next entry of `jitter`, cycling — a crude
+/// model of a human fist rather than a keyer.
+fn gen_cw_key(text: &str, wpm: f32, dah_units: f32, jitter: &[f32]) -> Vec<f32> {
     let dit = (1.2 / wpm * FS as f32) as usize;
+    let mut ji = 0usize;
     let mut key: Vec<f32> = Vec::new();
     // lead-in silence lets the threshold tracker settle
     key.extend(std::iter::repeat(0.0).take(dit * 8));
@@ -49,17 +57,23 @@ fn gen_cw_at(text: &str, wpm: f32, snr_scale: f32, tone: f32) -> Vec<Complex32> 
             continue;
         }
         for el in morse_for(ch).chars() {
-            let n = if el == '.' { dit } else { dit * 3 };
-            key.extend(std::iter::repeat(1.0).take(n));
+            let units = if el == '.' { 1.0 } else { dah_units };
+            let n = ((dit as f32) * units * jitter[ji % jitter.len()]) as usize;
+            ji += 1;
+            key.extend(std::iter::repeat(1.0).take(n.max(1)));
             key.extend(std::iter::repeat(0.0).take(dit)); // inter-element
         }
         key.extend(std::iter::repeat(0.0).take(dit * 2)); // char gap (total 3)
     }
     key.extend(std::iter::repeat(0.0).take(dit * 8));
+    key
+}
 
+/// AM the key line onto `tone` with noise, as `gen_cw_at` always did.
+fn key_to_iq(key: &[f32], snr_scale: f32, tone: f32) -> Vec<Complex32> {
     // Shape the key envelope so it has realistic rise/fall instead of clicks.
     let rise = (0.005 * FS as f32) as usize;
-    let mut env = key.clone();
+    let mut env = key.to_vec();
     let mut acc = 0.0f32;
     let a = 1.0 - (-1.0 / rise as f32).exp();
     for v in env.iter_mut() {
@@ -137,6 +151,62 @@ fn cw_follows_a_speed_change() {
     assert!(
         out.contains("PARIS") || out.contains("ARIS"),
         "speed-changed text lost: {out:?} ({})",
+        d.status()
+    );
+}
+
+/// A human fist: light dahs (2.2 dits) with ±15% element jitter, so the
+/// shortest dahs land at 1.87 dits. A fixed dit/dah boundary at 2.0
+/// misreads those; the adaptive boundary must settle between the
+/// operator's own clusters.
+#[test]
+fn cw_decodes_a_sloppy_fist() {
+    let key = gen_cw_key("CQ CQ DE W1AW W1AW K", 20.0, 2.2, &[0.85, 1.1, 1.0, 0.9, 1.15]);
+    let sig = key_to_iq(&key, 0.02, 600.0);
+    let mut d = cw::CwDecoder::new(FS);
+    let mut out = String::new();
+    for chunk in sig.chunks(4096) {
+        out.push_str(&d.process(chunk));
+    }
+    assert!(
+        out.contains("W1AW"),
+        "sloppy weighting lost the callsign: {out:?} ({})",
+        d.status()
+    );
+}
+
+/// QSB dropouts and static crashes: brief envelope glitches must be
+/// debounced, not decoded as extra elements or split gaps.
+#[test]
+fn cw_survives_dropouts_and_spikes() {
+    let mut sig = gen_cw("CQ CQ DE W1AW K", 20.0, 0.02);
+    let glitch = (0.007 * FS as f32) as usize;
+    // 7 ms fades every 150 ms...
+    let mut i = (0.15 * FS as f32) as usize;
+    while i + glitch < sig.len() {
+        for s in &mut sig[i..i + glitch] {
+            *s *= 0.02;
+        }
+        i += (0.15 * FS as f32) as usize;
+    }
+    // ...and 7 ms carrier bursts every 190 ms (in phase with the keyed
+    // tone, so inside a mark they add rather than cancel).
+    let mut i = (0.095 * FS as f32) as usize;
+    while i + glitch < sig.len() {
+        for (k, s) in sig[i..i + glitch].iter_mut().enumerate() {
+            let ph = 2.0 * PI * 600.0 * (i + k) as f32 / FS as f32;
+            *s += Complex32::from_polar(0.9, ph);
+        }
+        i += (0.19 * FS as f32) as usize;
+    }
+    let mut d = cw::CwDecoder::new(FS);
+    let mut out = String::new();
+    for chunk in sig.chunks(4096) {
+        out.push_str(&d.process(chunk));
+    }
+    assert!(
+        out.contains("W1AW"),
+        "glitched signal lost the callsign: {out:?} ({})",
         d.status()
     );
 }
@@ -285,6 +355,32 @@ fn rtty_decodes_baudot() {
     assert!(
         out.contains("RYRY") && out.contains("TEST"),
         "expected RYRY/TEST, got {out:?} ({})",
+        d.status()
+    );
+}
+
+/// The whole FSK pair sitting 100 Hz off the cursor — beyond half the
+/// shift, so a fixed 0 Hz slicer never even sees a start bit. The
+/// adaptive threshold has to find the midpoint on its own.
+#[test]
+fn rtty_tolerates_a_tuning_offset() {
+    let sig = gen_rtty("RYRY RYRY CQ DE TEST TEST", 45.45, 170.0);
+    let off: Vec<Complex32> = sig
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| {
+            let ph = 2.0 * PI * 100.0 * i as f32 / FS as f32;
+            s * Complex32::from_polar(1.0, ph)
+        })
+        .collect();
+    let mut d = rtty::RttyDecoder::new(FS);
+    let mut out = String::new();
+    for chunk in off.chunks(4096) {
+        out.push_str(&d.process(chunk));
+    }
+    assert!(
+        out.contains("TEST"),
+        "offset RTTY failed: {out:?} ({})",
         d.status()
     );
 }

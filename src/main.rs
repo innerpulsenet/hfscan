@@ -39,7 +39,184 @@ const WF_INTERVALS_MS: [u64; 5] = [100, 250, 500, 1000, 2000];
 
 /// Selectable FFT sizes. Larger means finer frequency resolution at the cost of
 /// a slower spectrum update, since a full segment has to be collected first.
-const FFT_SIZES: [usize; 6] = [1024, 2048, 4096, 8192, 16384, 32768];
+/// 65536 is 2.9 Hz per bin on a 192 kHz span and takes ~0.34 s to fill, which
+/// is what a deeply zoomed view needs before the display, not the data, is
+/// the thing limiting detail.
+const FFT_SIZES: [usize; 7] = [1024, 2048, 4096, 8192, 16384, 32768, 65536];
+
+/// Ceiling on waterfall history, in total floats. Rows are full-resolution
+/// spectra, so the row count has to fall as the FFT grows or the history
+/// alone would run to hundreds of megabytes. Every size up to 32768 still
+/// gets the full 400 rows.
+const WF_HISTORY_FLOATS: usize = 16 << 20;
+const WF_MAX_ROWS: usize = 400;
+
+/// How finely the waterfall subdivides a terminal cell.
+///
+/// A cell can carry exactly two colours, so the ceiling on detail is set by
+/// how many subcells those two colours are made to cover. Half blocks split a
+/// cell one way and paint each half exactly; quadrant glyphs split it both
+/// ways and approximate the four values with the best two-colour fit, which
+/// is the better trade for a heat map whose neighbours are usually similar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WfRes {
+    /// 2×2 subcells per character — twice the detail of either half-block mode.
+    Quad,
+    /// Two frequency bins per column, one time step per row.
+    Freq,
+    /// One frequency bin per column, two time steps per row.
+    Time,
+}
+
+impl WfRes {
+    const ALL: [WfRes; 3] = [WfRes::Quad, WfRes::Freq, WfRes::Time];
+
+    fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|x| *x == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            WfRes::Quad => "2x frequency, 2x time (quadrant)",
+            WfRes::Freq => "2x frequency, 1x time",
+            WfRes::Time => "1x frequency, 2x time",
+        }
+    }
+
+    /// Frequency subcells per column, and time steps per text row.
+    fn cells(self) -> (usize, usize) {
+        match self {
+            WfRes::Quad => (2, 2),
+            WfRes::Freq => (2, 1),
+            WfRes::Time => (1, 2),
+        }
+    }
+}
+
+/// Most decoders one span can carry. Each is a tuning chain plus a decoder;
+/// the chains alone measure well under 1% of a core each, but the transcript
+/// stops being readable long before the CPU runs out.
+const MAX_AUTO_SLOTS: usize = 10;
+/// Drop a narrowband slot whose signal the classifier has not seen for this
+/// long. FT8/FT4 slots are pinned to their calling frequencies instead.
+const AUTO_IDLE: Duration = Duration::from_secs(25);
+/// Flush a partial line from a character-at-a-time decoder after this many
+/// seconds *of audio* without a new character, so a station that stops
+/// sending still gets its last words shown. Measured in audio rather than
+/// wall clock so the behaviour does not depend on how fast blocks arrive.
+const AUTO_FLUSH_SECS: f64 = 2.0;
+/// Emit a line at this length even mid-transmission, so a long-winded
+/// station is not silent for the minute it takes to fill a screen line.
+const AUTO_LINE: usize = 48;
+
+/// One automatically tuned decoder inside the current span.
+///
+/// `Mode::Auto` runs a fleet of these instead of the single cursor-following
+/// chain. Each owns its tuning, so a CW station at one end of the span and an
+/// FT8 pile-up at the other are decoded from the same IQ simultaneously.
+struct AutoSlot {
+    /// Absolute dial frequency this decoder is tuned to.
+    dial_hz: f64,
+    kind: identify::Kind,
+    /// Set for FT8/FT4 slots, which are pinned to a calling frequency and
+    /// must not be retired just because the band went quiet for a slot.
+    pinned: bool,
+    chain: DecodeChain,
+    agc: SoftAgc,
+    decoder: Box<dyn Decoder>,
+    audio: Vec<Complex32>,
+    /// Text from a character-at-a-time decoder not yet emitted as a line.
+    partial: String,
+    last_seen: Instant,
+    /// Audio samples processed since the decoder last produced a character.
+    quiet: usize,
+}
+
+impl AutoSlot {
+    fn new(kind: identify::Kind, dial_hz: f64, center: f64, rate: f64, pinned: bool) -> Option<Self> {
+        let mode = match kind {
+            identify::Kind::Cw => Mode::Cw,
+            identify::Kind::Rtty => Mode::Rtty,
+            identify::Kind::Psk31 => Mode::Psk31,
+            identify::Kind::Ft8 => Mode::Ft8,
+            identify::Kind::Ft4 => Mode::Ft4,
+            _ => return None,
+        };
+        let mut chain = DecodeChain::new(rate, 400.0, mode.audio_rate());
+        let decoder = mode.make(chain.fs_out())?;
+        chain.set_bandwidth(decoder.bandwidth());
+        chain.set_offset(dial_hz - center + decoder.offset_shift());
+        let now = Instant::now();
+        Some(Self {
+            dial_hz,
+            kind,
+            pinned,
+            agc: SoftAgc::new(chain.fs_out()),
+            chain,
+            decoder,
+            audio: Vec::new(),
+            partial: String::new(),
+            last_seen: now,
+            quiet: 0,
+        })
+    }
+
+    /// How close another detection has to be to count as the same signal.
+    fn same_signal(&self, kind: identify::Kind, dial_hz: f64) -> bool {
+        let slack = match kind {
+            identify::Kind::Rtty => 300.0,
+            identify::Kind::Ft8 | identify::Kind::Ft4 => 2000.0,
+            _ => 120.0,
+        };
+        self.kind == kind && (self.dial_hz - dial_hz).abs() < slack
+    }
+
+    fn label(&self) -> String {
+        format!("{:>9.1} {:<4}", self.dial_hz / 1000.0, self.decoder.name())
+    }
+}
+
+/// The sixteen quadrant glyphs, indexed by a bitmask of which quarters take
+/// the foreground colour: bit 0 upper-left, 1 upper-right, 2 lower-left,
+/// 3 lower-right.
+#[rustfmt::skip]
+const QUADRANTS: [char; 16] = [
+    ' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛',
+    '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█',
+];
+
+/// Fit four subcell values into the two colours a cell can hold.
+///
+/// The split goes wherever the widest gap in the sorted values falls, so an
+/// edge — a carrier standing out of the noise floor — lands on the colour
+/// boundary and stays crisp. Returns the glyph plus the foreground and
+/// background values to colour it with.
+fn quad_cell(v: [f32; 4]) -> (char, f32, f32) {
+    let mut idx = [0usize, 1, 2, 3];
+    idx.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap_or(std::cmp::Ordering::Equal));
+    let mut cut = 0usize;
+    let mut widest = -1.0f32;
+    for k in 0..3 {
+        let gap = v[idx[k + 1]] - v[idx[k]];
+        if gap > widest {
+            widest = gap;
+            cut = k;
+        }
+    }
+    // A cell with nothing to separate is a solid block. Splitting it anyway
+    // would pick some arbitrary three-quarter glyph and lean on the terminal
+    // to draw two identical colours seamlessly.
+    if widest <= 1.0 / 255.0 {
+        let mean = (v[0] + v[1] + v[2] + v[3]) * 0.25;
+        return ('█', mean, mean);
+    }
+    let n_lo = cut + 1;
+    let lo = idx[..n_lo].iter().map(|&i| v[i]).sum::<f32>() / n_lo as f32;
+    let hi = idx[n_lo..].iter().map(|&i| v[i]).sum::<f32>() / (4 - n_lo) as f32;
+    let mask = idx[n_lo..].iter().fold(0usize, |m, &i| m | 1 << i);
+    (QUADRANTS[mask], hi, lo)
+}
 
 /// Temporal weight of each new spectrum estimate (the rest is history).
 const SMOOTH_TIME: [f32; 3] = [0.28, 0.12, 0.06];
@@ -127,7 +304,8 @@ struct Args {
     /// FFT size (1024..32768); higher gives finer resolution
     #[arg(long, default_value_t = 8192)]
     fft: usize,
-    /// Start with a decoder active: off, cw, rtty, psk31, ft8, ft4
+    /// Start with a decoder active: off, cw, rtty, psk31, ft8, ft4, auto
+    /// ("auto" decodes every digital signal it finds across the span)
     #[arg(short, long, default_value = "off")]
     mode: String,
     /// Your amateur radio callsign — enables spot reporting to pskreporter.info
@@ -207,9 +385,10 @@ struct App {
     st_scroll: usize,
     act_scroll: usize,
     wf_scroll: usize,
-    /// Waterfall hi-res mode: two frequency bins per column instead of two
-    /// time steps per row.
-    wf_wide: bool,
+    wf_res: WfRes,
+
+    /// Independent decoders running across the span in `Mode::Auto`.
+    auto: Vec<AutoSlot>,
 
     /// Station identity for spot reporting; empty when unconfigured.
     my_call: String,
@@ -378,7 +557,8 @@ impl App {
             st_scroll: 0,
             act_scroll: 0,
             wf_scroll: 0,
-            wf_wide: false,
+            wf_res: WfRes::Quad,
+            auto: Vec::new(),
             my_call: String::new(),
             my_grid: String::new(),
             reporter: None,
@@ -413,6 +593,8 @@ impl App {
         // Each mode wants its own audio rate, so the chain is rebuilt.
         self.chain = DecodeChain::new(self.rate, 3000.0, mode.audio_rate());
         self.decoder = mode.make(self.chain.fs_out());
+        // Auto rebuilds its fleet from the next classify pass.
+        self.auto.clear();
         self.soft_agc = SoftAgc::new(mode.audio_rate());
         self.apply_rx_filter();
         self.ft_msgs.clear();
@@ -520,6 +702,157 @@ impl App {
         self.center + self.cursor
     }
 
+    /// Run every automatic decoder over one IQ block and fold what they say
+    /// into the transcript, each line tagged with the frequency it came from.
+    fn feed_auto(&mut self, block: &[Complex32]) {
+        let soft = self.agc == AgcMode::Soft;
+        let mut lines: Vec<String> = Vec::new();
+        // (message, dial, mode) — spotting needs `&self.reporter`, so it
+        // cannot happen while `self.auto` is mutably borrowed.
+        let mut spots: Vec<(FtMessage, f64, &'static str)> = Vec::new();
+
+        for slot in &mut self.auto {
+            slot.chain.process(block, &mut slot.audio);
+            if soft && slot.decoder.wants_agc() {
+                slot.agc.process(&mut slot.audio);
+            }
+            let text = slot.decoder.process(&slot.audio);
+            let tag = slot.label();
+
+            // Slot-based modes hand back whole lines already; the
+            // character-at-a-time modes need collecting into readable ones.
+            if matches!(slot.kind, identify::Kind::Ft8 | identify::Kind::Ft4) {
+                for m in slot.decoder.take_messages() {
+                    lines.push(format!("{tag}  {}", m.format()));
+                    spots.push((m, slot.dial_hz, slot.decoder.name()));
+                }
+            } else {
+                for m in slot.decoder.take_messages() {
+                    spots.push((m, slot.dial_hz, slot.decoder.name()));
+                }
+                if text.is_empty() {
+                    slot.quiet += slot.audio.len();
+                } else {
+                    slot.partial.push_str(&text);
+                    slot.quiet = 0;
+                }
+                // Emit on a line break, once a line's worth has built up, or
+                // after a pause — otherwise a station that stops mid-word
+                // never appears at all.
+                while let Some(i) = slot.partial.find('\n') {
+                    let line: String = slot.partial.drain(..=i).collect();
+                    let line = line.trim_end().to_string();
+                    if !line.is_empty() {
+                        lines.push(format!("{tag}  {line}"));
+                    }
+                }
+                let idle = slot.quiet as f64 >= AUTO_FLUSH_SECS * slot.chain.fs_out();
+                if slot.partial.len() >= AUTO_LINE
+                    || (idle && !slot.partial.trim().is_empty())
+                {
+                    let take = slot
+                        .partial
+                        .char_indices()
+                        .nth(AUTO_LINE * 2)
+                        .map_or(slot.partial.len(), |(i, _)| i);
+                    let line: String = slot.partial.drain(..take).collect();
+                    lines.push(format!("{tag}  {}", line.trim_end()));
+                }
+            }
+        }
+
+        for line in lines {
+            self.text.push_str(&line);
+            self.text.push('\n');
+        }
+        if self.text.len() > 8000 {
+            let cut = self.text.len() - 6000;
+            // Never split a UTF-8 character when trimming the transcript.
+            let cut = (cut..self.text.len())
+                .find(|i| self.text.is_char_boundary(*i))
+                .unwrap_or(self.text.len());
+            self.text = self.text[cut..].to_string();
+        }
+        if let Some(r) = &self.reporter {
+            for (m, dial, mode) in &spots {
+                r.spot(m, *dial, mode);
+            }
+        }
+        for (m, _, _) in spots {
+            self.update_stations(&m);
+            self.ft_msgs.push_back(m);
+        }
+        while self.ft_msgs.len() > 600 {
+            self.ft_msgs.pop_front();
+        }
+    }
+
+    /// Point the automatic decoders at what is actually on the band.
+    ///
+    /// FT8 and FT4 are pinned to their calling frequencies rather than to
+    /// anything the classifier found: they always live there, a pile-up is
+    /// hard to localise from a periodogram, and a slot that stays put keeps
+    /// decoding through the gaps between transmissions.
+    fn reconcile_auto(&mut self) {
+        if self.mode != Mode::Auto {
+            if !self.auto.is_empty() {
+                self.auto.clear();
+            }
+            return;
+        }
+        let now = Instant::now();
+        let half = self.rate * 0.45;
+        let mut wanted: Vec<(identify::Kind, f64, bool)> = Vec::new();
+
+        for m in bands::MARKERS {
+            let kind = match m.label {
+                "FT8" => identify::Kind::Ft8,
+                "FT4" => identify::Kind::Ft4,
+                _ => continue,
+            };
+            // The decoder needs the whole 200–3000 Hz passband inside the span.
+            if (m.freq - self.center).abs() < half - 3200.0 {
+                wanted.push((kind, m.freq, true));
+            }
+        }
+
+        // Narrowband modes go wherever the classifier saw them, strongest
+        // first so a crowded span spends its slots on the best signals.
+        let mut found: Vec<&identify::Ident> = self
+            .idents
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.kind,
+                    identify::Kind::Cw | identify::Kind::Rtty | identify::Kind::Psk31
+                )
+            })
+            .collect();
+        found.sort_by(|a, b| {
+            b.snr_db
+                .partial_cmp(&a.snr_db)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for id in found {
+            wanted.push((id.kind, self.center + id.offset_hz as f64, false));
+        }
+
+        for (kind, dial, pinned) in wanted {
+            if let Some(s) = self.auto.iter_mut().find(|s| s.same_signal(kind, dial)) {
+                s.last_seen = now;
+                continue;
+            }
+            if self.auto.len() >= MAX_AUTO_SLOTS {
+                continue;
+            }
+            if let Some(slot) = AutoSlot::new(kind, dial, self.center, self.rate, pinned) {
+                self.auto.push(slot);
+            }
+        }
+        self.auto
+            .retain(|s| s.pinned || s.last_seen.elapsed() < AUTO_IDLE);
+    }
+
     /// Fold one decode into the station table. Stations keep the order they
     /// were first heard in — the list updates in place instead of reshuffling
     /// every slot, so a callsign stays put while you read it.
@@ -614,7 +947,8 @@ impl App {
         }
         if self.wf_last.elapsed() >= self.wf_interval() {
             self.waterfall.push_front(std::mem::take(&mut self.wf_accum));
-            while self.waterfall.len() > 400 {
+            let cap = (WF_HISTORY_FLOATS / self.fft_size().max(1)).clamp(16, WF_MAX_ROWS);
+            while self.waterfall.len() > cap {
                 self.waterfall.pop_back();
             }
             self.wf_last = Instant::now();
@@ -688,15 +1022,19 @@ impl App {
             self.supervise_hw_gain(block);
         }
 
+        if self.mode == Mode::Auto {
+            self.feed_auto(block);
+        }
+
         if self.decoder.is_some() {
-            let (shift, gated) = self
+            let (shift, gated, rides_agc) = self
                 .decoder
                 .as_ref()
-                .map(|d| (d.offset_shift(), d.squelched()))
-                .unwrap_or((0.0, true));
+                .map(|d| (d.offset_shift(), d.squelched(), d.wants_agc()))
+                .unwrap_or((0.0, true, true));
             self.chain.set_offset(self.cursor + shift);
             self.chain.process(block, out);
-            if self.agc == AgcMode::Soft {
+            if self.agc == AgcMode::Soft && rides_agc {
                 self.soft_agc.process(out);
             }
             // Feeding noise to a decoder just fills the pane with junk - but
@@ -782,6 +1120,7 @@ fn parse_mode(s: &str) -> Mode {
         "psk" | "psk31" => Mode::Psk31,
         "ft8" => Mode::Ft8,
         "ft4" => Mode::Ft4,
+        "auto" | "all" => Mode::Auto,
         _ => Mode::Off,
     }
 }
@@ -1023,13 +1362,9 @@ fn run_app<B: Backend>(
                         app.msg_scroll = app.msg_scroll.saturating_sub(n);
                     }
                     KeyCode::Char('W') => {
-                        app.wf_wide = !app.wf_wide;
+                        app.wf_res = app.wf_res.next();
                         app.wf_scroll = 0;
-                        let what = if app.wf_wide {
-                            "2x frequency, 1x time"
-                        } else {
-                            "1x frequency, 2x time"
-                        };
+                        let what = app.wf_res.label();
                         app.log(format!("waterfall: {what}"));
                     }
                     KeyCode::Char('a') => cycle_agc(app, radio),
@@ -1249,6 +1584,12 @@ fn refresh_idents(app: &mut App) {
     let raw = identify::classify_span(&app.scout_iq, app.rate, &app.smoothed, app.center);
     apply_idents(app, raw);
     merge_heard(app);
+    let before = app.auto.len();
+    app.reconcile_auto();
+    if app.auto.len() != before {
+        let n = app.auto.len();
+        app.log(format!("auto: {n} decoder(s) running"));
+    }
 }
 
 /// Merge a classify pass into held tracks: smooth position, keep the chip
@@ -1660,6 +2001,8 @@ fn retune(app: &mut App, radio: &radio::Radio, freq: f64) {
     app.heard.clear();
     app.scout_iq.clear();
     app.ident_at = Instant::now();
+    // Every automatic slot was tuned relative to the old centre.
+    app.auto.clear();
     if let Some(d) = &mut app.decoder {
         d.hop();
     }
@@ -1920,7 +2263,10 @@ fn find_peaks(spectrum: &[f32], center: f64, rate: f64) -> Vec<(f64, f32)> {
 /// Status, spectrum, waterfall, decode, activity. Shared by the renderer
 /// and mouse hit-testing so they can never disagree.
 fn pane_rects(area: Rect, app: &App) -> [Rect; 5] {
-    let wide = matches!(app.mode, Mode::Ft8 | Mode::Ft4 | Mode::Cw | Mode::Psk31);
+    let wide = matches!(
+        app.mode,
+        Mode::Ft8 | Mode::Ft4 | Mode::Cw | Mode::Psk31 | Mode::Auto
+    );
     // `v` enlarges the decode pane at the expense of the waterfall.
     let dec = match (wide, app.decode_zoom) {
         (false, 0) => Constraint::Length(9),
@@ -2109,6 +2455,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::Psk31 => Color::LightBlue,
         Mode::Ft8 => Color::Green,
         Mode::Ft4 => Color::LightGreen,
+        Mode::Auto => Color::LightRed,
     };
     let snr_color = if app.cursor_snr >= 10.0 {
         Color::Green
@@ -2167,7 +2514,16 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ));
-            spans2.push(lbl(" hang"));
+            spans2.push(lbl(" hang "));
+            // The soft gain rails at 0.08 and 60. Sitting on a rail means the
+            // level reaching the decoders is wrong — too little to slice, or
+            // clipped — which is invisible if only the mode name is shown.
+            let g = app.soft_agc.gain();
+            let railed = !(0.09..=59.0).contains(&g);
+            spans2.push(Span::styled(
+                format!("{:+.0} dB", 20.0 * g.log10()),
+                Style::default().fg(if railed { Color::Yellow } else { Color::Gray }),
+            ));
         }
         AgcMode::Hardware => {
             spans2.push(Span::styled(
@@ -2244,10 +2600,31 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         ));
     }
     if let Some(r) = &app.reporter {
+        // A bare cumulative total cannot distinguish "nothing new to report"
+        // from "wedged", and the hourly re-report rule means a healthy
+        // reporter sits still for long stretches. Show the queue and the age
+        // of the last datagram alongside it.
+        let s = r.stats();
         spans2.push(lbl("  spots "));
         spans2.push(Span::styled(
-            r.sent_count().to_string(),
+            s.sent.to_string(),
             Style::default().fg(Color::Green),
+        ));
+        let mut detail = Vec::new();
+        if s.queued > 0 {
+            detail.push(format!("{} queued", s.queued));
+        }
+        if s.suppressed > 0 {
+            detail.push(format!("{} dup", s.suppressed));
+        }
+        match s.since_send {
+            Some(age) if age < 90 => detail.push(format!("sent {age}s ago")),
+            Some(age) => detail.push(format!("sent {}m ago", age / 60)),
+            None => detail.push("none sent yet".into()),
+        }
+        spans2.push(Span::styled(
+            format!(" ({})", detail.join(", ")),
+            Style::default().fg(Color::DarkGray),
         ));
     }
     let line2 = Line::from(spans2);
@@ -2516,9 +2893,11 @@ fn draw_spectrum(f: &mut Frame, area: Rect, app: &App) {
             let half = app.rx_bandwidth() as f64 / 2.0;
             (app.cursor - half, app.cursor + half, Color::Rgb(28, 28, 40))
         }
-        Mode::Off => (0.0, 0.0, Color::Reset),
+        // Auto is not listening at the cursor at all — its decoders are
+        // spread across the span and are drawn as their own markers.
+        Mode::Off | Mode::Auto => (0.0, 0.0, Color::Reset),
     };
-    let shade = !matches!(app.mode, Mode::Off);
+    let shade = !matches!(app.mode, Mode::Off | Mode::Auto);
     let lock_col = app.decoder.as_ref().and_then(|d| {
         if d.locked() {
             Some(freq_col(app, w, app.cursor + d.lock_hz() as f64))
@@ -2752,8 +3131,8 @@ fn draw_waterfall(f: &mut Frame, area: Rect, app: &App) {
     let start = (app.center + lo) / 1000.0;
     let end = (app.center + hi) / 1000.0;
     let mut title = format!(" waterfall  {start:.3} .. {end:.3} kHz ");
-    if app.wf_wide {
-        title.push_str("(hi-res freq) ");
+    if app.wf_res != WfRes::Quad {
+        title.push_str("(half-block) ");
     }
     if app.wf_scroll > 0 {
         title.push_str(&format!("({} back) ", app.wf_scroll));
@@ -2780,72 +3159,50 @@ fn draw_waterfall(f: &mut Frame, area: Rect, app: &App) {
         }
     };
 
-    let mut lines = Vec::with_capacity(inner.height as usize);
-    if app.wf_wide {
-        // Hi-res: two frequency bins per column ('▌' paints the left bin in
-        // the foreground colour and the right in the background), one time
-        // step per row — twice the frequency detail at half the time density.
-        for row in 0..inner.height as usize {
-            let Some(spec) = row_spec(row) else {
-                lines.push(Line::from(""));
-                continue;
-            };
-            let (a, b) = view_bins(app, spec.len());
-            let cols = resample(&spec[a..b], w * 2);
-            let mut spans = Vec::with_capacity(w);
-            for x in 0..w {
-                let l = norm(cols[x * 2]);
-                let r = norm(cols[x * 2 + 1]);
-                let style = Style::default().fg(heat(l)).bg(heat(r));
-                if x == cur {
-                    spans.push(Span::styled("│", style.fg(Color::Magenta)));
-                } else {
-                    spans.push(Span::styled("▌", style));
-                }
-            }
-            lines.push(Line::from(spans));
-        }
-        f.render_widget(Paragraph::new(lines), inner);
-        return;
-    }
-
-    // Each text row holds two time steps: '▀' paints the upper half in the
-    // foreground colour and the lower half in the background, doubling the
-    // vertical resolution the terminal can show.
+    // `fcells` frequency subcells across each column, `tcells` time steps
+    // stacked into each text row.
+    let (fcells, tcells) = app.wf_res.cells();
     let row_cols = |idx: usize| -> Option<Vec<f32>> {
         let spec = row_spec(idx)?;
         let (a, b) = view_bins(app, spec.len());
-        Some(resample(&spec[a..b], w))
+        Some(resample(&spec[a..b], w * fcells))
     };
 
+    let mut lines = Vec::with_capacity(inner.height as usize);
     for row in 0..inner.height as usize {
-        let upper = row_cols(row * 2);
-        let lower = row_cols(row * 2 + 1);
-        let mut spans = Vec::with_capacity(w);
-        if upper.is_none() && lower.is_none() {
+        // The newest of the time steps this row covers. If even that is
+        // missing the history simply does not reach this far back.
+        let Some(upper) = row_cols(row * tcells) else {
             lines.push(Line::from(""));
             continue;
-        }
-        let normc = |cols: &Option<Vec<f32>>, x: usize| -> Option<f32> {
-            cols.as_ref()
-                .and_then(|c| c.get(x))
-                .map(|v| norm(*v))
         };
+        // A half-filled history repeats the row it does have rather than
+        // punching a hole in the middle of the display.
+        let lower = if tcells > 1 {
+            row_cols(row * tcells + 1).unwrap_or_else(|| upper.clone())
+        } else {
+            upper.clone()
+        };
+        let at = |c: &[f32], i: usize| norm(c.get(i).copied().unwrap_or(f32::MIN));
+
+        let mut spans = Vec::with_capacity(w);
         for x in 0..w {
-            let up = normc(&upper, x);
-            let dn = normc(&lower, x);
-            let mut style = Style::default();
-            if let Some(u) = up {
-                style = style.fg(heat(u));
-            }
-            if let Some(d) = dn {
-                style = style.bg(heat(d));
-            }
+            let (ch, fg, bg) = match app.wf_res {
+                WfRes::Quad => quad_cell([
+                    at(&upper, x * 2),
+                    at(&upper, x * 2 + 1),
+                    at(&lower, x * 2),
+                    at(&lower, x * 2 + 1),
+                ]),
+                WfRes::Freq => ('▌', at(&upper, x * 2), at(&upper, x * 2 + 1)),
+                WfRes::Time => ('▀', at(&upper, x), at(&lower, x)),
+            };
+            let style = Style::default().fg(heat(fg)).bg(heat(bg));
             if x == cur {
                 // Keep the cursor readable against whatever is behind it.
                 spans.push(Span::styled("│", style.fg(Color::Magenta)));
             } else {
-                spans.push(Span::styled("▀", style));
+                spans.push(Span::styled(ch.to_string(), style));
             }
         }
         lines.push(Line::from(spans));
@@ -2894,6 +3251,23 @@ fn draw_decode(f: &mut Frame, area: Rect, app: &App) {
     let extra = match (app.mode, app.decoder.as_ref()) {
         (Mode::Psk31, Some(d)) if d.locked() => format!("  lock {:+.1} Hz", d.lock_hz()),
         (Mode::Psk31, _) => "  searching".into(),
+        (Mode::Auto, _) if app.auto.is_empty() => "  listening for signals".into(),
+        (Mode::Auto, _) => {
+            let mut tally: Vec<String> = Vec::new();
+            for k in [
+                identify::Kind::Ft8,
+                identify::Kind::Ft4,
+                identify::Kind::Cw,
+                identify::Kind::Rtty,
+                identify::Kind::Psk31,
+            ] {
+                let n = app.auto.iter().filter(|s| s.kind == k).count();
+                if n > 0 {
+                    tally.push(format!("{n} {}", k.label()));
+                }
+            }
+            format!("  {}", tally.join("  "))
+        }
         _ => String::new(),
     };
     let mut title = format!(" decode: {}{extra} ", app.mode.label());
@@ -3612,13 +3986,16 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  PgUp/PgDn   retune centre ± half span"),
         Line::from("  c           centre the radio on the cursor"),
         Line::from("  b / B       next / previous band preset"),
-        Line::from("  d           decoder: off → CW → RTTY → PSK31 → FT8 → FT4"),
+        Line::from("  d           decoder: off → CW → RTTY → PSK31 → FT8 → FT4 → AUTO"),
+        Line::from("              AUTO decodes every digital signal in the span at once —"),
+        Line::from("              FT8/FT4 on their calling frequencies, CW/RTTY/PSK31"),
+        Line::from("              wherever found. Each line is tagged with its frequency."),
         Line::from("  r           RTTY normal/reverse shift"),
         Line::from("              PSK31 auto-locks to a nearby carrier (AFC)"),
         Line::from("  s           scan the current band; results are labelled"),
         Line::from("              spectrum chips + bottom activity strip (heard)"),
         Line::from("  v           enlarge the decode pane (cycles sizes)"),
-        Line::from("  w / W       waterfall speed / hi-res frequency mode"),
+        Line::from("  w / W       waterfall speed / subcell resolution"),
         Line::from("  f / F       FFT size (frequency resolution)"),
         Line::from("  a           AGC: soft hang → hardware → off   + / - gain"),
         Line::from("  e           spectrum smoothing (light / medium / heavy)"),
@@ -3680,6 +4057,293 @@ mod tests {
             freq_hz: freq,
             text: text.into(),
         }
+    }
+
+    use super::{identify, AutoSlot, MAX_AUTO_SLOTS};
+    use num_complex::Complex32;
+    use std::time::{Duration, Instant};
+
+    fn ident(kind: identify::Kind, offset_hz: f32, snr_db: f32) -> identify::Ident {
+        identify::Ident {
+            offset_hz,
+            bw_hz: 100.0,
+            snr_db,
+            kind,
+            score: 0.8,
+        }
+    }
+
+    /// FT8/FT4 always live on their calling frequencies, so Auto pins a
+    /// decoder there rather than waiting for the classifier to localise a
+    /// pile-up — and only where the whole 200–3000 Hz passband fits.
+    #[test]
+    fn auto_pins_the_ft_calling_frequencies_in_the_span() {
+        // 192 kHz centred on 14.10 MHz covers both 14074 (FT8) and 14080 (FT4).
+        let mut app = App::new(14_100_000.0, 192_000.0, Mode::Auto);
+        app.reconcile_auto();
+        let dials: Vec<f64> = app.auto.iter().map(|s| s.dial_hz).collect();
+        assert!(
+            dials.iter().any(|d| (*d - 14_074_000.0).abs() < 1.0),
+            "FT8 calling frequency not covered: {dials:?}"
+        );
+        assert!(
+            dials.iter().any(|d| (*d - 14_080_000.0).abs() < 1.0),
+            "FT4 calling frequency not covered: {dials:?}"
+        );
+        // 20m PSK at 14070 is not an FT mode and must not be pinned.
+        assert!(app.auto.iter().all(|s| s.kind != identify::Kind::Psk31));
+        // Pinned slots survive a quiet band; that is the point of pinning.
+        app.reconcile_auto();
+        assert!(app.auto.iter().all(|s| s.pinned));
+    }
+
+    /// A marker that sits too close to the edge of the span cannot have its
+    /// whole passband received, so decoding it would just waste a slot.
+    #[test]
+    fn auto_skips_an_ft_frequency_hanging_off_the_edge() {
+        // Centre so 14074 is only 1 kHz inside a 192 kHz span.
+        let app_lo = 14_074_000.0 - 96_000.0 + 1_000.0;
+        let mut app = App::new(app_lo, 192_000.0, Mode::Auto);
+        app.reconcile_auto();
+        assert!(
+            app.auto.iter().all(|s| (s.dial_hz - 14_074_000.0).abs() > 1.0),
+            "took an FT8 slot whose passband runs off the span"
+        );
+    }
+
+    /// Narrowband signals come and go; their slots have to follow.
+    #[test]
+    fn auto_tracks_then_retires_a_narrowband_signal() {
+        let mut app = App::new(7_030_000.0, 192_000.0, Mode::Auto);
+        app.idents = vec![ident(identify::Kind::Cw, 3000.0, 20.0)];
+        app.reconcile_auto();
+        let cw: Vec<_> = app
+            .auto
+            .iter()
+            .filter(|s| s.kind == identify::Kind::Cw)
+            .collect();
+        assert_eq!(cw.len(), 1, "expected one CW decoder");
+        assert!((cw[0].dial_hz - 7_033_000.0).abs() < 1.0);
+        assert!(!cw[0].pinned);
+
+        // Seen again a moment later at a slightly different estimate: same
+        // signal, same decoder, not a second one.
+        app.idents = vec![ident(identify::Kind::Cw, 3040.0, 19.0)];
+        app.reconcile_auto();
+        assert_eq!(
+            app.auto.iter().filter(|s| s.kind == identify::Kind::Cw).count(),
+            1,
+            "a wobbling estimate must not spawn duplicate decoders"
+        );
+
+        // Gone from the classifier, and aged past the idle window.
+        app.idents.clear();
+        for s in &mut app.auto {
+            s.last_seen = Instant::now() - super::AUTO_IDLE - Duration::from_secs(1);
+        }
+        app.reconcile_auto();
+        assert!(
+            app.auto.iter().all(|s| s.kind != identify::Kind::Cw),
+            "a signal that stopped should release its slot"
+        );
+    }
+
+    /// A crowded band must not spawn decoders without limit, and the slots
+    /// it does spend should go to the strongest signals.
+    #[test]
+    fn auto_caps_slots_and_prefers_strong_signals() {
+        let mut app = App::new(7_100_000.0, 192_000.0, Mode::Auto);
+        app.idents = (0..40)
+            .map(|i| ident(identify::Kind::Cw, -80_000.0 + i as f32 * 4000.0, i as f32))
+            .collect();
+        app.reconcile_auto();
+        assert!(
+            app.auto.len() <= MAX_AUTO_SLOTS,
+            "spawned {} decoders, cap is {MAX_AUTO_SLOTS}",
+            app.auto.len()
+        );
+        // The strongest ident was the last one (snr 39), so it must have a slot.
+        let strongest = 7_100_000.0 + (-80_000.0 + 39.0 * 4000.0);
+        assert!(
+            app.auto.iter().any(|s| (s.dial_hz - strongest).abs() < 200.0),
+            "cap dropped the strongest signal"
+        );
+    }
+
+    /// Every automatic slot is tuned relative to the radio centre, so a
+    /// retune has to tear the fleet down rather than leave it pointing at
+    /// frequencies that no longer exist.
+    #[test]
+    fn auto_slot_labels_carry_the_frequency_and_mode() {
+        let slot = AutoSlot::new(
+            identify::Kind::Cw,
+            7_033_250.0,
+            7_030_000.0,
+            192_000.0,
+            false,
+        )
+        .expect("CW slot");
+        let label = slot.label();
+        assert!(label.contains("7033.2") || label.contains("7033.3"), "{label}");
+        assert!(label.contains("CW"), "{label}");
+    }
+
+    /// Keyed CW at `tone_hz` off the span centre, sending `text` at `wpm`.
+    fn cw_iq(text: &str, wpm: f32, tone_hz: f64, fs: f64, secs: f64) -> Vec<Complex32> {
+        fn code(c: char) -> &'static str {
+            match c {
+                'A' => ".-", 'B' => "-...", 'C' => "-.-.", 'D' => "-..", 'E' => ".",
+                'G' => "--.", 'K' => "-.-", 'N' => "-.", 'O' => "---", 'Q' => "--.-",
+                'R' => ".-.", 'S' => "...", 'T' => "-", 'W' => ".--",
+                _ => "",
+            }
+        }
+        let dit = (1.2 / wpm as f64 * fs) as usize;
+        let mut key: Vec<bool> = Vec::new();
+        while key.len() < (fs * secs) as usize {
+            for ch in text.chars() {
+                if ch == ' ' {
+                    key.extend(std::iter::repeat_n(false, dit * 4));
+                    continue;
+                }
+                for el in code(ch).chars() {
+                    let n = if el == '-' { dit * 3 } else { dit };
+                    key.extend(std::iter::repeat_n(true, n));
+                    key.extend(std::iter::repeat_n(false, dit));
+                }
+                key.extend(std::iter::repeat_n(false, dit * 2));
+            }
+        }
+        // Shape the key envelope over ~5 ms. A real transmitter does this;
+        // hard on/off edges splatter across the band and the span classifier
+        // would rightly report the clicks as more CW signals.
+        //
+        // The band noise matters just as much: with a noiseless synthetic
+        // signal the spectrum median sits at the f32 leakage floor, and a
+        // median-relative detector then finds "signals" across the whole
+        // span. No receiver ever sees that.
+        let rise = (0.005 * fs) as usize;
+        let mut phase = 0.0f64;
+        let step = 2.0 * std::f64::consts::PI * tone_hz / fs;
+        let mut env = 0.0f32;
+        let mut rng = 0x2545F491u32;
+        key.iter()
+            .map(|&on| {
+                let target = if on { 1.0 } else { 0.0 };
+                let k = 1.0 / rise.max(1) as f32;
+                env += (target - env).clamp(-k, k);
+                let mut noise = || {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 17;
+                    rng ^= rng << 5;
+                    (rng as f32 / u32::MAX as f32 - 0.5) * 0.004
+                };
+                let s = Complex32::from_polar(0.05 * env, phase as f32)
+                    + Complex32::new(noise(), noise());
+                phase += step;
+                s
+            })
+            .collect()
+    }
+
+    /// The whole automatic path on a real signal: the classifier points a
+    /// slot at a frequency, the slot's own chain and decoder run over raw
+    /// span IQ, and what comes out lands in the transcript tagged with where
+    /// it was heard. This is what the single-decoder tests cannot cover.
+    #[test]
+    fn auto_decodes_a_cw_signal_and_tags_it_with_the_frequency() {
+        let fs = 192_000.0;
+        let mut app = App::new(7_030_000.0, fs, Mode::Auto);
+        app.agc = super::AgcMode::Off;
+        // The classifier reports CW 3 kHz up; the tone sits 60 Hz off that,
+        // inside the decoder's own search window, as a real one would.
+        app.idents = vec![ident(identify::Kind::Cw, 3000.0, 25.0)];
+        app.reconcile_auto();
+        // This span also covers the 40m FT4 and FT8 calling frequencies, so
+        // those get pinned decoders too — they simply have nothing to hear.
+        assert_eq!(
+            app.auto.iter().filter(|s| s.kind == identify::Kind::Cw).count(),
+            1,
+            "expected exactly one CW decoder, got {:?}",
+            app.auto.iter().map(|s| s.dial_hz).collect::<Vec<_>>()
+        );
+
+        let mut iq = cw_iq("CQ CQ DE W1AW ", 20.0, 3060.0, fs, 14.0);
+        // Then the station stops. The trailing quiet is what flushes the
+        // last partial line, exactly as a real band would.
+        iq.extend(cw_iq(" ", 20.0, 3060.0, fs, 3.0));
+        let mut out = Vec::new();
+        let mut spec = super::Spectrum::new(4096);
+        for block in iq.chunks(16_384) {
+            app.feed(block, &mut spec, &mut out);
+        }
+
+        assert!(
+            !app.text.is_empty(),
+            "auto mode decoded nothing from a clean CW signal"
+        );
+        // Every line names the frequency and mode it came from.
+        for line in app.text.lines().filter(|l| !l.trim().is_empty()) {
+            let tag: Vec<&str> = line.split_whitespace().take(2).collect();
+            assert!(
+                tag.len() == 2 && tag[0].parse::<f64>().is_ok(),
+                "transcript line is not tagged with frequency and mode: {line:?}"
+            );
+        }
+        let ours: String = app
+            .text
+            .lines()
+            .filter(|l| l.contains("7033.0"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !ours.is_empty(),
+            "nothing from the signal's own frequency; transcript was {:?}",
+            app.text
+        );
+        assert!(
+            ours.contains("CQ") || ours.contains("W1AW") || ours.contains("DE"),
+            "expected recognisable morse from 7033.0, got {ours:?}"
+        );
+    }
+
+    /// The quadrant renderer is only worth its extra detail if the glyph it
+    /// picks actually matches which quarters are hot; get the mapping wrong
+    /// and a carrier lands in the wrong corner of the cell.
+    #[test]
+    fn quadrant_glyph_matches_the_hot_quarters() {
+        // [upper-left, upper-right, lower-left, lower-right]
+        let cases = [
+            ([1.0, 0.0, 0.0, 0.0], '▘'),
+            ([0.0, 1.0, 0.0, 0.0], '▝'),
+            ([0.0, 0.0, 1.0, 0.0], '▖'),
+            ([0.0, 0.0, 0.0, 1.0], '▗'),
+            ([1.0, 1.0, 0.0, 0.0], '▀'),
+            ([0.0, 0.0, 1.0, 1.0], '▄'),
+            ([1.0, 0.0, 1.0, 0.0], '▌'),
+            ([0.0, 1.0, 0.0, 1.0], '▐'),
+            ([1.0, 0.0, 0.0, 1.0], '▚'),
+            ([0.0, 1.0, 1.0, 0.0], '▞'),
+            ([1.0, 1.0, 1.0, 0.0], '▛'),
+            ([1.0, 1.0, 0.0, 1.0], '▜'),
+            ([1.0, 0.0, 1.0, 1.0], '▙'),
+            ([0.0, 1.0, 1.0, 1.0], '▟'),
+        ];
+        for (v, want) in cases {
+            let (ch, fg, bg) = super::quad_cell(v);
+            assert_eq!(ch, want, "wrong glyph for {v:?}");
+            assert!(fg > bg, "hot quarters must take the foreground for {v:?}");
+        }
+    }
+
+    /// A cell holds two colours however finely it is carved up, so the split
+    /// has to fall on the biggest step in the data — otherwise a weak signal
+    /// beside a strong one gets averaged into its neighbour.
+    #[test]
+    fn quadrant_split_follows_the_largest_step() {
+        let (_, fg, bg) = super::quad_cell([0.90, 0.95, 0.10, 0.12]);
+        assert!((fg - 0.925).abs() < 0.01, "foreground averaged the hot pair");
+        assert!((bg - 0.11).abs() < 0.01, "background averaged the cold pair");
     }
 
     #[test]
@@ -3791,14 +4455,16 @@ mod tests {
             t.draw(|f| super::draw(f, &app)).unwrap();
             app.decode_zoom = 2;
             t.draw(|f| super::draw(f, &app)).unwrap();
-            // Scrolled panes and hi-res waterfall must render too.
+            // Scrolled panes must render too, in every waterfall resolution.
             app.decode_zoom = 0;
             app.msg_scroll = 3;
             app.st_scroll = 1;
             app.act_scroll = 1;
             app.wf_scroll = 5;
-            app.wf_wide = true;
-            t.draw(|f| super::draw(f, &app)).unwrap();
+            for res in super::WfRes::ALL {
+                app.wf_res = res;
+                t.draw(|f| super::draw(f, &app)).unwrap();
+            }
             // The settings dialog overlays everything.
             app.settings = Some(super::SettingsEdit {
                 call: "K1ABC".into(),

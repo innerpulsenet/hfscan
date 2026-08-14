@@ -10,6 +10,7 @@
 use crate::decoders::cw;
 use crate::decoders::psk31;
 use crate::bands;
+use crate::dsp::mix_decim;
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::f32::consts::PI;
@@ -82,13 +83,18 @@ pub fn classify_span(
 
     let mut fft = Psd::new();
     let mut out = Vec::new();
+    let decim = (fs / AUDIO as f64).round().max(1.0) as usize;
+    // The achieved audio rate; only equals AUDIO when fs is a multiple.
+    let fs_a = (fs / decim as f64) as f32;
     for o in occ {
-        let audio = mix_decim(iq, fs as f32, o.offset_hz, (fs / AUDIO as f64).round().max(1.0) as usize);
-        if audio.len() < (AUDIO * 0.2) as usize {
+        let audio = mix_decim(iq, fs as f32, o.offset_hz, decim);
+        // The PSD needs a whole FFT frame; on less it would come back flat
+        // and every feature computed from it would be garbage.
+        if audio.len() < PSD_N {
             continue;
         }
         let abs = abs_center + o.offset_hz as f64;
-        let (kind, score) = classify_one(&audio, o.bw_hz, abs, &mut fft);
+        let (kind, score) = classify_one(&audio, fs_a, o.bw_hz, abs, &mut fft);
         // Nyquist-edge junk, mixed to audio, often looks like an FT8
         // forest. Ham modes do not live outside the allocations.
         if kind.amateur_only() && !bands::in_amateur(abs) {
@@ -177,15 +183,21 @@ fn ft_kind(abs_hz: f64) -> Option<Kind> {
     }
 }
 
-fn classify_one(audio: &[Complex32], coarse_bw: f32, abs_hz: f64, psd: &mut Psd) -> (Kind, f32) {
+fn classify_one(
+    audio: &[Complex32],
+    fs_a: f32,
+    coarse_bw: f32,
+    abs_hz: f64,
+    psd: &mut Psd,
+) -> (Kind, f32) {
     let spec = psd.power(audio);
-    let fine = features(&spec, AUDIO / spec.len() as f32, audio);
+    let fine = features(&spec, fs_a / spec.len() as f32, audio, fs_a);
     let ft = ft_kind(abs_hz);
 
     // One-off modes only outside the FT USB windows — a single FT8 tone
     // looks like a carrier / CW / a 170 Hz neighbour pair (RTTY).
     if ft.is_none() {
-        let psk = psk31::scan_span(audio, AUDIO as f64, &[(0.0, 20.0)]);
+        let psk = psk31::scan_span(audio, fs_a as f64, &[(0.0, 20.0)]);
         if let Some(h) = psk.iter().max_by(|a, b| {
             a.quality
                 .partial_cmp(&b.quality)
@@ -195,7 +207,7 @@ fn classify_one(audio: &[Complex32], coarse_bw: f32, abs_hz: f64, psd: &mut Psd)
                 return (Kind::Psk31, h.quality);
             }
         }
-        let cw = cw::scan_span(audio, AUDIO as f64, &[(0.0, 20.0)]);
+        let cw = cw::scan_span(audio, fs_a as f64, &[(0.0, 20.0)]);
         if let Some(h) = cw.iter().max_by(|a, b| {
             a.quality
                 .partial_cmp(&b.quality)
@@ -340,7 +352,7 @@ struct Feat {
     speech: f32,
 }
 
-fn features(psd: &[f32], bin_hz: f32, audio: &[Complex32]) -> Feat {
+fn features(psd: &[f32], bin_hz: f32, audio: &[Complex32], fs_a: f32) -> Feat {
     let n = psd.len();
     let mut sorted = psd.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -382,9 +394,9 @@ fn features(psd: &[f32], bin_hz: f32, audio: &[Complex32]) -> Feat {
     let neigh = psd.get(1).copied().unwrap_or(dc);
     let carrier = dc > neigh * 3.0 && dc > med * 12.0;
 
-    let (env_cv, speech) = envelope_stats(audio);
+    let (env_cv, speech) = envelope_stats(audio, fs_a);
     Feat {
-        obw_hz: obw.min(AUDIO / 2.0),
+        obw_hz: obw.min(fs_a / 2.0),
         tonality: peak / med,
         n_peaks: peaks.len(),
         dual_hz: dual,
@@ -423,11 +435,11 @@ fn rtty_sep(peaks: &[(f32, f32)]) -> Option<f32> {
     best_sep
 }
 
-fn envelope_stats(audio: &[Complex32]) -> (f32, f32) {
+fn envelope_stats(audio: &[Complex32], fs_a: f32) -> (f32, f32) {
     if audio.is_empty() {
         return (0.0, 0.0);
     }
-    let decim = 40usize; // 8 kHz -> 200 Hz
+    let decim = (fs_a / 200.0).round().max(1.0) as usize; // audio -> ~200 Hz
     let mut env = Vec::new();
     let mut acc = 0.0;
     let mut n = 0;
@@ -447,19 +459,27 @@ fn envelope_stats(audio: &[Complex32]) -> (f32, f32) {
     let var = env.iter().map(|e| (e - mean) * (e - mean)).sum::<f32>() / env.len() as f32;
     let cv = var.sqrt() / mean.max(1e-9);
 
-    // Syllabic AM lives around 2–8 Hz. A 200 Hz env rate, 64-pt Goertzel bank.
+    // Syllabic AM lives around 2–8 Hz. Goertzel bank on the recent envelope,
+    // with the mean removed first — DC leakage through the rectangular
+    // window otherwise floods the low band and everything reads as speech.
     let n = env.len().min(128);
     let slice = &env[env.len() - n..];
+    let dc = slice.iter().sum::<f32>() / n as f32;
     let mut low = 0.0f32;
     let mut mid = 0.0f32;
-    let fs = 200.0f32;
-    for k in 1..16 {
+    let fs = fs_a / decim as f32;
+    // Cover the whole 12–40 Hz reference band, not just the first 15 bins.
+    let k_max = ((40.0 * n as f32 / fs).ceil() as usize).min(n / 2);
+    for k in 1..=k_max {
         let f = k as f32 * fs / n as f32;
+        if f >= 40.0 {
+            break;
+        }
         let mut acc = Complex32::new(0.0, 0.0);
         let w = -2.0 * PI * k as f32 / n as f32;
         for (i, &e) in slice.iter().enumerate() {
             let (sin, cos) = (w * i as f32).sin_cos();
-            acc += Complex32::new(e, 0.0) * Complex32::new(cos, sin);
+            acc += Complex32::new(e - dc, 0.0) * Complex32::new(cos, sin);
         }
         let p = acc.norm_sqr();
         if (2.0..10.0).contains(&f) {
@@ -514,32 +534,6 @@ impl Psd {
         let s = 1.0 / nseg as f32;
         acc.iter().map(|v| v * s + 1e-20).collect()
     }
-}
-
-fn mix_decim(iq: &[Complex32], fs: f32, hz: f32, decim: usize) -> Vec<Complex32> {
-    let step = -2.0 * PI * hz / fs;
-    let mut phase = 0.0f32;
-    let mut acc = Complex32::new(0.0, 0.0);
-    let mut n = 0usize;
-    let mut out = Vec::with_capacity(iq.len() / decim + 1);
-    let scale = 1.0 / decim as f32;
-    for &s in iq {
-        let (sin, cos) = phase.sin_cos();
-        phase += step;
-        if phase > PI {
-            phase -= 2.0 * PI;
-        } else if phase < -PI {
-            phase += 2.0 * PI;
-        }
-        acc += s * Complex32::new(cos, sin);
-        n += 1;
-        if n == decim {
-            out.push(acc * scale);
-            acc = Complex32::new(0.0, 0.0);
-            n = 0;
-        }
-    }
-    out
 }
 
 #[cfg(test)]

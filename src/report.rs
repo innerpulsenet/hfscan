@@ -14,7 +14,7 @@
 use crate::decoders::FtMessage;
 use std::collections::HashMap;
 use std::net::{ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -225,30 +225,125 @@ fn build_packet(
     out
 }
 
+/// Dedup and batching, split out from the thread so the re-report rule can
+/// be exercised without a socket or the wall clock.
+///
+/// This is the part that decides a spot is *not* worth sending, which is
+/// what makes a healthy reporter look stalled: once every station audible on
+/// a band has been reported, nothing new goes out until either a new station
+/// appears or the hour is up.
+struct SpotQueue {
+    pending: Vec<Spot>,
+    /// (call, MHz band, mode) -> when we last reported it.
+    seen: HashMap<(String, u64, String), u32>,
+    /// Spots dropped as already-reported since the last successful send.
+    suppressed: usize,
+}
+
+impl SpotQueue {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            seen: HashMap::new(),
+            suppressed: 0,
+        }
+    }
+
+    /// True when the spot was queued, false when the hourly rule suppressed it.
+    fn accept(&mut self, spot: Spot) -> bool {
+        let key = (spot.call.clone(), spot.freq_hz / 1_000_000, spot.mode.clone());
+        let fresh = self
+            .seen
+            .get(&key)
+            .map(|t| spot.time.saturating_sub(*t) >= REREPORT_SECS)
+            .unwrap_or(true);
+        if !fresh {
+            self.suppressed += 1;
+            return false;
+        }
+        if self.pending.len() >= 1000 {
+            return false;
+        }
+        self.seen.insert(key, spot.time);
+        self.pending.push(spot);
+        true
+    }
+
+    fn ready(&self, due: bool) -> bool {
+        !self.pending.is_empty() && (due || self.pending.len() >= MAX_RECORDS)
+    }
+
+    fn take_batch(&mut self) -> Vec<Spot> {
+        let n = self.pending.len().min(MAX_RECORDS);
+        self.pending.drain(..n).collect()
+    }
+
+    /// Put a failed batch back at the front, still bounded.
+    fn requeue(&mut self, batch: Vec<Spot>) {
+        let mut again = batch;
+        again.append(&mut self.pending);
+        again.truncate(1000);
+        self.pending = again;
+    }
+}
+
 /// UI-side handle: the reporter thread owns the socket, the dedup table and
 /// the send timer so a DNS hiccup can never stall the display.
 pub struct Reporter {
     tx: SyncSender<Spot>,
     my_call: String,
     sent: Arc<AtomicUsize>,
+    queued: Arc<AtomicUsize>,
+    /// Unix seconds of the last successful datagram; 0 until the first one.
+    last_send: Arc<AtomicU64>,
+    /// Decodes recognised but already reported this hour.
+    suppressed: Arc<AtomicUsize>,
+}
+
+/// What the status line needs to tell "working, nothing new to say" apart
+/// from "wedged", which a bare cumulative total cannot do.
+pub struct ReportStats {
+    pub sent: usize,
+    pub queued: usize,
+    pub suppressed: usize,
+    /// Seconds since the last successful send, or `None` if none yet.
+    pub since_send: Option<u64>,
 }
 
 impl Reporter {
     pub fn start(my_call: String, my_grid: String, log: SyncSender<String>) -> Reporter {
         let (tx, rx) = sync_channel::<Spot>(512);
-        let sent = Arc::new(AtomicUsize::new(0));
-        let thread_sent = sent.clone();
+        let counts = Counters {
+            sent: Arc::new(AtomicUsize::new(0)),
+            queued: Arc::new(AtomicUsize::new(0)),
+            last_send: Arc::new(AtomicU64::new(0)),
+            suppressed: Arc::new(AtomicUsize::new(0)),
+        };
+        let thread_counts = counts.clone();
         let call = my_call.clone();
-        std::thread::spawn(move || run(rx, log, call, my_grid, thread_sent));
+        std::thread::spawn(move || run(rx, log, call, my_grid, thread_counts));
         Reporter {
             tx,
             my_call,
-            sent,
+            sent: counts.sent,
+            queued: counts.queued,
+            last_send: counts.last_send,
+            suppressed: counts.suppressed,
         }
     }
 
-    pub fn sent_count(&self) -> usize {
-        self.sent.load(Ordering::Relaxed)
+    pub fn stats(&self) -> ReportStats {
+        let last = self.last_send.load(Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        ReportStats {
+            sent: self.sent.load(Ordering::Relaxed),
+            queued: self.queued.load(Ordering::Relaxed),
+            suppressed: self.suppressed.load(Ordering::Relaxed),
+            since_send: (last > 0).then(|| now.saturating_sub(last)),
+        }
     }
 
     /// Queue a spot for the station that transmitted this decode. Our own
@@ -275,6 +370,14 @@ impl Reporter {
     }
 }
 
+#[derive(Clone)]
+struct Counters {
+    sent: Arc<AtomicUsize>,
+    queued: Arc<AtomicUsize>,
+    last_send: Arc<AtomicU64>,
+    suppressed: Arc<AtomicUsize>,
+}
+
 /// Tiny xorshift for the send-time jitter; avoids pulling in a rand crate.
 struct Rng(u64);
 
@@ -292,7 +395,7 @@ fn run(
     log: SyncSender<String>,
     my_call: String,
     my_grid: String,
-    sent: Arc<AtomicUsize>,
+    counts: Counters,
 ) {
     let sock = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
@@ -311,31 +414,22 @@ fn run(
     let session = rng.next() as u32;
     let mut seq: u32 = 0; // counts records, per the spec
     let mut packets: u32 = 0;
-    let mut pending: Vec<Spot> = Vec::new();
-    // (call, MHz band, mode) -> last time reported, for dedup.
-    let mut seen: HashMap<(String, u64, String), u32> = HashMap::new();
+    let mut q = SpotQueue::new();
     let mut templates_at = Instant::now() - Duration::from_secs(3600);
     let mut next_send = Instant::now() + SEND_INTERVAL + Duration::from_secs(rng.next() % 60);
 
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(spot) => {
-                let key = (spot.call.clone(), spot.freq_hz / 1_000_000, spot.mode.clone());
-                let stale = seen
-                    .get(&key)
-                    .map(|t| spot.time.saturating_sub(*t) >= REREPORT_SECS)
-                    .unwrap_or(true);
-                if stale && pending.len() < 1000 {
-                    seen.insert(key, spot.time);
-                    pending.push(spot);
-                }
+                q.accept(spot);
+                counts.queued.store(q.pending.len(), Ordering::Relaxed);
+                counts.suppressed.store(q.suppressed, Ordering::Relaxed);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
 
-        let due = Instant::now() >= next_send;
-        if pending.is_empty() || !(due || pending.len() >= MAX_RECORDS) {
+        if !q.ready(Instant::now() >= next_send) {
             continue;
         }
         let templates = packets < 3 || templates_at.elapsed() >= Duration::from_secs(3600);
@@ -343,8 +437,7 @@ fn run(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
-        let n = pending.len().min(MAX_RECORDS);
-        let chunk: Vec<Spot> = pending.drain(..n).collect();
+        let chunk = q.take_batch();
         let pkt = build_packet(&my_call, &my_grid, SOFTWARE, &chunk, seq, session, now, templates);
         let dest = DEST.to_socket_addrs().ok().and_then(|mut a| a.next());
         match dest {
@@ -355,21 +448,34 @@ fn run(
                     if templates {
                         templates_at = Instant::now();
                     }
-                    sent.fetch_add(chunk.len(), Ordering::Relaxed);
-                    let _ = log.try_send(format!("pskreporter: {} spot(s) sent", chunk.len()));
+                    counts.sent.fetch_add(chunk.len(), Ordering::Relaxed);
+                    counts.last_send.store(now as u64, Ordering::Relaxed);
+                    // Say what was held back too: a run of "0 new" is the
+                    // difference between a quiet band and a broken reporter.
+                    let dup = std::mem::take(&mut q.suppressed);
+                    counts.suppressed.store(0, Ordering::Relaxed);
+                    let held = if dup > 0 {
+                        format!(", {dup} already reported this hour")
+                    } else {
+                        String::new()
+                    };
+                    let _ = log.try_send(format!(
+                        "pskreporter: {} spot(s) sent{held}",
+                        chunk.len()
+                    ));
                 }
                 Err(e) => {
                     // Keep the spots for the next attempt, bounded.
                     let _ = log.try_send(format!("pskreporter: send failed: {e}"));
-                    let mut again = chunk;
-                    again.extend(pending.drain(..));
-                    pending = again.into_iter().take(1000).collect();
+                    q.requeue(chunk);
                 }
             },
             None => {
                 let _ = log.try_send(format!("pskreporter: cannot resolve {DEST}"));
+                q.requeue(chunk);
             }
         }
+        counts.queued.store(q.pending.len(), Ordering::Relaxed);
         next_send = Instant::now() + SEND_INTERVAL + Duration::from_secs(rng.next() % 60);
     }
 }
@@ -481,6 +587,57 @@ mod tests {
         );
         assert!(SOFTWARE.starts_with("HFScan v"), "got {SOFTWARE:?}");
         assert!(SOFTWARE.contains("KQ2Y"), "author credit missing from {SOFTWARE:?}");
+    }
+
+    /// The reason a working reporter looks stalled: everything audible has
+    /// already been reported, and the rules say not to report it again yet.
+    #[test]
+    fn a_station_is_reported_once_an_hour_then_again() {
+        let mut q = SpotQueue::new();
+        assert!(q.accept(spot("K1ABC", 14_074_000, -5, 1_000_000)));
+        // Same station, same band, same mode, minutes later: held back.
+        assert!(!q.accept(spot("K1ABC", 14_074_500, -7, 1_000_600)));
+        assert_eq!(q.suppressed, 1);
+        assert_eq!(q.pending.len(), 1);
+        // An hour on, it is worth reporting again.
+        assert!(q.accept(spot("K1ABC", 14_074_000, -6, 1_003_600)));
+        assert_eq!(q.pending.len(), 2);
+        // A different band is a different report immediately.
+        assert!(q.accept(spot("K1ABC", 7_074_000, -6, 1_000_700)));
+    }
+
+    /// A batch that could not go out has to come back, or the spots are lost
+    /// for an hour: `seen` already counts them as reported.
+    #[test]
+    fn an_unsent_batch_is_requeued_not_dropped() {
+        let mut q = SpotQueue::new();
+        for i in 0..3 {
+            assert!(q.accept(spot(&format!("K{i}AAA"), 14_074_000, -5, 1_000_000)));
+        }
+        let batch = q.take_batch();
+        assert_eq!(batch.len(), 3);
+        assert!(q.pending.is_empty());
+        q.requeue(batch);
+        assert_eq!(q.pending.len(), 3, "a failed send must not lose the spots");
+        // And they are still suppressed as duplicates, so nothing double-sends.
+        assert!(!q.accept(spot("K0AAA", 14_074_000, -5, 1_000_100)));
+    }
+
+    /// Bursts bigger than one datagram must drain in batches rather than
+    /// waiting five minutes per 60 spots.
+    #[test]
+    fn a_large_burst_is_ready_immediately() {
+        let mut q = SpotQueue::new();
+        for i in 0..150 {
+            q.accept(spot(&format!("K{i}XYZ"), 14_074_000, -5, 1_000_000));
+        }
+        assert!(q.ready(false), "a full queue should not wait for the timer");
+        assert_eq!(q.take_batch().len(), MAX_RECORDS);
+        assert!(q.ready(false));
+        assert_eq!(q.take_batch().len(), MAX_RECORDS);
+        // The tail waits for the timer.
+        assert!(!q.ready(false));
+        assert!(q.ready(true));
     }
 
     #[test]

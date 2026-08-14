@@ -305,6 +305,15 @@ impl Decoder for FtDecoder {
         false
     }
 
+    fn wants_agc(&self) -> bool {
+        // `quantize` already scales each finished slot by a single gain, for
+        // the reason spelled out there: a station appearing mid-slot must not
+        // move the noise floor under the LDPC soft metrics part-way through a
+        // message. A block-rate AGC ahead of the buffer reintroduces exactly
+        // that, so the slot capture takes its audio unridden.
+        false
+    }
+
     fn process(&mut self, samples: &[Complex32]) -> String {
         let slot = current_slot(self.slot_secs);
         if slot != self.slot {

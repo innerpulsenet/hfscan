@@ -4,13 +4,16 @@
 mod bands;
 mod decoders;
 mod dsp;
+mod identify;
 mod radio;
 mod report;
 
 use anyhow::Result;
 use clap::Parser;
-use decoders::{Decoder, FtMessage, Mode};
-use dsp::{DecodeChain, Spectrum};
+use decoders::cw::{self, CwHit};
+use decoders::psk31::{self, PskHit};
+use decoders::{CwView, Decoder, FtMessage, Mode, PskView};
+use dsp::{smooth_bins, DecodeChain, SoftAgc, Spectrum};
 use num_complex::Complex32;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -38,6 +41,77 @@ const WF_INTERVALS_MS: [u64; 5] = [100, 250, 500, 1000, 2000];
 /// a slower spectrum update, since a full segment has to be collected first.
 const FFT_SIZES: [usize; 6] = [1024, 2048, 4096, 8192, 16384, 32768];
 
+/// Temporal weight of each new spectrum estimate (the rest is history).
+const SMOOTH_TIME: [f32; 3] = [0.28, 0.12, 0.06];
+/// Frequency-domain binomial width: 1 = off, 3 = light, 5 = heavy.
+const SMOOTH_BINS: [usize; 3] = [1, 3, 5];
+const SMOOTH_LABELS: [&str; 3] = ["light", "medium", "heavy"];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AgcMode {
+    /// Hang AGC on the decoder path + slow hardware trim.
+    Soft,
+    /// Device AGC. Fast, and it pumps the whole spectrum.
+    Hardware,
+    /// Manual IF/RF gain.
+    Off,
+}
+
+impl AgcMode {
+    fn next(self) -> Self {
+        match self {
+            AgcMode::Soft => AgcMode::Hardware,
+            AgcMode::Hardware => AgcMode::Off,
+            AgcMode::Off => AgcMode::Soft,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RxFilter {
+    Auto,
+    Hz80,
+    Hz200,
+    Hz500,
+    Hz1500,
+    Hz3000,
+}
+
+impl RxFilter {
+    const ALL: [RxFilter; 6] = [
+        RxFilter::Auto,
+        RxFilter::Hz80,
+        RxFilter::Hz200,
+        RxFilter::Hz500,
+        RxFilter::Hz1500,
+        RxFilter::Hz3000,
+    ];
+    fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|x| *x == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+    fn label(self) -> &'static str {
+        match self {
+            RxFilter::Auto => "auto",
+            RxFilter::Hz80 => "80 Hz",
+            RxFilter::Hz200 => "200 Hz",
+            RxFilter::Hz500 => "500 Hz",
+            RxFilter::Hz1500 => "1.5 kHz",
+            RxFilter::Hz3000 => "3 kHz",
+        }
+    }
+    fn hz(self, mode_default: f32) -> f32 {
+        match self {
+            RxFilter::Auto => mode_default,
+            RxFilter::Hz80 => 80.0,
+            RxFilter::Hz200 => 200.0,
+            RxFilter::Hz500 => 500.0,
+            RxFilter::Hz1500 => 1500.0,
+            RxFilter::Hz3000 => 3000.0,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "hfscan", about = "HF band scanner and digital decoder for the RSP1A")]
 struct Args {
@@ -64,12 +138,27 @@ struct Args {
     grid: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanKind {
+    Energy,
+    Psk31,
+    Cw,
+}
+
+#[derive(Clone)]
+struct ScanHit {
+    freq: f64,
+    score: f32,
+    label: &'static str,
+}
+
 struct ScanState {
     end: f64,
     step: f64,
     cur: f64,
     dwell_until: Instant,
-    results: Vec<(f64, f32)>,
+    results: Vec<ScanHit>,
+    kind: ScanKind,
 }
 
 struct App {
@@ -78,11 +167,21 @@ struct App {
     cursor: f64, // offset from centre, Hz
     zoom: f64,   // 1.0 = whole span; higher zooms in around the cursor
     gain: f64,
-    agc: bool,
+    agc: AgcMode,
     biast: bool,
+    smooth_idx: usize,
+    rx_filter: RxFilter,
+    soft_agc: SoftAgc,
+    hw_trim_at: Instant,
+    hw_hot: u32,
+    hw_quiet: u32,
     band_idx: usize,
+    /// Last hardware gain used on each HF band, so a hot band cannot
+    /// starve the next one after `b`.
+    band_gains: Vec<f64>,
 
     spectrum: Vec<f32>,
+    spec_work: Vec<f32>,
     smoothed: Vec<f32>,
     waterfall: VecDeque<Vec<f32>>,
     wf_accum: Vec<f32>,
@@ -128,6 +227,21 @@ struct App {
     squelch: bool,
     squelch_db: f32,
     cursor_snr: f32,
+
+    /// Recent radio IQ used by the span scout and the signature classifier.
+    scout_iq: Vec<Complex32>,
+    /// Confirmed PSK31 signals in the current span (offsets from centre).
+    psk_hits: Vec<PskHit>,
+    /// Confirmed CW tones in the current span (offsets from centre).
+    cw_hits: Vec<CwHit>,
+    /// Occupied slices labelled CW / PSK / SSB / … from the last classify.
+    idents: Vec<identify::Ident>,
+    scout_at: Instant,
+    ident_at: Instant,
+    /// Set by a finished PSK31 band scan so the UI loop can retune.
+    pending_tune: Option<f64>,
+    /// Slow hardware-gain nudge from the software AGC supervisor.
+    pending_gain: Option<f64>,
 }
 
 /// Station settings dialog state.
@@ -145,11 +259,19 @@ impl App {
             rate,
             cursor: 0.0,
             zoom: 1.0,
-            gain: 40.0,
-            agc: true,
+            gain: 36.0,
+            agc: AgcMode::Soft,
             biast: false,
+            smooth_idx: 1, // medium
+            rx_filter: RxFilter::Auto,
+            soft_agc: SoftAgc::new(mode.audio_rate()),
+            hw_trim_at: Instant::now(),
+            hw_hot: 0,
+            hw_quiet: 0,
             band_idx: 0,
+            band_gains: vec![36.0; bands::BANDS.len()],
             spectrum: Vec::new(),
+            spec_work: Vec::new(),
             smoothed: Vec::new(),
             waterfall: VecDeque::new(),
             wf_accum: Vec::new(),
@@ -182,6 +304,14 @@ impl App {
             squelch: true,
             squelch_db: 12.0,
             cursor_snr: 0.0,
+            scout_iq: Vec::new(),
+            psk_hits: Vec::new(),
+            cw_hits: Vec::new(),
+            idents: Vec::new(),
+            scout_at: Instant::now(),
+            ident_at: Instant::now(),
+            pending_tune: None,
+            pending_gain: None,
         };
         app.set_mode(mode);
         app
@@ -192,14 +322,77 @@ impl App {
         // Each mode wants its own audio rate, so the chain is rebuilt.
         self.chain = DecodeChain::new(self.rate, 3000.0, mode.audio_rate());
         self.decoder = mode.make(self.chain.fs_out());
-        if let Some(d) = &self.decoder {
-            self.chain.set_bandwidth(d.bandwidth());
-        }
+        self.soft_agc = SoftAgc::new(mode.audio_rate());
+        self.apply_rx_filter();
         self.ft_msgs.clear();
         self.stations.clear();
         self.st_scroll = 0;
         self.act_scroll = 0;
+        self.psk_hits.clear();
+        self.cw_hits.clear();
+        self.idents.clear();
+        self.scout_iq.clear();
+        self.apply_station();
         self.log(format!("decoder: {}", mode.label()));
+    }
+
+    fn apply_station(&mut self) {
+        if let Some(d) = &mut self.decoder {
+            d.set_station(&self.my_call, &self.my_grid);
+        }
+    }
+
+    fn mode_bandwidth(&self) -> f32 {
+        self.decoder
+            .as_ref()
+            .map(|d| d.bandwidth())
+            .unwrap_or(400.0)
+    }
+
+    fn rx_bandwidth(&self) -> f32 {
+        self.rx_filter.hz(self.mode_bandwidth())
+    }
+
+    fn apply_rx_filter(&mut self) {
+        self.chain.set_bandwidth(self.rx_bandwidth());
+    }
+
+    /// Keep the ADC in a comfortable range without touching the spectrum
+    /// every block. Only runs in software-AGC mode, at most every 1.5 s.
+    fn supervise_hw_gain(&mut self, block: &[Complex32]) {
+        let mut peak = 0.0f32;
+        for s in block {
+            let m = s.re.abs().max(s.im.abs());
+            if m > peak {
+                peak = m;
+            }
+        }
+        if peak > 0.85 {
+            self.hw_hot = self.hw_hot.saturating_add(1);
+            self.hw_quiet = 0;
+        } else if peak < 0.04 {
+            self.hw_quiet = self.hw_quiet.saturating_add(1);
+            self.hw_hot = 0;
+        } else {
+            self.hw_hot = 0;
+            self.hw_quiet = 0;
+        }
+        if self.hw_trim_at.elapsed() < Duration::from_millis(1500) {
+            return;
+        }
+        if self.hw_hot >= 4 && self.gain > 2.0 {
+            self.gain = (self.gain - 3.0).max(0.0);
+            self.pending_gain = Some(self.gain);
+            self.hw_trim_at = Instant::now();
+            self.hw_hot = 0;
+            self.log(format!("AGC: hardware gain {:+.0} dB (hot ADC)", self.gain));
+        } else if self.hw_quiet >= 12 && self.gain < 46.0 {
+            self.gain = (self.gain + 2.0).min(48.0);
+            self.pending_gain = Some(self.gain);
+            self.hw_trim_at = Instant::now();
+            self.hw_quiet = 0;
+            self.log(format!("AGC: hardware gain {:+.0} dB (quiet ADC)", self.gain));
+        }
     }
 
     fn fft_size(&self) -> usize {
@@ -295,11 +488,17 @@ impl App {
 
     fn feed(&mut self, block: &[Complex32], spec: &mut Spectrum, out: &mut Vec<Complex32>) {
         spec.power_db(block, &mut self.spectrum);
-        if self.smoothed.len() != self.spectrum.len() {
-            self.smoothed = self.spectrum.clone();
+        smooth_bins(
+            &self.spectrum,
+            SMOOTH_BINS[self.smooth_idx],
+            &mut self.spec_work,
+        );
+        let a = SMOOTH_TIME[self.smooth_idx];
+        if self.smoothed.len() != self.spec_work.len() {
+            self.smoothed = self.spec_work.clone();
         } else {
-            for (s, v) in self.smoothed.iter_mut().zip(&self.spectrum) {
-                *s = 0.6 * *s + 0.4 * *v;
+            for (s, v) in self.smoothed.iter_mut().zip(&self.spec_work) {
+                *s = (1.0 - a) * *s + a * *v;
             }
         }
 
@@ -326,17 +525,54 @@ impl App {
         if !sorted.is_empty() {
             let med = sorted[sorted.len() / 2];
             let hi = sorted[sorted.len() * 999 / 1000];
-            self.floor_db = 0.8 * self.floor_db + 0.2 * (med - 5.0);
-            self.ceil_db = 0.8 * self.ceil_db + 0.2 * (hi + 10.0).max(med + 20.0);
+            self.floor_db = 0.94 * self.floor_db + 0.06 * (med - 4.0);
+            self.ceil_db = 0.90 * self.ceil_db + 0.10 * (hi + 8.0).max(med + 18.0);
         }
 
-        // Signal-to-noise inside the decoder's passband, used for the squelch.
+        // Always keep a rolling slice of radio IQ. The signature classifier
+        // needs it in every mode; CW / PSK31 scouts reuse the same buffer.
+        self.scout_iq.extend_from_slice(block);
+        let secs = if self.mode == Mode::Cw
+            || self.scan.as_ref().is_some_and(|s| s.kind == ScanKind::Cw)
+        {
+            0.85
+        } else {
+            0.60
+        };
+        let max = (self.rate * secs) as usize;
+        if self.scout_iq.len() > max {
+            let drain = self.scout_iq.len() - max;
+            self.scout_iq.drain(..drain);
+        }
+        if self.scout_at.elapsed() >= Duration::from_millis(800) {
+            match self.mode {
+                Mode::Psk31 => refresh_psk_hits(self),
+                Mode::Cw => refresh_cw_hits(self),
+                _ => {}
+            }
+            self.scout_at = Instant::now();
+        }
+        if self.ident_at.elapsed() >= Duration::from_millis(1200) {
+            refresh_idents(self);
+            self.ident_at = Instant::now();
+        }
+
+        // Signal-to-noise inside the decoder's passband, used for the squelch
+        // and the status line. Once PSK31 is locked, measure a tight window
+        // on the carrier rather than the whole search band.
         if let Some(d) = &self.decoder {
             let n = self.smoothed.len();
             if n > 0 {
                 let bin_hz = self.rate / n as f64;
-                let half = ((d.bandwidth() as f64 / 2.0) / bin_hz).ceil().max(1.0) as isize;
-                let centre = (n as f64 / 2.0 + self.cursor / bin_hz) as isize;
+                let (centre_hz, half_hz) = if matches!(self.mode, Mode::Psk31 | Mode::Cw)
+                    && d.locked()
+                {
+                    (self.cursor + d.lock_hz() as f64, 40.0)
+                } else {
+                    (self.cursor, self.rx_bandwidth() as f64 / 2.0)
+                };
+                let half = (half_hz / bin_hz).ceil().max(1.0) as isize;
+                let centre = (n as f64 / 2.0 + centre_hz / bin_hz) as isize;
                 let lo = (centre - half).clamp(0, n as isize - 1) as usize;
                 let hi = (centre + half).clamp(0, n as isize - 1) as usize;
                 let peak = self.smoothed[lo..=hi.max(lo)]
@@ -347,6 +583,10 @@ impl App {
             }
         }
 
+        if self.agc == AgcMode::Soft {
+            self.supervise_hw_gain(block);
+        }
+
         if self.decoder.is_some() {
             let (shift, gated) = self
                 .decoder
@@ -355,6 +595,9 @@ impl App {
                 .unwrap_or((0.0, true));
             self.chain.set_offset(self.cursor + shift);
             self.chain.process(block, out);
+            if self.agc == AgcMode::Soft {
+                self.soft_agc.process(out);
+            }
             // Feeding noise to a decoder just fills the pane with junk - but
             // slot-based modes must keep capturing regardless.
             let open = !self.squelch || !gated || self.cursor_snr >= self.squelch_db;
@@ -375,12 +618,17 @@ impl App {
                         r.spot(m, dial, self.mode.label());
                     }
                 }
-                for m in msgs {
-                    self.update_stations(&m);
-                    self.ft_msgs.push_back(m);
-                }
-                while self.ft_msgs.len() > 600 {
-                    self.ft_msgs.pop_front();
+                // Structured messages feed the FT traffic panes; PSK31
+                // also emits them (for spotting) but they must not land
+                // in the FT station/activity tables.
+                if matches!(self.mode, Mode::Ft8 | Mode::Ft4) {
+                    for m in msgs {
+                        self.update_stations(&m);
+                        self.ft_msgs.push_back(m);
+                    }
+                    while self.ft_msgs.len() > 600 {
+                        self.ft_msgs.pop_front();
+                    }
                 }
             }
         }
@@ -426,7 +674,8 @@ fn save_config(call: &str, grid: &str) -> std::io::Result<()> {
     std::fs::write(&path, format!("call = \"{call}\"\ngrid = \"{grid}\"\n"))
 }
 
-fn parse_mode(s: &str) -> Mode {    match s.to_ascii_lowercase().as_str() {
+fn parse_mode(s: &str) -> Mode {
+    match s.to_ascii_lowercase().as_str() {
         "cw" => Mode::Cw,
         "rtty" => Mode::Rtty,
         "psk" | "psk31" => Mode::Psk31,
@@ -472,6 +721,7 @@ fn main() -> Result<()> {
             grid.unwrap_or_default(),
             app.rlog_tx.clone(),
         ));
+        app.apply_station();
         app.log(format!("de {} — spotting to pskreporter.info", app.my_call));
     } else {
         app.log("press o to set your callsign (enables pskreporter spotting)".into());
@@ -479,10 +729,6 @@ fn main() -> Result<()> {
     if rate != args.rate {
         app.log(format!("sample rate forced to {rate:.0} Hz for FT8/FT4"));
     }
-    app.fft_idx = FFT_SIZES
-        .iter()
-        .position(|n| *n >= args.fft)
-        .unwrap_or(FFT_SIZES.len() - 1);
     app.fft_idx = FFT_SIZES
         .iter()
         .position(|n| *n >= args.fft)
@@ -525,6 +771,7 @@ fn run_app<B: Backend>(
         if spec.size() != app.fft_size() {
             spec = Spectrum::new(app.fft_size());
             app.spectrum.clear();
+            app.spec_work.clear();
             app.smoothed.clear();
             app.wf_accum.clear();
             app.waterfall.clear();
@@ -544,6 +791,12 @@ fn run_app<B: Backend>(
             if done {
                 app.scan = None;
             }
+        }
+        if let Some(f) = app.pending_tune.take() {
+            retune(app, radio, f);
+        }
+        if let Some(g) = app.pending_gain.take() {
+            let _ = radio.cmd.send(radio::Cmd::Gain(g));
         }
 
         if last_draw.elapsed() >= Duration::from_millis(50) {
@@ -580,6 +833,7 @@ fn run_app<B: Backend>(
                     KeyCode::Char('Z') => app.zoom = (app.zoom / 2.0).max(1.0),
                     KeyCode::Char('n') => next_signal(app, true),
                     KeyCode::Char('N') => next_signal(app, false),
+                    KeyCode::Char('p') => mode_scan_key(app, radio),
                     KeyCode::Char('f') => {
                         app.fft_idx = (app.fft_idx + 1) % FFT_SIZES.len();
                         let n = app.fft_size();
@@ -639,6 +893,15 @@ fn run_app<B: Backend>(
                             d.toggle();
                         }
                     }
+                    KeyCode::Char('u') if matches!(app.mode, Mode::Cw | Mode::Psk31) => {
+                        lock_nudge(app, -2.0);
+                    }
+                    KeyCode::Char('i') if matches!(app.mode, Mode::Cw | Mode::Psk31) => {
+                        lock_nudge(app, 2.0);
+                    }
+                    KeyCode::Char('g') if matches!(app.mode, Mode::Cw | Mode::Psk31) => {
+                        centre_on_lock(app);
+                    }
                     KeyCode::Char('x') => {
                         app.text.clear();
                         app.ft_msgs.clear();
@@ -668,11 +931,22 @@ fn run_app<B: Backend>(
                         };
                         app.log(format!("waterfall: {what}"));
                     }
-                    KeyCode::Char('a') => {
-                        app.agc = !app.agc;
-                        let _ = radio.cmd.send(radio::Cmd::Agc(app.agc));
-                        let msg = format!("AGC {}", if app.agc { "on" } else { "off" });
-                        app.log(msg);
+                    KeyCode::Char('a') => cycle_agc(app, radio),
+                    KeyCode::Char('e') => {
+                        app.smooth_idx = (app.smooth_idx + 1) % SMOOTH_LABELS.len();
+                        app.log(format!(
+                            "spectrum smooth: {}",
+                            SMOOTH_LABELS[app.smooth_idx]
+                        ));
+                    }
+                    KeyCode::Char('l') => {
+                        app.rx_filter = app.rx_filter.next();
+                        app.apply_rx_filter();
+                        app.log(format!(
+                            "RX filter: {} ({:.0} Hz)",
+                            app.rx_filter.label(),
+                            app.rx_bandwidth()
+                        ));
                     }
                     KeyCode::Char('t') => {
                         app.biast = !app.biast;
@@ -680,13 +954,11 @@ fn run_app<B: Backend>(
                     }
                     KeyCode::Char('+') | KeyCode::Char('=') => {
                         app.gain = (app.gain + 2.0).min(48.0);
-                        app.agc = false;
-                        let _ = radio.cmd.send(radio::Cmd::Gain(app.gain));
+                        apply_agc_mode(app, radio, AgcMode::Off);
                     }
                     KeyCode::Char('-') => {
                         app.gain = (app.gain - 2.0).max(0.0);
-                        app.agc = false;
-                        let _ = radio.cmd.send(radio::Cmd::Gain(app.gain));
+                        apply_agc_mode(app, radio, AgcMode::Off);
                     }
                     KeyCode::Char('k') => {
                         app.squelch = !app.squelch;
@@ -700,7 +972,7 @@ fn run_app<B: Backend>(
                             app.scan = None;
                             app.log("scan cancelled".into());
                         } else {
-                            start_scan(app, radio);
+                            start_scan(app, radio, ScanKind::Energy);
                         }
                     }
                     _ => {}
@@ -752,6 +1024,7 @@ fn settings_key(app: &mut App, k: KeyEvent) {
             }
             app.my_call = ed.call.clone();
             app.my_grid = ed.grid.clone();
+            app.apply_station();
             // Dropping the old handle disconnects the old reporter thread.
             app.reporter = Some(Reporter::start(ed.call, ed.grid, app.rlog_tx.clone()));
             app.log(format!("de {} — spotting to pskreporter.info", app.my_call));
@@ -772,7 +1045,8 @@ fn settings_key(app: &mut App, k: KeyEvent) {
 
 /// Wheel-scroll whichever pane is under the mouse: the FT sub-panes scroll
 /// independently, the waterfall scrolls back through its history.
-fn scroll_pane_at(app: &mut App, area: Rect, col: u16, row: u16, delta: isize) {    let chunks = pane_rects(area, app);
+fn scroll_pane_at(app: &mut App, area: Rect, col: u16, row: u16, delta: isize) {
+    let chunks = pane_rects(area, app);
     let inside = |r: Rect| {
         col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
     };
@@ -785,6 +1059,13 @@ fn scroll_pane_at(app: &mut App, area: Rect, col: u16, row: u16, delta: isize) {
             } else if inside(cols[1]) {
                 adj(&mut app.msg_scroll);
             } else {
+                adj(&mut app.st_scroll);
+            }
+        } else if matches!(app.mode, Mode::Cw | Mode::Psk31) {
+            let cols = cw_cols(chunks[3]);
+            if inside(cols[1]) {
+                adj(&mut app.msg_scroll);
+            } else if inside(cols[2]) {
                 adj(&mut app.st_scroll);
             }
         } else {
@@ -801,8 +1082,17 @@ fn nudge_cursor(app: &mut App, delta: f64) {
 }
 
 /// Jump the cursor to the next detected signal, so a busy band can be walked
-/// without hunting for peaks by eye.
+/// without hunting for peaks by eye. In PSK31 mode this hops confirmed
+/// PSK31 carriers, not raw energy peaks.
 fn next_signal(app: &mut App, forward: bool) {
+    if app.mode == Mode::Psk31 {
+        next_psk31(app, forward);
+        return;
+    }
+    if app.mode == Mode::Cw {
+        next_cw(app, forward);
+        return;
+    }
     let mut peaks = find_peaks(&app.smoothed, 0.0, app.rate);
     if peaks.is_empty() {
         app.log("no signals above the noise floor".into());
@@ -831,10 +1121,285 @@ fn next_signal(app: &mut App, forward: bool) {
     }
 }
 
+fn refresh_psk_hits(app: &mut App) {
+    let mut peaks = find_peaks(&app.smoothed, 0.0, app.rate);
+    peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    peaks.truncate(24);
+    app.psk_hits = psk31::scan_span(&app.scout_iq, app.rate, &peaks);
+}
+
+fn refresh_cw_hits(app: &mut App) {
+    let mut peaks = find_peaks(&app.smoothed, 0.0, app.rate);
+    peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    peaks.truncate(24);
+    app.cw_hits = cw::scan_span(&app.scout_iq, app.rate, &peaks);
+}
+
+fn refresh_idents(app: &mut App) {
+    if app.smoothed.is_empty() || app.scout_iq.len() < (app.rate * 0.25) as usize {
+        return;
+    }
+    app.idents = identify::classify_span(&app.scout_iq, app.rate, &app.smoothed, app.center);
+}
+
+fn cycle_agc(app: &mut App, radio: &radio::Radio) {
+    apply_agc_mode(app, radio, app.agc.next());
+}
+
+fn apply_agc_mode(app: &mut App, radio: &radio::Radio, mode: AgcMode) {
+    app.agc = mode;
+    match mode {
+        AgcMode::Soft => {
+            let _ = radio.cmd.send(radio::Cmd::Agc(false));
+            let _ = radio.cmd.send(radio::Cmd::Gain(app.gain));
+            app.soft_agc.reset();
+            app.log(format!("AGC soft (hang)  hw {:+.0} dB", app.gain));
+        }
+        AgcMode::Hardware => {
+            let _ = radio.cmd.send(radio::Cmd::Agc(true));
+            app.log("AGC hardware (fast — can pump)".into());
+        }
+        AgcMode::Off => {
+            let _ = radio.cmd.send(radio::Cmd::Agc(false));
+            let _ = radio.cmd.send(radio::Cmd::Gain(app.gain));
+            app.log(format!("AGC off  gain {:+.0} dB", app.gain));
+        }
+    }
+}
+
+fn hop_cursor_to(app: &mut App, offset_hz: f64) {
+    if let Some(d) = &mut app.decoder {
+        d.hop();
+    }
+    app.cursor = offset_hz.clamp(-app.rate * 0.45, app.rate * 0.45);
+}
+
+/// Next / previous confirmed PSK31. Prefers another signal already inside
+/// the decoder's passband (no retune); otherwise scouts the visible span
+/// and moves the cursor onto it.
+fn next_psk31(app: &mut App, forward: bool) {
+    if let Some(d) = &mut app.decoder
+        && let Some(hz) = d.next_lock(forward)
+    {
+        app.log(format!("PSK31 lock {hz:+.1} Hz (in passband)"));
+        return;
+    }
+    // Don't wipe a band-scan list; only scout the current span if we
+    // don't already have confirmed hits to walk.
+    if app.psk_hits.is_empty() {
+        refresh_psk_hits(app);
+    }
+    if app.psk_hits.is_empty() {
+        if app.scout_iq.len() < (app.rate * 0.25) as usize {
+            app.log("PSK31 scout: collecting audio…".into());
+        } else {
+            app.log("no PSK31 in this span — press p to scan the band".into());
+        }
+        return;
+    }
+    let cur = app.cursor
+        + app
+            .decoder
+            .as_ref()
+            .map(|d| d.lock_hz() as f64)
+            .unwrap_or(0.0);
+    let guard = 40.0;
+    let target = if forward {
+        app.psk_hits
+            .iter()
+            .find(|h| h.offset_hz as f64 > cur + guard)
+            .or_else(|| app.psk_hits.first())
+    } else {
+        app.psk_hits
+            .iter()
+            .rev()
+            .find(|h| (h.offset_hz as f64) < cur - guard)
+            .or_else(|| app.psk_hits.last())
+    };
+    match target {
+        Some(h) => {
+            let hz = h.offset_hz as f64;
+            let abs = app.center + hz;
+            if hz.abs() > app.rate * 0.40 {
+                if let Some(d) = &mut app.decoder {
+                    d.hop();
+                }
+                app.cursor = 0.0;
+                app.pending_tune = Some(abs);
+                // Re-base stored hits onto the new centre.
+                for hit in &mut app.psk_hits {
+                    hit.offset_hz = (app.center + hit.offset_hz as f64 - abs) as f32;
+                }
+            } else {
+                hop_cursor_to(app, hz);
+            }
+            app.log(format!(
+                "PSK31 -> {:.3} kHz  ({} found)",
+                abs / 1000.0,
+                app.psk_hits.len()
+            ));
+        }
+        None => app.log("no further PSK31 in this span".into()),
+    }
+}
+
+fn lock_nudge(app: &mut App, delta_hz: f32) {
+    if let Some(d) = &mut app.decoder
+        && let Some(hz) = d.nudge_lock(delta_hz)
+    {
+        app.log(format!("{} tune {hz:+.1} Hz", app.mode.label()));
+    }
+}
+
+/// Move the cursor onto the locked tone so the filter is centred and the
+/// residual reads near zero — the manual "zero-beat".
+fn centre_on_lock(app: &mut App) {
+    let Some(d) = app.decoder.as_ref() else {
+        return;
+    };
+    let off = d.lock_hz() as f64;
+    if off.abs() < 0.5 {
+        app.log(format!("{} already centred", app.mode.label()));
+        return;
+    }
+    hop_cursor_to(app, app.cursor + off);
+    app.log(format!(
+        "{} centred {:.3} kHz",
+        app.mode.label(),
+        app.tuned_freq() / 1000.0
+    ));
+}
+
+/// Next / previous confirmed CW. Same hop rules as PSK31.
+fn next_cw(app: &mut App, forward: bool) {
+    if let Some(d) = &mut app.decoder
+        && let Some(hz) = d.next_lock(forward)
+    {
+        app.log(format!("CW lock {hz:+.1} Hz (in passband)"));
+        return;
+    }
+    if app.cw_hits.is_empty() {
+        refresh_cw_hits(app);
+    }
+    if app.cw_hits.is_empty() {
+        if app.scout_iq.len() < (app.rate * 0.35) as usize {
+            app.log("CW scout: collecting audio…".into());
+        } else {
+            app.log("no CW in this span — press p to scan the band".into());
+        }
+        return;
+    }
+    let cur = app.cursor
+        + app
+            .decoder
+            .as_ref()
+            .map(|d| d.lock_hz() as f64)
+            .unwrap_or(0.0);
+    let guard = 40.0;
+    let target = if forward {
+        app.cw_hits
+            .iter()
+            .find(|h| h.offset_hz as f64 > cur + guard)
+            .or_else(|| app.cw_hits.first())
+    } else {
+        app.cw_hits
+            .iter()
+            .rev()
+            .find(|h| (h.offset_hz as f64) < cur - guard)
+            .or_else(|| app.cw_hits.last())
+    };
+    match target {
+        Some(h) => {
+            let hz = h.offset_hz as f64;
+            let abs = app.center + hz;
+            if hz.abs() > app.rate * 0.40 {
+                if let Some(d) = &mut app.decoder {
+                    d.hop();
+                }
+                app.cursor = 0.0;
+                app.pending_tune = Some(abs);
+                for hit in &mut app.cw_hits {
+                    hit.offset_hz = (app.center + hit.offset_hz as f64 - abs) as f32;
+                }
+            } else {
+                hop_cursor_to(app, hz);
+            }
+            app.log(format!(
+                "CW -> {:.3} kHz  ({} found)",
+                abs / 1000.0,
+                app.cw_hits.len()
+            ));
+        }
+        None => app.log("no further CW in this span".into()),
+    }
+}
+
+/// `p`: lock the next PSK31 or CW in the current span. If the scout sees
+/// none, walk the band and lock the first one it confirms.
+fn mode_scan_key(app: &mut App, radio: &radio::Radio) {
+    let kind = match app.mode {
+        Mode::Psk31 => ScanKind::Psk31,
+        Mode::Cw => ScanKind::Cw,
+        _ => {
+            app.log("switch to CW or PSK31 first (d)".into());
+            return;
+        }
+    };
+    if app.scan.as_ref().is_some_and(|s| s.kind == kind) {
+        app.scan = None;
+        app.log(format!("{} scan cancelled", app.mode.label()));
+        return;
+    }
+    match kind {
+        ScanKind::Psk31 => {
+            refresh_psk_hits(app);
+            if !app.psk_hits.is_empty() {
+                next_psk31(app, true);
+                return;
+            }
+        }
+        ScanKind::Cw => {
+            refresh_cw_hits(app);
+            if !app.cw_hits.is_empty() {
+                next_cw(app, true);
+                return;
+            }
+        }
+        ScanKind::Energy => {}
+    }
+    start_scan(app, radio, kind);
+}
+
 fn retune(app: &mut App, radio: &radio::Radio, freq: f64) {
     let freq = freq.clamp(100_000.0, 30_000_000.0);
+    if app.band_idx < app.band_gains.len() {
+        app.band_gains[app.band_idx] = app.gain;
+    }
+    let old_band = app.band_idx;
     app.center = freq;
+    // A new centre invalidates the old periodogram, scout list and AGC
+    // hang. Leaving them in place is why coming back to a band looked
+    // empty — the colour scale and hardware gain still belonged to the
+    // previous band, which reads as a filter having switched on.
     app.waterfall.clear();
+    app.spectrum.clear();
+    app.smoothed.clear();
+    app.spec_work.clear();
+    app.wf_accum.clear();
+    app.floor_db = -90.0;
+    app.ceil_db = -20.0;
+    app.psk_hits.clear();
+    app.cw_hits.clear();
+    app.idents.clear();
+    app.scout_iq.clear();
+    app.ident_at = Instant::now();
+    if let Some(d) = &mut app.decoder {
+        d.hop();
+    }
+    app.soft_agc.reset();
+    app.hw_hot = 0;
+    app.hw_quiet = 0;
+    app.hw_trim_at = Instant::now();
     let _ = radio.cmd.send(radio::Cmd::Tune(freq));
     if let Some(b) = bands::band_for(freq) {
         app.band_idx = bands::BANDS
@@ -842,22 +1407,38 @@ fn retune(app: &mut App, radio: &radio::Radio, freq: f64) {
             .position(|x| x.name == b.name)
             .unwrap_or(app.band_idx);
     }
+    if app.band_idx != old_band && app.band_idx < app.band_gains.len() {
+        app.gain = app.band_gains[app.band_idx];
+        app.pending_gain = Some(app.gain);
+    }
 }
 
-fn start_scan(app: &mut App, radio: &radio::Radio) {
+fn start_scan(app: &mut App, radio: &radio::Radio, kind: ScanKind) {
     let band = &bands::BANDS[app.band_idx];
     // Step by slightly less than the span so the edges overlap.
     let step = app.rate * 0.8;
     let start = band.start + app.rate / 2.0;
+    // Mode scouts need a dwell long enough to score keying / BPSK.
+    let dwell_ms = match kind {
+        ScanKind::Cw => 900,
+        ScanKind::Psk31 => 700,
+        ScanKind::Energy => 550,
+    };
     let state = ScanState {
         end: band.end,
         step,
         cur: start,
-        dwell_until: Instant::now() + Duration::from_millis(400),
+        dwell_until: Instant::now() + Duration::from_millis(dwell_ms),
         results: Vec::new(),
+        kind,
+    };
+    let tag = match kind {
+        ScanKind::Cw => "CW ",
+        ScanKind::Psk31 => "PSK31 ",
+        ScanKind::Energy => "",
     };
     app.log(format!(
-        "scanning {} ({:.3}-{:.3} MHz)",
+        "{tag}scanning {} ({:.3}-{:.3} MHz)",
         band.name,
         band.start / 1e6,
         band.end / 1e6
@@ -876,33 +1457,147 @@ fn step_scan(app: &mut App) -> Option<bool> {
         return Some(false);
     }
 
-    let peaks = find_peaks(&app.smoothed, cur, app.rate);
-    if let Some(s) = app.scan.as_mut() {
-        s.results.extend(peaks);
-        s.cur += step;
+    let kind = app.scan.as_ref()?.kind;
+    match kind {
+        ScanKind::Psk31 => {
+            let peaks = find_peaks(&app.smoothed, 0.0, app.rate);
+            let hits = psk31::scan_span(&app.scout_iq, app.rate, &peaks);
+            if let Some(s) = app.scan.as_mut() {
+                for h in hits {
+                    s.results.push(ScanHit {
+                        freq: s.cur + h.offset_hz as f64,
+                        score: h.quality * 100.0,
+                        label: "PSK31",
+                    });
+                }
+                s.cur += step;
+                s.dwell_until = Instant::now() + Duration::from_millis(700);
+            }
+        }
+        ScanKind::Cw => {
+            let peaks = find_peaks(&app.smoothed, 0.0, app.rate);
+            let hits = cw::scan_span(&app.scout_iq, app.rate, &peaks);
+            if let Some(s) = app.scan.as_mut() {
+                for h in hits {
+                    s.results.push(ScanHit {
+                        freq: s.cur + h.offset_hz as f64,
+                        score: h.quality * 100.0,
+                        label: "CW",
+                    });
+                }
+                s.cur += step;
+                s.dwell_until = Instant::now() + Duration::from_millis(900);
+            }
+        }
+        ScanKind::Energy => {
+            let peaks = find_peaks(&app.smoothed, cur, app.rate);
+            let ids = identify::classify_span(&app.scout_iq, app.rate, &app.smoothed, app.center);
+            if let Some(s) = app.scan.as_mut() {
+                for (f, snr) in peaks {
+                    let label = ids
+                        .iter()
+                        .min_by(|a, b| {
+                            let da = (s.cur + a.offset_hz as f64 - f).abs();
+                            let db = (s.cur + b.offset_hz as f64 - f).abs();
+                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .filter(|i| {
+                            (s.cur + i.offset_hz as f64 - f).abs()
+                                < i.bw_hz.max(400.0) as f64
+                        })
+                        .map(|i| i.kind.label())
+                        .unwrap_or("");
+                    s.results.push(ScanHit {
+                        freq: f,
+                        score: snr,
+                        label,
+                    });
+                }
+                s.cur += step;
+                s.dwell_until = Instant::now() + Duration::from_millis(550);
+            }
+        }
     }
 
     if cur + step > end {
         // Sweep complete: summarise into the text pane.
+        let kind = app.scan.as_ref()?.kind;
         let mut results = app.scan.as_mut()?.results.clone();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        results.dedup_by(|a, b| (a.0 - b.0).abs() < 200.0);
-        app.text.push_str("\n--- scan results (strongest first) ---\n");
-        for (f, snr) in results.iter().take(25) {
-            let marker = bands::MARKERS
-                .iter()
-                .find(|m| (m.freq - f).abs() < 1500.0)
-                .map(|m| m.label)
-                .unwrap_or("");
-            app.text.push_str(&format!(
-                "{:>10.3} kHz  {:5.1} dB  {}\n",
-                f / 1000.0,
-                snr,
-                marker
-            ));
+        if matches!(kind, ScanKind::Psk31 | ScanKind::Cw) {
+            let label = match kind {
+                ScanKind::Cw => "CW",
+                _ => "PSK31",
+            };
+            results.sort_by(|a, b| {
+                a.freq
+                    .partial_cmp(&b.freq)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            results.dedup_by(|a, b| (a.freq - b.freq).abs() < 40.0);
+            app.text
+                .push_str(&format!("\n--- {label} scan (low → high) ---\n"));
+            for h in results.iter() {
+                app.text
+                    .push_str(&format!("{:>10.3} kHz  q={:.0}%\n", h.freq / 1000.0, h.score));
+            }
+            app.text.push_str(&format!("--- end of {label} scan ---\n"));
+            app.log(format!("{label} scan: {} signal(s)", results.len()));
+            if let Some(first) = results.first() {
+                let f = first.freq;
+                if let Some(d) = &mut app.decoder {
+                    d.hop();
+                }
+                app.cursor = 0.0;
+                app.pending_tune = Some(f);
+                match kind {
+                    ScanKind::Cw => {
+                        app.cw_hits = results
+                            .iter()
+                            .map(|h| CwHit {
+                                offset_hz: (h.freq - f) as f32,
+                                score: h.score,
+                                quality: h.score / 100.0,
+                            })
+                            .collect();
+                    }
+                    _ => {
+                        app.psk_hits = results
+                            .iter()
+                            .map(|h| PskHit {
+                                offset_hz: (h.freq - f) as f32,
+                                score: h.score,
+                                quality: h.score / 100.0,
+                            })
+                            .collect();
+                    }
+                }
+            }
+        } else {
+            results.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            results.dedup_by(|a, b| (a.freq - b.freq).abs() < 200.0);
+            app.text.push_str("\n--- scan results (strongest first) ---\n");
+            for h in results.iter().take(25) {
+                let marker = bands::MARKERS
+                    .iter()
+                    .find(|m| (m.freq - h.freq).abs() < 1500.0)
+                    .map(|m| m.label)
+                    .unwrap_or("");
+                let kind = if h.label.is_empty() { marker } else { h.label };
+                app.text.push_str(&format!(
+                    "{:>10.3} kHz  {:5.1} dB  {}\n",
+                    h.freq / 1000.0,
+                    h.score,
+                    kind
+                ));
+            }
+            app.text.push_str("--- end of scan ---\n");
+            let n = results.iter().filter(|h| !h.label.is_empty()).count();
+            app.log(format!("scan complete — {n} labelled"));
         }
-        app.text.push_str("--- end of scan ---\n");
-        app.log("scan complete".into());
         return Some(true);
     }
     Some(false)
@@ -955,9 +1650,9 @@ fn find_peaks(spectrum: &[f32], center: f64, rate: f64) -> Vec<(f64, f32)> {
 /// The four vertical panes (status, spectrum, waterfall, decode). Shared by
 /// the renderer and mouse hit-testing so they can never disagree.
 fn pane_rects(area: Rect, app: &App) -> [Rect; 4] {
-    let ft = matches!(app.mode, Mode::Ft8 | Mode::Ft4);
+    let wide = matches!(app.mode, Mode::Ft8 | Mode::Ft4 | Mode::Cw | Mode::Psk31);
     // `v` enlarges the decode pane at the expense of the waterfall.
-    let dec = match (ft, app.decode_zoom) {
+    let dec = match (wide, app.decode_zoom) {
         (false, 0) => Constraint::Length(9),
         (true, 0) => Constraint::Length(14),
         (_, 1) => Constraint::Percentage(45),
@@ -986,16 +1681,16 @@ fn ft_cols(area: Rect) -> [Rect; 3] {
 }
 
 fn draw(f: &mut Frame, app: &App) {
-    let ft = matches!(app.mode, Mode::Ft8 | Mode::Ft4);
     let chunks = pane_rects(f.area(), app);
 
     draw_status(f, chunks[0], app);
     draw_spectrum(f, chunks[1], app);
     draw_waterfall(f, chunks[2], app);
-    if ft {
-        draw_ft(f, chunks[3], app);
-    } else {
-        draw_decode(f, chunks[3], app);
+    match app.mode {
+        Mode::Ft8 | Mode::Ft4 => draw_ft(f, chunks[3], app),
+        Mode::Cw => draw_cw(f, chunks[3], app),
+        Mode::Psk31 => draw_psk(f, chunks[3], app),
+        _ => draw_decode(f, chunks[3], app),
     }
 
     if let Some(ed) = &app.settings {
@@ -1030,7 +1725,7 @@ fn draw_settings(f: &mut Frame, area: Rect, ed: &SettingsEdit) {
         Line::from("  tab: switch field   enter: save   esc: cancel"),
         Line::from(""),
         Line::from(Span::styled(
-            "  FT8/FT4 spots are reported to pskreporter.info",
+            "  FT8, FT4 and PSK31 spots go to pskreporter.info",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
@@ -1149,6 +1844,15 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     } else {
         Color::Red
     };
+    let dec_style = if app.decoder.as_ref().is_some_and(|d| d.locked()) {
+        Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD)
+    } else if app.mode == Mode::Psk31 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::White)
+    };
     let mut spans2 = vec![
         Span::styled(
             app.mode.label(),
@@ -1157,7 +1861,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        val(dec_status),
+        Span::styled(dec_status, dec_style),
         lbl("  UTC "),
         Span::styled(utc, Style::default().fg(Color::LightBlue)),
     ];
@@ -1182,20 +1886,42 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         },
         Span::raw("  "),
     ]);
-    if app.agc {
-        spans2.push(Span::styled(
-            "AGC",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ));
-    } else {
-        spans2.push(lbl("gain "));
-        spans2.push(Span::styled(
-            format!("{:.0} dB", app.gain),
-            Style::default().fg(Color::Yellow),
-        ));
+    match app.agc {
+        AgcMode::Soft => {
+            spans2.push(Span::styled(
+                "AGC",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans2.push(lbl(" hang"));
+        }
+        AgcMode::Hardware => {
+            spans2.push(Span::styled(
+                "AGC",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans2.push(lbl(" hw"));
+        }
+        AgcMode::Off => {
+            spans2.push(lbl("gain "));
+            spans2.push(Span::styled(
+                format!("{:.0} dB", app.gain),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
     }
+    spans2.push(lbl("  fil "));
+    spans2.push(Span::styled(
+        if app.rx_filter == RxFilter::Auto {
+            format!("auto {:.0}", app.rx_bandwidth())
+        } else {
+            app.rx_filter.label().to_string()
+        },
+        Style::default().fg(Color::LightCyan),
+    ));
     spans2.push(lbl("  bias-T "));
     spans2.push(if app.biast {
         Span::styled(
@@ -1210,12 +1936,38 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         format!("{}ms", WF_INTERVALS_MS[app.wf_idx]),
         dim,
     ));
-    if app.scan.is_some() {
+    if let Some(s) = &app.scan {
+        let tag = match s.kind {
+            ScanKind::Psk31 => "  PSK SCAN",
+            ScanKind::Cw => "  CW SCAN",
+            ScanKind::Energy => "  SCANNING",
+        };
         spans2.push(Span::styled(
-            "  SCANNING",
+            tag,
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if app.mode == Mode::Psk31 && !app.psk_hits.is_empty() {
+        spans2.push(lbl("  psk "));
+        spans2.push(Span::styled(
+            app.psk_hits.len().to_string(),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    if app.mode == Mode::Cw && !app.cw_hits.is_empty() {
+        spans2.push(lbl("  cw "));
+        spans2.push(Span::styled(
+            app.cw_hits.len().to_string(),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if !app.idents.is_empty() {
+        spans2.push(lbl("  id "));
+        spans2.push(Span::styled(
+            identify::summary(&app.idents),
+            Style::default().fg(Color::LightCyan),
         ));
     }
     if let Some(r) = &app.reporter {
@@ -1235,10 +1987,13 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     }
     let line2 = Line::from(spans2);
 
+    let title = if app.my_call.is_empty() {
+        " hfscan  —  press ? for help ".to_string()
+    } else {
+        format!(" hfscan  ·  {}  —  press ? for help ", app.my_call)
+    };
     let p = Paragraph::new(vec![line1, line2]).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" hfscan — press ? for help "),
+        Block::default().borders(Borders::ALL).title(title),
     );
     f.render_widget(p, area);
 }
@@ -1278,13 +2033,36 @@ fn resample(spectrum: &[f32], width: usize) -> Vec<f32> {
 }
 
 fn cursor_col(app: &App, width: usize) -> usize {
+    freq_col(app, width, app.cursor)
+}
+
+fn freq_col(app: &App, width: usize, offset_hz: f64) -> usize {
     let (lo, hi) = app.view_range();
-    let frac = (app.cursor - lo) / (hi - lo).max(1.0);
+    let frac = (offset_hz - lo) / (hi - lo).max(1.0);
     ((frac * width as f64) as isize).clamp(0, width as isize - 1) as usize
 }
 
+fn ident_color(kind: identify::Kind) -> Color {
+    match kind {
+        identify::Kind::Cw => Color::Yellow,
+        identify::Kind::Psk31 => Color::LightBlue,
+        identify::Kind::Rtty => Color::Magenta,
+        identify::Kind::Ft8 => Color::Green,
+        identify::Kind::Ft4 => Color::LightGreen,
+        identify::Kind::Ssb => Color::White,
+        identify::Kind::Am => Color::LightYellow,
+        identify::Kind::Carrier => Color::DarkGray,
+        identify::Kind::Unknown => Color::Gray,
+    }
+}
+
 fn draw_spectrum(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default().borders(Borders::ALL).title(" spectrum ");
+    let title = if app.idents.is_empty() {
+        " spectrum ".to_string()
+    } else {
+        format!(" spectrum  {} ", identify::summary(&app.idents))
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 || app.smoothed.is_empty() {
@@ -1300,15 +2078,63 @@ fn draw_spectrum(f: &mut Frame, area: Rect, app: &App) {
     let cur = cursor_col(app, w);
     let (lo, hi) = (app.floor_db, app.ceil_db.max(app.floor_db + 10.0));
 
-    // In the FT modes the decoder monitors a fixed 200-2900 Hz window above
-    // the dial (the cursor); shade that band so it is visible at a glance.
-    let ft = matches!(app.mode, Mode::Ft8 | Mode::Ft4);
-    let band_lo = app.cursor + decoders::ft8::FREQ_MIN as f64;
-    let band_hi = app.cursor + decoders::ft8::FREQ_MAX as f64;
+    // Shade the decoder's listen window so you can see what it is
+    // hearing: FT8/FT4 the 200-3000 Hz USB passband above the dial,
+    // everything else the mode bandwidth around the cursor.
+    let (band_lo, band_hi, band_bg) = match app.mode {
+        Mode::Ft8 | Mode::Ft4 => (
+            app.cursor + decoders::ft8::FREQ_MIN as f64,
+            app.cursor + decoders::ft8::FREQ_MAX as f64,
+            Color::Rgb(40, 40, 50),
+        ),
+        Mode::Psk31 => {
+            let half = app.rx_bandwidth() as f64 / 2.0;
+            (
+                app.cursor - half,
+                app.cursor + half,
+                Color::Rgb(16, 36, 52),
+            )
+        }
+        Mode::Cw | Mode::Rtty => {
+            let half = app.rx_bandwidth() as f64 / 2.0;
+            (app.cursor - half, app.cursor + half, Color::Rgb(28, 28, 40))
+        }
+        Mode::Off => (0.0, 0.0, Color::Reset),
+    };
+    let shade = !matches!(app.mode, Mode::Off);
+    let lock_col = app.decoder.as_ref().and_then(|d| {
+        if d.locked() {
+            Some(freq_col(app, w, app.cursor + d.lock_hz() as f64))
+        } else {
+            None
+        }
+    });
+    // Span-scout hits: offsets from the radio centre. In-passband hits
+    // are relative to the cursor — mark both so `n`/`p` have a target.
+    let mut hit_cols = Vec::new();
+    for h in &app.psk_hits {
+        hit_cols.push(freq_col(app, w, h.offset_hz as f64));
+    }
+    for h in &app.cw_hits {
+        hit_cols.push(freq_col(app, w, h.offset_hz as f64));
+    }
+    let ident_cols: Vec<(usize, identify::Kind)> = app
+        .idents
+        .iter()
+        .map(|i| (freq_col(app, w, i.offset_hz as f64), i.kind))
+        .collect();
+    if let Some(d) = &app.decoder {
+        for hz in d.candidate_hz() {
+            hit_cols.push(freq_col(app, w, app.cursor + hz as f64));
+        }
+    }
     let (vlo, vhi) = app.view_range();
     let in_band = |x: usize| {
+        if !shade {
+            return false;
+        }
         let off = vlo + (x as f64 + 0.5) * (vhi - vlo) / w as f64;
-        ft && off >= band_lo && off <= band_hi
+        off >= band_lo && off <= band_hi
     };
 
     const BARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -1321,12 +2147,25 @@ fn draw_spectrum(f: &mut Frame, area: Rect, app: &App) {
             let eighths = (norm * (bars_h * 8) as f32) as usize;
             let cell = eighths.saturating_sub(from_bottom * 8).min(8);
             let ch = BARS[cell];
+            let ident = ident_cols.iter().find(|(c, _)| *c == x).map(|(_, k)| *k);
             let style = if x == cur {
                 Style::default().fg(Color::Magenta).bg(Color::Rgb(40, 0, 40))
+            } else if lock_col == Some(x) {
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .bg(Color::Rgb(0, 40, 50))
+            } else if hit_cols.contains(&x) {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .bg(Color::Rgb(0, 24, 32))
+            } else if let Some(k) = ident {
+                Style::default()
+                    .fg(ident_color(k))
+                    .bg(Color::Rgb(20, 20, 28))
             } else {
                 let mut s = Style::default().fg(heat(norm));
                 if in_band(x) {
-                    s = s.bg(Color::Rgb(40, 40, 50));
+                    s = s.bg(band_bg);
                 }
                 s
             };
@@ -1334,10 +2173,59 @@ fn draw_spectrum(f: &mut Frame, area: Rect, app: &App) {
         }
         lines.push(Line::from(spans));
     }
+    paint_ident_labels(&mut lines, app, w);
     if h > 1 {
         lines.push(axis_row(app, w));
     }
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Overlay short kind labels on the top spectrum row, strongest first.
+fn paint_ident_labels(lines: &mut [Line], app: &App, w: usize) {
+    if lines.is_empty() || w == 0 || app.idents.is_empty() {
+        return;
+    }
+    let mut order: Vec<&identify::Ident> = app.idents.iter().collect();
+    order.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                b.snr_db
+                    .partial_cmp(&a.snr_db)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+    let mut used = vec![false; w];
+    let row = lines[0].spans.clone();
+    if row.len() != w {
+        return;
+    }
+    let mut cells: Vec<Span> = row;
+    for id in order {
+        let label = id.kind.label();
+        if label.is_empty() {
+            continue;
+        }
+        let col = freq_col(app, w, id.offset_hz as f64);
+        let start = col.min(w.saturating_sub(label.len()));
+        let end = start + label.len();
+        if end > w || used[start..end].iter().any(|&u| u) {
+            continue;
+        }
+        let style = Style::default()
+            .fg(ident_color(id.kind))
+            .add_modifier(Modifier::BOLD);
+        for (i, ch) in label.chars().enumerate() {
+            cells[start + i] = Span::styled(ch.to_string(), style);
+            used[start + i] = true;
+        }
+        // One-column gap so adjacent labels stay readable.
+        if end < w {
+            used[end] = true;
+        }
+    }
+    lines[0] = Line::from(cells);
 }
 
 /// Frequency axis for the spectrum: '┬' ticks at round steps, labelled in kHz.
@@ -1532,9 +2420,18 @@ fn transcript_lines(app: &App, width: usize, rows: usize, ft: bool) -> Vec<Line<
 }
 
 fn draw_decode(f: &mut Frame, area: Rect, app: &App) {
-    let mut title = format!(" decode: {} ", app.mode.label());
+    let extra = match (app.mode, app.decoder.as_ref()) {
+        (Mode::Psk31, Some(d)) if d.locked() => format!("  lock {:+.1} Hz", d.lock_hz()),
+        (Mode::Psk31, _) => "  searching".into(),
+        _ => String::new(),
+    };
+    let mut title = format!(" decode: {}{extra} ", app.mode.label());
     if app.msg_scroll > 0 {
-        title = format!(" decode: {} (scrolled up {}) ", app.mode.label(), app.msg_scroll);
+        title = format!(
+            " decode: {}{extra} (scrolled up {}) ",
+            app.mode.label(),
+            app.msg_scroll
+        );
     }
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
@@ -1542,6 +2439,430 @@ fn draw_decode(f: &mut Frame, area: Rect, app: &App) {
 
     let body = transcript_lines(app, inner.width.max(1) as usize, inner.height as usize, false);
     f.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+}
+
+fn cw_cols(area: Rect) -> [Rect; 3] {
+    let cols = Layout::horizontal([
+        Constraint::Percentage(34),
+        Constraint::Percentage(38),
+        Constraint::Min(26),
+    ])
+    .split(area);
+    [cols[0], cols[1], cols[2]]
+}
+
+fn draw_cw(f: &mut Frame, area: Rect, app: &App) {
+    let cols = cw_cols(area);
+    let view = app.decoder.as_ref().and_then(|d| d.cw_view());
+    draw_cw_envelope(f, cols[0], app, view.as_ref());
+    draw_cw_text(f, cols[1], app);
+    draw_cw_tuner(f, cols[2], app, view.as_ref());
+}
+
+/// Scrolling keying envelope. Newest on the right; green while the key
+/// is down. The slice thresholds are a dim dotted rule.
+fn draw_cw_envelope(f: &mut Frame, area: Rect, _app: &App, view: Option<&CwView>) {
+    let title = match view {
+        Some(v) if v.key_down => " envelope  KEY ",
+        Some(_) => " envelope ",
+        None => " envelope ",
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let Some(v) = view else {
+        f.render_widget(
+            Paragraph::new("waiting for audio").style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    };
+    let w = inner.width as usize;
+    let h = inner.height as usize;
+    let n = v.env.len();
+    let mut cols = vec![0.0f32; w];
+    let mut keyed = vec![false; w];
+    if n > 0 {
+        for x in 0..w {
+            let i = x * n / w;
+            cols[x] = v.env[i.min(n - 1)];
+            keyed[x] = v.keyed.get(i.min(n - 1)).copied().unwrap_or(false);
+        }
+    }
+    const BARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let mut lines = Vec::with_capacity(h);
+    for row in 0..h {
+        let from_bottom = h - 1 - row;
+        let mut spans = Vec::with_capacity(w);
+        for x in 0..w {
+            let eighths = (cols[x].clamp(0.0, 1.0) * (h * 8) as f32) as usize;
+            let cell = eighths.saturating_sub(from_bottom * 8).min(8);
+            let ch = BARS[cell];
+            let on_row = ((1.0 - v.on_thr) * h as f32) as usize;
+            let off_row = ((1.0 - v.off_thr) * h as f32) as usize;
+            let style = if keyed[x] {
+                Style::default().fg(Color::LightGreen)
+            } else if row == on_row || row == off_row {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            spans.push(Span::styled(ch.to_string(), style));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_cw_text(f: &mut Frame, area: Rect, app: &App) {
+    let mut title = " copy ".to_string();
+    if app.msg_scroll > 0 {
+        title = format!(" copy (scrolled up {}) ", app.msg_scroll);
+    }
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let body = transcript_lines(app, inner.width.max(1) as usize, inner.height as usize, false);
+    f.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_cw_tuner(f: &mut Frame, area: Rect, app: &App, view: Option<&CwView>) {
+    let rf = app.tuned_freq();
+    let lock = view.map(|v| v.lock_hz as f64).unwrap_or(0.0);
+    let center = rf + lock;
+    let title = format!(" tuner  {:.3} kHz ", center / 1000.0);
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line> = Vec::new();
+    match view {
+        None => lines.push(Line::from(Span::styled("no decoder", dim))),
+        Some(v) => {
+            let err = v.tune_err_hz;
+            let err_col = if err.abs() < 2.0 {
+                Color::LightGreen
+            } else if err.abs() < 8.0 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+            lines.push(Line::from(vec![
+                Span::styled("rf     ", dim),
+                Span::styled(
+                    format!("{:.3} kHz", center / 1000.0),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("lock   ", dim),
+                Span::styled(
+                    format!("{:+.1} Hz", v.lock_hz),
+                    Style::default().fg(if v.locked {
+                        Color::LightCyan
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("tune   ", dim),
+                Span::styled(format!("{err:+.1} Hz"), Style::default().fg(err_col)),
+            ]));
+            lines.push(tune_meter(inner.width as usize, err));
+            lines.push(Line::from(vec![
+                Span::styled("wpm    ", dim),
+                Span::styled(format!("{:.0}", v.wpm), Style::default().fg(Color::White)),
+                Span::styled(format!("   dit {:.0} ms", v.dit_ms), dim),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("q      ", dim),
+                Span::styled(
+                    format!("{:.0}%", v.quality * 100.0),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    if v.key_down { "   KEY" } else { "   —" },
+                    Style::default().fg(if v.key_down {
+                        Color::LightGreen
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+            ]));
+            let elem = if v.symbol.is_empty() {
+                "·".into()
+            } else {
+                v.symbol.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("elem   ", dim),
+                Span::styled(elem, Style::default().fg(Color::Cyan)),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "u/i fine   g centre   n next",
+                dim,
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("tones", dim)));
+            let passband = !v.hits.is_empty();
+            let mut listed: Vec<(f32, f32, bool)> = if passband {
+                v.hits
+                    .iter()
+                    .map(|h| {
+                        (
+                            h.offset_hz,
+                            h.quality,
+                            (h.offset_hz - v.lock_hz).abs() < 15.0,
+                        )
+                    })
+                    .collect()
+            } else {
+                app.cw_hits
+                    .iter()
+                    .map(|h| (h.offset_hz, h.quality, false))
+                    .collect()
+            };
+            listed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let skip = app.st_scroll.min(listed.len().saturating_sub(1));
+            for (off, q, on) in listed.into_iter().skip(skip).take(8) {
+                let abs = if passband {
+                    (rf + off as f64) / 1000.0
+                } else {
+                    (app.center + off as f64) / 1000.0
+                };
+                let mark = if on { '>' } else { ' ' };
+                let style = if on {
+                    Style::default().fg(Color::LightCyan)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{mark}{abs:8.3}  q={:.0}%", q * 100.0),
+                    style,
+                )));
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn tune_meter(width: usize, err_hz: f32) -> Line<'static> {
+    let inner = width.saturating_sub(2).max(8);
+    let mut cells = vec!['·'; inner];
+    let mid = inner / 2;
+    cells[mid] = '|';
+    let span = 20.0f32;
+    let x = (mid as f32 + (err_hz / span) * mid as f32)
+        .round()
+        .clamp(0.0, (inner - 1) as f32) as usize;
+    cells[x] = if err_hz.abs() < 2.0 { '●' } else { '◆' };
+    let bar: String = cells.into_iter().collect();
+    let col = if err_hz.abs() < 2.0 {
+        Color::LightGreen
+    } else if err_hz.abs() < 8.0 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+    Line::from(Span::styled(format!("[{bar}]"), Style::default().fg(col)))
+}
+
+fn draw_psk(f: &mut Frame, area: Rect, app: &App) {
+    let cols = cw_cols(area);
+    let view = app.decoder.as_ref().and_then(|d| d.psk_view());
+    draw_psk_scope(f, cols[0], view.as_ref());
+    draw_cw_text(f, cols[1], app);
+    draw_psk_tuner(f, cols[2], app, view.as_ref());
+}
+
+/// Constellation (I/Q of recent symbols) over a short envelope of the
+/// locked baseband. BPSK sits on the real axis; a residual carrier
+/// tilts the cloud — that is the fine-tune cue.
+fn draw_psk_scope(f: &mut Frame, area: Rect, view: Option<&PskView>) {
+    let title = match view {
+        Some(v) if v.locked => " eye  LOCK ",
+        _ => " eye ",
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let Some(v) = view else {
+        f.render_widget(
+            Paragraph::new("waiting for audio").style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    };
+    let w = inner.width as usize;
+    let h = inner.height as usize;
+    let env_h = if h > 4 { 2 } else { 0 };
+    let eye_h = h.saturating_sub(env_h).max(1);
+
+    let mut grid = vec![vec![' '; w]; eye_h];
+    let mid_x = w / 2;
+    let mid_y = eye_h / 2;
+    for x in 0..w {
+        grid[mid_y][x] = '─';
+    }
+    for y in 0..eye_h {
+        grid[y][mid_x] = '│';
+    }
+    grid[mid_y][mid_x] = '┼';
+    for (i, s) in v.symbols.iter().enumerate() {
+        let x = ((s.re + 1.25) / 2.5 * w as f32).round() as isize;
+        let y = ((1.25 - s.im) / 2.5 * eye_h as f32).round() as isize;
+        if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < eye_h {
+            let ch = if i + 4 >= v.symbols.len() { '●' } else { '·' };
+            grid[y as usize][x as usize] = ch;
+        }
+    }
+    let mut lines: Vec<Line> = grid
+        .into_iter()
+        .map(|row| {
+            Line::from(Span::styled(
+                row.into_iter().collect::<String>(),
+                Style::default().fg(Color::LightCyan),
+            ))
+        })
+        .collect();
+
+    if env_h > 0 && !v.env.is_empty() {
+        const BARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        for row in 0..env_h {
+            let from_bottom = env_h - 1 - row;
+            let mut spans = Vec::with_capacity(w);
+            for x in 0..w {
+                let i = x * v.env.len() / w.max(1);
+                let e = v.env.get(i).copied().unwrap_or(0.0);
+                let eighths = (e.clamp(0.0, 1.0) * (env_h * 8) as f32) as usize;
+                let cell = eighths.saturating_sub(from_bottom * 8).min(8);
+                spans.push(Span::styled(
+                    BARS[cell].to_string(),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_psk_tuner(f: &mut Frame, area: Rect, app: &App, view: Option<&PskView>) {
+    let rf = app.tuned_freq();
+    let lock = view.map(|v| v.lock_hz as f64).unwrap_or(0.0);
+    let center = rf + lock;
+    let title = format!(" tuner  {:.3} kHz ", center / 1000.0);
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line> = Vec::new();
+    match view {
+        None => lines.push(Line::from(Span::styled("no decoder", dim))),
+        Some(v) => {
+            let err = v.tune_err_hz;
+            let err_col = if err.abs() < 1.0 {
+                Color::LightGreen
+            } else if err.abs() < 4.0 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+            lines.push(Line::from(vec![
+                Span::styled("rf     ", dim),
+                Span::styled(
+                    format!("{:.3} kHz", center / 1000.0),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("lock   ", dim),
+                Span::styled(
+                    format!("{:+.1} Hz", v.lock_hz),
+                    Style::default().fg(if v.locked {
+                        Color::LightCyan
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("afc    ", dim),
+                Span::styled(format!("{err:+.1} Hz"), Style::default().fg(err_col)),
+            ]));
+            lines.push(tune_meter(inner.width as usize, err));
+            lines.push(Line::from(vec![
+                Span::styled("q      ", dim),
+                Span::styled(
+                    format!("{:.0}%", v.quality * 100.0),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    format!("   rev {:.0}%", v.reversals * 100.0),
+                    dim,
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "u/i fine   g centre   n next",
+                dim,
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("signals", dim)));
+            let passband = !v.hits.is_empty();
+            let mut listed: Vec<(f32, f32, bool)> = if passband {
+                v.hits
+                    .iter()
+                    .map(|h| {
+                        (
+                            h.offset_hz,
+                            h.quality,
+                            (h.offset_hz - v.lock_hz).abs() < 8.0,
+                        )
+                    })
+                    .collect()
+            } else {
+                app.psk_hits
+                    .iter()
+                    .map(|h| (h.offset_hz, h.quality, false))
+                    .collect()
+            };
+            listed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let skip = app.st_scroll.min(listed.len().saturating_sub(1));
+            for (off, q, on) in listed.into_iter().skip(skip).take(8) {
+                let abs = if passband {
+                    (rf + off as f64) / 1000.0
+                } else {
+                    (app.center + off as f64) / 1000.0
+                };
+                let mark = if on { '>' } else { ' ' };
+                let style = if on {
+                    Style::default().fg(Color::LightCyan)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{mark}{abs:8.3}  q={:.0}%", q * 100.0),
+                    style,
+                )));
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// FT8/FT4 replace the plain decode pane with three views of the same decodes:
@@ -1812,25 +3133,32 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  ↑ / ↓       scroll the decode transcript (shift: 10 lines)"),
         Line::from("  wheel       scroll the pane under the mouse (waterfall too)"),
         Line::from("  z / Z       zoom in / out — also sets the tuning step"),
-        Line::from("  n / N       jump to next / previous signal"),
+        Line::from("  n / N       next / previous signal (CW/PSK31: confirmed)"),
+        Line::from("  p           CW/PSK31: lock next in span, or scan the band"),
+        Line::from("  u / i       CW/PSK31: fine-tune lock −2 / +2 Hz"),
+        Line::from("  g           CW/PSK31: centre the cursor on the lock"),
         Line::from("  [ ]         retune centre ±10 kHz"),
         Line::from("  PgUp/PgDn   retune centre ± half span"),
         Line::from("  c           centre the radio on the cursor"),
         Line::from("  b / B       next / previous band preset"),
         Line::from("  d           decoder: off → CW → RTTY → PSK31 → FT8 → FT4"),
         Line::from("  r           RTTY normal/reverse shift"),
-        Line::from("  s           scan the current band for signals"),
+        Line::from("              PSK31 auto-locks to a nearby carrier (AFC)"),
+        Line::from("  s           scan the current band; results are labelled"),
+        Line::from("              spectrum tags: CW PSK RTTY FT8 FT4 SSB AM CAR"),
         Line::from("  v           enlarge the decode pane (cycles sizes)"),
         Line::from("  w / W       waterfall speed / hi-res frequency mode"),
         Line::from("  f / F       FFT size (frequency resolution)"),
-        Line::from("  a           toggle AGC      + / -   manual gain"),
+        Line::from("  a           AGC: soft hang → hardware → off   + / - gain"),
+        Line::from("  e           spectrum smoothing (light / medium / heavy)"),
+        Line::from("  l           RX bandpass (auto / 80 / 200 / 500 / 1.5k / 3k)"),
         Line::from("  k           squelch on/off  , / .   squelch threshold"),
         Line::from("  t           toggle bias-T (external preamp power)"),
         Line::from("  o           station settings (callsign, grid, spotting)"),
         Line::from("  x           clear the decode pane"),
         Line::from("  ? / q       toggle help / quit"),
     ];
-    let w = 62.min(area.width.saturating_sub(4));
+    let w = 68.min(area.width.saturating_sub(4));
     let h = (text.len() as u16 + 2).min(area.height);
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
@@ -1962,6 +3290,58 @@ mod tests {
             t.draw(|f| super::draw(f, &app)).unwrap();
             app.settings = None;
         }
+    }
+
+    #[test]
+    fn psk_panes_render_without_panicking() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(14_070_000.0, 192_000.0, Mode::Psk31);
+        app.text = "CQ CQ DE TEST\n".into();
+        for (w, h) in [(80u16, 24u16), (40, 12), (150, 50)] {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| super::draw(f, &app)).unwrap();
+        }
+        let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        t.draw(|f| super::draw(f, &app)).unwrap();
+        let buf = t.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("eye"), "eye pane missing:\n{text}");
+        assert!(text.contains("tuner"), "tuner pane missing:\n{text}");
+        assert!(text.contains("copy"), "copy pane missing:\n{text}");
+    }
+
+    #[test]
+    fn cw_panes_render_without_panicking() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(14_026_000.0, 192_000.0, Mode::Cw);
+        app.text = "CQ CQ DE W1AW K\n".into();
+        for (w, h) in [(80u16, 24u16), (40, 12), (150, 50)] {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| super::draw(f, &app)).unwrap();
+        }
+        let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        t.draw(|f| super::draw(f, &app)).unwrap();
+        let buf = t.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("envelope"), "envelope pane missing:\n{text}");
+        assert!(text.contains("tuner"), "tuner pane missing:\n{text}");
+        assert!(text.contains("copy"), "copy pane missing:\n{text}");
     }
 
     /// Scrolling the transcript shows older lines; zero stays pinned to live.

@@ -30,7 +30,12 @@ const SEND_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_RECORDS: usize = 60;
 /// Re-report a station after this long, or sooner on a band change.
 const REREPORT_SECS: u32 = 3600;
-const SOFTWARE: &str = concat!("HFScan by KQ2Y v", env!("CARGO_PKG_VERSION"));
+/// Shown as `decodingSoftware` on pskreporter.info.
+///
+/// The site treats the first ASCII digit in this field as the start of the
+/// version. Putting a callsign such as `KQ2Y` *before* the version therefore
+/// displays as `HFScan by KQ`. Version comes first so the full credit survives.
+const SOFTWARE: &str = concat!("HFScan v", env!("CARGO_PKG_VERSION"), " by KQ2Y");
 
 pub struct Spot {
     call: String,
@@ -460,6 +465,22 @@ mod tests {
         // The record sits right after the sender block header (20-byte
         // record + 4-byte header = 0x18).
         assert_eq!(&pkt[pos - 4..pos], &[0x9A, 0x93, 0x00, 0x18]);
+    }
+
+    #[test]
+    fn software_id_does_not_put_callsign_digits_before_the_version() {
+        // "HFScan by KQ2Y v0.1.0" is shown as "HFScan by KQ" because the
+        // first digit (`2`) is parsed as the version. The version must be
+        // the first digit run, and the author callsign must still be present.
+        let first_digit = SOFTWARE
+            .find(|c: char| c.is_ascii_digit())
+            .expect("software id must include a version");
+        assert!(
+            SOFTWARE[..first_digit].ends_with('v'),
+            "first digit must belong to the version, got {SOFTWARE:?}"
+        );
+        assert!(SOFTWARE.starts_with("HFScan v"), "got {SOFTWARE:?}");
+        assert!(SOFTWARE.contains("KQ2Y"), "author credit missing from {SOFTWARE:?}");
     }
 
     #[test]

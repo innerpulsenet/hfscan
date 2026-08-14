@@ -33,7 +33,10 @@ pub fn spawn(args: String, rate: f64, freq: f64) -> Result<Radio> {
     let dev = soapysdr::Device::new(args.as_str()).context("opening SDR device")?;
     dev.set_sample_rate(Rx, 0, rate).context("setting sample rate")?;
     dev.set_frequency(Rx, 0, freq, ()).context("setting frequency")?;
-    let _ = dev.set_gain_mode(Rx, 0, true);
+    // Hardware AGC on the RSP1A pumps on static and FT8 bursts; start
+    // in manual gain and let the UI's hang AGC own the level.
+    let _ = dev.set_gain_mode(Rx, 0, false);
+    let _ = dev.set_gain(Rx, 0, 36.0);
     let _ = dev.write_setting("biasT_ctrl", "false");
 
     std::thread::spawn(move || {

@@ -35,8 +35,11 @@ fn morse_for(c: char) -> &'static str {
 }
 
 fn gen_cw(text: &str, wpm: f32, snr_scale: f32) -> Vec<Complex32> {
+    gen_cw_at(text, wpm, snr_scale, 600.0)
+}
+
+fn gen_cw_at(text: &str, wpm: f32, snr_scale: f32, tone: f32) -> Vec<Complex32> {
     let dit = (1.2 / wpm * FS as f32) as usize;
-    let tone = 600.0f32; // audio offset inside the CW passband
     let mut key: Vec<f32> = Vec::new();
     // lead-in silence lets the threshold tracker settle
     key.extend(std::iter::repeat(0.0).take(dit * 8));
@@ -104,6 +107,105 @@ fn cw_tracks_speed() {
         assert!(
             (est - wpm).abs() < wpm * 0.25,
             "speed estimate {est:.1} too far from {wpm:.1}"
+        );
+    }
+}
+
+/// A mid-stream speed change must be followed, not locked to the old dit.
+#[test]
+fn cw_follows_a_speed_change() {
+    let slow = gen_cw("PARIS PARIS ", 15.0, 0.01);
+    let fast = gen_cw("PARIS PARIS", 32.0, 0.01);
+    let mut d = cw::CwDecoder::new(FS);
+    for chunk in slow.chunks(4096) {
+        let _ = d.process(chunk);
+    }
+    let mid = d.wpm();
+    assert!(
+        (mid - 15.0).abs() < 6.0,
+        "should have locked ~15 WPM first, got {mid:.1}"
+    );
+    let mut out = String::new();
+    for chunk in fast.chunks(4096) {
+        out.push_str(&d.process(chunk));
+    }
+    let est = d.wpm();
+    assert!(
+        (est - 32.0).abs() < 10.0,
+        "failed to follow 15→32 WPM, estimate {est:.1}"
+    );
+    assert!(
+        out.contains("PARIS") || out.contains("ARIS"),
+        "speed-changed text lost: {out:?} ({})",
+        d.status()
+    );
+}
+
+#[test]
+fn cw_view_exposes_envelope_and_center() {
+    let sig = gen_cw("CQ DE W1AW", 20.0, 0.02);
+    let mut d = cw::CwDecoder::new(FS);
+    for chunk in sig.chunks(4096) {
+        let _ = d.process(chunk);
+    }
+    let v = d.cw_view().expect("CW view");
+    assert!(
+        v.env.len() > 50,
+        "envelope history too short: {}",
+        v.env.len()
+    );
+    assert_eq!(v.env.len(), v.keyed.len());
+    assert!(v.wpm > 8.0 && v.wpm < 35.0, "wpm {}", v.wpm);
+    let before = v.lock_hz;
+    let after = d.nudge_lock(5.0).unwrap();
+    assert!((after - before - 5.0).abs() < 0.1);
+}
+
+/// The span scout must confirm keyed Morse and ignore a dead carrier.
+#[test]
+fn cw_span_scout_finds_cw_and_skips_a_carrier() {
+    let cw_sig = gen_cw_at("CQ CQ DE W1AW", 20.0, 0.02, 400.0);
+    let n = cw_sig.len();
+    let mut iq = cw_sig;
+    for i in 0..n {
+        let ph = 2.0 * PI * (-250.0) * i as f32 / FS as f32;
+        iq[i] += Complex32::from_polar(0.9, ph);
+    }
+    let hits = cw::scan_span(&iq, FS, &[(400.0, 20.0), (-250.0, 20.0)]);
+    assert!(
+        hits.iter().any(|h| (h.offset_hz - 400.0).abs() < 40.0),
+        "scout missed the CW at +400 Hz: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| (h.offset_hz + 250.0).abs() < 40.0),
+        "scout locked a plain carrier: {hits:?}"
+    );
+}
+
+/// Two CW tones in the passband: lock one, then next_lock hops to the other.
+#[test]
+fn cw_next_lock_hops_to_the_other_signal() {
+    let a = gen_cw_at("CQ CQ CQ DE TEST", 20.0, 0.015, 80.0);
+    let b = gen_cw_at("CQ CQ CQ DE TEST", 20.0, 0.015, -120.0);
+    let n = a.len().min(b.len());
+    let sig: Vec<Complex32> = (0..n).map(|i| a[i] + b[i]).collect();
+    let mut d = cw::CwDecoder::new(FS);
+    for chunk in sig.chunks(4096) {
+        let _ = d.process(chunk);
+    }
+    assert!(
+        d.locked() || !d.candidate_hz().is_empty(),
+        "should find at least one CW tone ({})",
+        d.status()
+    );
+    if d.candidate_hz().len() >= 2 {
+        let first = d.lock_hz();
+        let hopped = d.next_lock(true);
+        assert!(hopped.is_some(), "next_lock should hop ({})", d.status());
+        assert!(
+            (d.lock_hz() - first).abs() > 40.0,
+            "next_lock stayed at {first:.1} ({})",
+            d.status()
         );
     }
 }
@@ -293,6 +395,20 @@ fn psk31_debug_bitstream() {
 }
 
 #[test]
+fn psk31_view_exposes_symbols_and_nudge() {
+    let sig = gen_psk31("CQ DE TEST", 0.0);
+    let mut d = psk31::Psk31Decoder::new(FS);
+    for chunk in sig.chunks(4096) {
+        let _ = d.process(chunk);
+    }
+    let v = d.psk_view().expect("PSK view");
+    assert!(!v.symbols.is_empty() || !v.env.is_empty());
+    let before = v.lock_hz;
+    let after = d.nudge_lock(3.0).unwrap();
+    assert!((after - before - 3.0).abs() < 1.0, "{before} -> {after}");
+}
+
+#[test]
 fn psk31_decodes_text() {
     let msg = "CQ DE TEST";
     let sig = gen_psk31(msg, 0.0);
@@ -320,6 +436,113 @@ fn psk31_tolerates_frequency_offset() {
         out.contains("HELLO WORLD"),
         "offset signal failed: {out:?} ({})",
         d.status()
+    );
+}
+
+/// An unmodulated tone squares to a loud peak too — it must not be
+/// mistaken for PSK31 (no phase reversals).
+#[test]
+fn psk31_ignores_a_plain_carrier() {
+    let n = (FS * 3.0) as usize;
+    let sig: Vec<Complex32> = (0..n)
+        .map(|i| {
+            let ph = 2.0 * PI * 15.0 * i as f32 / FS as f32;
+            Complex32::from_polar(1.0, ph)
+        })
+        .collect();
+    let mut d = psk31::Psk31Decoder::new(FS);
+    let mut out = String::new();
+    for chunk in sig.chunks(4096) {
+        out.push_str(&d.process(chunk));
+    }
+    assert!(
+        !d.locked(),
+        "carrier must not look like PSK31 ({})",
+        d.status()
+    );
+    assert!(
+        out.chars().filter(|c| c.is_ascii_alphanumeric()).count() < 3,
+        "carrier leaked text: {out:?}"
+    );
+}
+
+/// Offsets well outside the old ±4 Hz AFC pull-in: the searcher has to
+/// identify the carrier and mix it onto DC itself.
+#[test]
+fn psk31_identifies_and_calibrates_to_a_nearby_signal() {
+    for offset in [18.0f32, -22.0, 35.0] {
+        let sig = gen_psk31("HELLO WORLD", offset);
+        let mut d = psk31::Psk31Decoder::new(FS);
+        let mut out = String::new();
+        for chunk in sig.chunks(4096) {
+            out.push_str(&d.process(chunk));
+        }
+        assert!(
+            out.contains("HELLO WORLD"),
+            "failed to lock {offset:+.0} Hz signal: {out:?} ({})",
+            d.status()
+        );
+        assert!(
+            d.locked(),
+            "decoder should report lock at {offset:+.0} Hz ({})",
+            d.status()
+        );
+        assert!(
+            (d.lock_hz() - offset).abs() < 4.0,
+            "calibrated {:+.1} Hz, wanted {offset:+.1} Hz ({})",
+            d.lock_hz(),
+            d.status()
+        );
+    }
+}
+
+/// Two carriers in the same passband: lock one, then `next_lock` must
+/// hop to the other.
+#[test]
+fn psk31_next_lock_hops_to_the_other_signal() {
+    let a = gen_psk31("ALPHA", 20.0);
+    let b = gen_psk31("BRAVO", -50.0);
+    let n = a.len().min(b.len());
+    let sig: Vec<Complex32> = (0..n).map(|i| a[i] + b[i]).collect();
+    let mut d = psk31::Psk31Decoder::new(FS);
+    for chunk in sig.chunks(4096) {
+        let _ = d.process(chunk);
+    }
+    assert!(d.locked(), "should lock one of the two ({})", d.status());
+    let first = d.lock_hz();
+    let hopped = d.next_lock(true);
+    assert!(
+        hopped.is_some(),
+        "next_lock should find the other signal ({})",
+        d.status()
+    );
+    let second = d.lock_hz();
+    assert!(
+        (first - second).abs() > 20.0,
+        "next_lock stayed at {first:.1} Hz ({})",
+        d.status()
+    );
+}
+
+/// The span scout must confirm a real PSK31 peak and ignore a dead carrier.
+#[test]
+fn psk31_span_scout_finds_psk_and_skips_a_carrier() {
+    let psk = gen_psk31("HELLO", 80.0);
+    let n = psk.len();
+    let mut iq = psk;
+    // Unmodulated tone well away from the PSK31 signal.
+    for i in 0..n {
+        let ph = 2.0 * PI * (-120.0) * i as f32 / FS as f32;
+        iq[i] += Complex32::from_polar(1.0, ph);
+    }
+    let hits = psk31::scan_span(&iq, FS, &[(80.0, 20.0), (-120.0, 20.0)]);
+    assert!(
+        hits.iter().any(|h| (h.offset_hz - 80.0).abs() < 8.0),
+        "scout missed the PSK31 at +80 Hz: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| (h.offset_hz + 120.0).abs() < 8.0),
+        "scout locked a plain carrier: {hits:?}"
     );
 }
 

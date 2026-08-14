@@ -11,6 +11,46 @@ mod tests;
 
 use num_complex::Complex32;
 
+/// Snapshot of the CW decoder for the dedicated scope pane.
+#[derive(Clone, Debug)]
+pub struct CwView {
+    /// Normalised envelope 0..1, oldest first.
+    pub env: Vec<f32>,
+    /// Key-down flag for each envelope sample.
+    pub keyed: Vec<bool>,
+    /// Slice thresholds as 0..1 of the current peak–floor span.
+    pub on_thr: f32,
+    pub off_thr: f32,
+    /// Lock offset from the cursor, Hz.
+    pub lock_hz: f32,
+    /// Residual tone after the lock mix, Hz. Zero means centred.
+    pub tune_err_hz: f32,
+    pub wpm: f32,
+    pub quality: f32,
+    pub key_down: bool,
+    /// Morse being assembled (`.`, `-`).
+    pub symbol: String,
+    pub dit_ms: f32,
+    pub locked: bool,
+    pub hits: Vec<cw::CwHit>,
+}
+
+/// Snapshot of the PSK31 decoder for the scope / tuner pane.
+#[derive(Clone, Debug)]
+pub struct PskView {
+    /// Recent normalised symbols (I/Q on the unit circle), oldest first.
+    pub symbols: Vec<Complex32>,
+    /// |baseband| 0..1 after the lock mix, oldest first.
+    pub env: Vec<f32>,
+    pub lock_hz: f32,
+    /// Residual AFC after the lock mix, Hz.
+    pub tune_err_hz: f32,
+    pub quality: f32,
+    pub reversals: f32,
+    pub locked: bool,
+    pub hits: Vec<psk31::PskHit>,
+}
+
 /// One decoded FT8/FT4 transmission, kept structured so the UI can build
 /// activity maps and station lists rather than just printing lines.
 #[derive(Clone, Debug)]
@@ -57,10 +97,44 @@ pub trait Decoder: Send {
     fn squelched(&self) -> bool {
         true
     }
-    /// Drain structured messages decoded since the last call. Only FT8/FT4
-    /// produce these; other modes return nothing.
+    /// Drain structured messages decoded since the last call. FT8/FT4 produce
+    /// one per decode; PSK31 produces one when a CQ/DE callsign is recognised.
     fn take_messages(&mut self) -> Vec<FtMessage> {
         Vec::new()
+    }
+    /// Frequency the decoder has locked to, in Hz relative to the tuning-chain
+    /// centre (the cursor). Zero when the mode does not track a carrier.
+    fn lock_hz(&self) -> f32 {
+        0.0
+    }
+    /// Whether the decoder has a confident lock on a signal.
+    fn locked(&self) -> bool {
+        false
+    }
+    /// Receiver identity, used for FT8 a-priori decoding and hash lookup.
+    fn set_station(&mut self, _call: &str, _grid: &str) {}
+    /// Drop the current lock (the cursor moved; baseband is a new place).
+    fn hop(&mut self) {}
+    /// Jump to the next / previous identified signal *inside* the current
+    /// passband. Returns the new lock offset in Hz, or `None`.
+    fn next_lock(&mut self, _forward: bool) -> Option<f32> {
+        None
+    }
+    /// Offsets (Hz, relative to the cursor) of signals the decoder has
+    /// identified in the current passband.
+    fn candidate_hz(&self) -> Vec<f32> {
+        Vec::new()
+    }
+    /// Live CW scope (envelope, lock, tune error). Other modes return none.
+    fn cw_view(&self) -> Option<CwView> {
+        None
+    }
+    fn psk_view(&self) -> Option<PskView> {
+        None
+    }
+    /// Nudge the in-passband lock, Hz. Returns the new lock offset.
+    fn nudge_lock(&mut self, _delta_hz: f32) -> Option<f32> {
+        None
     }
 }
 

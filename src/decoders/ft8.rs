@@ -15,19 +15,25 @@
 
 use super::{Decoder, FtMessage};
 use crate::dsp::Nco;
+use crate::report::is_callsign;
+use mfsk_core::engine::equalize::EqMode;
+use mfsk_core::msg::ap::ApHint;
 use mfsk_core::msg::decode_request::DecodeRequest;
-use mfsk_core::msg::wsjt77::unpack77;
+use mfsk_core::msg::hash_table::CallsignHashTable;
+use mfsk_core::msg::wsjt77::{is_plausible_message, unpack77_with_hash};
 use mfsk_core::{Ft4, Ft8};
 use num_complex::Complex32;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const AUDIO_RATE: f64 = 12_000.0;
-/// Audio passband centre; signals live at 200-2900 Hz above the dial.
-pub const AUDIO_CENTRE: f64 = 1500.0;
+/// Audio passband centre; signals live at 200-3000 Hz above the dial.
+pub const AUDIO_CENTRE: f64 = 1600.0;
 pub const FREQ_MIN: f32 = 200.0;
-pub const FREQ_MAX: f32 = 2900.0;
-const MAX_CAND: usize = 100;
+/// Matches WSJT-X's default upper edge so stations at the top of the
+/// waterfall are not silently dropped.
+pub const FREQ_MAX: f32 = 3000.0;
+const MAX_CAND: usize = 200;
 
 pub struct FtDecoder {
     ft4: bool,
@@ -38,35 +44,48 @@ pub struct FtDecoder {
     /// single slot-wide gain can be used (see `append_audio`).
     buf: Vec<f32>,
     slot: u64,
-    jobs: Sender<Vec<i16>>,
+    jobs: Sender<SlotJob>,
     results: Receiver<Vec<FtMessage>>,
     msgs: Vec<FtMessage>,
     decodes: u32,
     pending: bool,
     started: bool,
     last_fill: f32,
+    my_call: String,
+}
+
+struct SlotJob {
+    audio: Vec<i16>,
+    my_call: String,
 }
 
 impl FtDecoder {
     pub fn new(fs: f64, ft4: bool) -> Self {
         let slot_secs = if ft4 { 7.5 } else { 15.0 };
         let nmax = (slot_secs * AUDIO_RATE) as usize;
-        let (jobs, job_rx) = channel::<Vec<i16>>();
+        let (jobs, job_rx) = channel::<SlotJob>();
         let (res_tx, results) = channel::<Vec<FtMessage>>();
 
         std::thread::spawn(move || {
-            while let Ok(audio) = job_rx.recv() {
+            let mut hash = CallsignHashTable::new();
+            while let Ok(job) = job_rx.recv() {
                 // If slots queued up faster than we can decode them (slow
                 // CPU, busy band), keep only the freshest: stale decodes are
                 // worth less than current ones, and the queue must stay
                 // bounded.
-                let mut latest = audio;
+                let mut latest = job;
                 while let Ok(newer) = job_rx.try_recv() {
                     latest = newer;
                 }
+                if !latest.my_call.is_empty() {
+                    hash.insert(&latest.my_call);
+                }
                 // One batch per slot (possibly empty), so the UI can tell
                 // "slot done, nothing heard".
-                if res_tx.send(decode_slot(&latest, ft4)).is_err() {
+                if res_tx
+                    .send(decode_slot(&latest.audio, ft4, &latest.my_call, &mut hash))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -90,6 +109,7 @@ impl FtDecoder {
             pending: false,
             started: false,
             last_fill: 0.0,
+            my_call: String::new(),
         }
     }
 
@@ -97,7 +117,11 @@ impl FtDecoder {
     /// the tests, which cannot wait on the wall clock.
     #[cfg(test)]
     pub fn decode_audio(audio: &[i16], ft4: bool) -> Vec<String> {
-        decode_slot(audio, ft4).iter().map(|m| m.format()).collect()
+        let mut hash = CallsignHashTable::new();
+        decode_slot(audio, ft4, "", &mut hash)
+            .iter()
+            .map(|m| m.format())
+            .collect()
     }
 
     #[cfg(test)]
@@ -132,7 +156,10 @@ impl FtDecoder {
         if self.buf.len() >= self.nmax * 3 / 4 {
             let audio = quantize(&self.buf, self.nmax);
             self.pending = true;
-            let _ = self.jobs.send(audio);
+            let _ = self.jobs.send(SlotJob {
+                audio,
+                my_call: self.my_call.clone(),
+            });
         }
         self.buf.clear();
         self.buf.reserve(self.nmax + 4096);
@@ -168,51 +195,81 @@ fn current_slot(slot_secs: f64) -> u64 {
     (now / slot_secs) as u64
 }
 
-fn decode_slot(audio: &[i16], ft4: bool) -> Vec<FtMessage> {
+fn decode_slot(
+    audio: &[i16],
+    ft4: bool,
+    my_call: &str,
+    hash: &mut CallsignHashTable,
+) -> Vec<FtMessage> {
     let stamp = slot_stamp();
     let mut out = Vec::new();
     if ft4 {
-        // sic_rounds(2): decode, subtract the decoded signals from the
-        // buffer, decode the residual again — this is how jt9 recovers weak
-        // signals sitting inside a strong neighbour's occupied bandwidth,
-        // which is exactly the situation a hot front end (bias-T + LNA)
-        // creates.
-        let res = DecodeRequest::<Ft4>::new(audio, FREQ_MIN, FREQ_MAX, 1.0, MAX_CAND)
-            .sic_rounds(2)
+        // Three SIC rounds is WSJT-X's nsp ceiling: decode, subtract,
+        // decode the residual. Recovers weak stations sitting inside a
+        // strong neighbour's occupied bandwidth — the situation a hot
+        // front end (bias-T + LNA) creates. Local Costas EQ flattens
+        // per-tone fading before the LLRs are built.
+        let res = DecodeRequest::<Ft4>::new(audio, FREQ_MIN, FREQ_MAX, 0.9, MAX_CAND)
+            .sic_rounds(3)
+            .eq_mode(EqMode::Local)
+            .osd(true)
             .decode()
             .results;
-        for r in &res {
-            if let Some(text) = unpack77(r.message77()) {
-                out.push(FtMessage {
-                    stamp: stamp.clone(),
-                    snr_db: r.snr_db,
-                    dt_sec: r.dt_sec,
-                    freq_hz: r.freq_hz,
-                    text,
-                });
-            }
-        }
+        collect_results(&res, &stamp, hash, &mut out);
     } else {
         // sic_early: WSJT-X's early-decode architecture — progressively
         // longer audio prefixes with subtraction between checkpoints. A
         // recall superset of plain multi-pass SIC.
-        let res = DecodeRequest::<Ft8>::new(audio, FREQ_MIN, FREQ_MAX, 1.0, MAX_CAND)
+        //
+        // When we know our own callsign, lock those bits as an a-priori
+        // hint (messages addressed to us). That drops the decode
+        // threshold by a couple of dB on those candidates, which is the
+        // difference between hearing a reply and missing it.
+        let ap = if !my_call.is_empty() {
+            Some(ApHint::new().with_call2(my_call))
+        } else {
+            None
+        };
+        let mut req = DecodeRequest::<Ft8>::new(audio, FREQ_MIN, FREQ_MAX, 0.9, MAX_CAND)
             .sic_early()
-            .decode()
-            .results;
-        for r in &res {
-            if let Some(text) = unpack77(r.message77()) {
-                out.push(FtMessage {
-                    stamp: stamp.clone(),
-                    snr_db: r.snr_db,
-                    dt_sec: r.dt_sec,
-                    freq_hz: r.freq_hz,
-                    text,
-                });
-            }
+            .eq_mode(EqMode::Local)
+            .osd(true);
+        if let Some(ref hint) = ap {
+            req = req.ap_hint(hint);
         }
+        let res = req.decode().results;
+        collect_results(&res, &stamp, hash, &mut out);
     }
     out
+}
+
+fn collect_results(
+    res: &[mfsk_core::engine::pipeline::DecodeResult],
+    stamp: &str,
+    hash: &mut CallsignHashTable,
+    out: &mut Vec<FtMessage>,
+) {
+    for r in res {
+        let Some(text) = unpack77_with_hash(r.message77(), hash) else {
+            continue;
+        };
+        if !is_plausible_message(&text) {
+            continue;
+        }
+        for tok in text.split_whitespace() {
+            let t = tok.trim_matches(|c| c == '<' || c == '>');
+            if is_callsign(t) {
+                hash.insert(t);
+            }
+        }
+        out.push(FtMessage {
+            stamp: stamp.to_string(),
+            snr_db: r.snr_db,
+            dt_sec: r.dt_sec,
+            freq_hz: r.freq_hz,
+            text,
+        });
+    }
 }
 
 /// UTC hhmmss of the slot that just ended, matching WSJT-X's log style.
@@ -298,5 +355,9 @@ impl Decoder for FtDecoder {
         self.decodes = 0;
         self.started = false;
         self.slot = current_slot(self.slot_secs);
+    }
+
+    fn set_station(&mut self, call: &str, _grid: &str) {
+        self.my_call = call.to_string();
     }
 }

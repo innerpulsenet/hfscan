@@ -7,7 +7,7 @@ pub mod psk31;
 pub mod rtty;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use num_complex::Complex32;
 

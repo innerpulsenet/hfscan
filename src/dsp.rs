@@ -123,25 +123,58 @@ pub fn smooth_bins(src: &[f32], taps: usize, out: &mut Vec<f32>) {
     }
 }
 
+/// A unit phasor advanced by a fixed angle per sample.
+///
+/// A complex multiply where `sin_cos` would otherwise be called per sample.
+/// The scouts mix the whole span buffer once per candidate frequency, so that
+/// call was costing a quarter of a second per scout pass on a busy band —
+/// most of the budget between passes, spent on trigonometry.
+///
+/// A repeated multiply loses magnitude to rounding, so it is renormalised
+/// often enough that the drift never reaches the signal: a first-order
+/// correction every 1024 samples, which costs one multiply per sample amortised.
+pub(crate) struct Rotator {
+    cur: Complex32,
+    step: Complex32,
+    n: u32,
+}
+
+impl Rotator {
+    pub(crate) fn new(rad_per_sample: f32) -> Self {
+        let (sin, cos) = rad_per_sample.sin_cos();
+        Self {
+            cur: Complex32::new(1.0, 0.0),
+            step: Complex32::new(cos, sin),
+            n: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn next(&mut self) -> Complex32 {
+        let v = self.cur;
+        self.cur *= self.step;
+        self.n += 1;
+        if self.n >= 1024 {
+            self.n = 0;
+            // Newton step towards |cur| = 1, cheaper than a square root.
+            let k = 1.5 - 0.5 * self.cur.norm_sqr();
+            self.cur *= k;
+        }
+        v
+    }
+}
+
 /// Mix `iq` down by `hz` and decimate by `decim` for the scouts and the
 /// signature classifier. The decimation window is triangular (two boxcars
 /// back to back), giving a sinc² response — roughly double the stopband dB
 /// of a plain block average for one extra accumulator — so a strong
 /// neighbour elsewhere in the span aliases far less into the analysis audio.
 pub fn mix_decim(iq: &[Complex32], fs: f32, hz: f32, decim: usize) -> Vec<Complex32> {
-    let step = -2.0 * PI * hz / fs;
-    let mut phase = 0.0f32;
+    let mut osc = Rotator::new(-2.0 * PI * hz / fs);
     let mut out = Vec::with_capacity(iq.len() / decim.max(1) + 1);
     if decim <= 1 {
         for &s in iq {
-            let (sin, cos) = phase.sin_cos();
-            phase += step;
-            if phase > PI {
-                phase -= 2.0 * PI;
-            } else if phase < -PI {
-                phase += 2.0 * PI;
-            }
-            out.push(s * Complex32::new(cos, sin));
+            out.push(s * osc.next());
         }
         return out;
     }
@@ -153,14 +186,7 @@ pub fn mix_decim(iq: &[Complex32], fs: f32, hz: f32, decim: usize) -> Vec<Comple
     let mut rise = Complex32::new(0.0, 0.0);
     let mut r = 0usize;
     for &s in iq {
-        let (sin, cos) = phase.sin_cos();
-        phase += step;
-        if phase > PI {
-            phase -= 2.0 * PI;
-        } else if phase < -PI {
-            phase += 2.0 * PI;
-        }
-        let m = s * Complex32::new(cos, sin);
+        let m = s * osc.next();
         fall += m * (1.0 - r as f32 / d);
         rise += m * ((r + 1) as f32 / d);
         r += 1;

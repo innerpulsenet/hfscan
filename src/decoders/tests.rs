@@ -409,6 +409,10 @@ fn rtty_reverse_shift_is_garbage_then_recovers() {
 // ---------------------------------------------------------------- PSK31
 
 fn gen_psk31(text: &str, freq_offset: f32) -> Vec<Complex32> {
+    gen_psk31_snr(text, freq_offset, 0.02)
+}
+
+fn gen_psk31_snr(text: &str, freq_offset: f32, snr_scale: f32) -> Vec<Complex32> {
     let sps = (FS as f32 / 31.25) as usize;
     let mut bits: Vec<bool> = Vec::new();
     // Idle: a run of 0 bits (continuous reversals) for the receiver to lock to.
@@ -457,7 +461,7 @@ fn gen_psk31(text: &str, freq_offset: f32) -> Vec<Complex32> {
         .map(|(i, &v)| {
             let ph = 2.0 * PI * freq_offset * i as f32 / FS as f32;
             Complex32::from_polar(v.abs(), ph + if v < 0.0 { PI } else { 0.0 })
-                + Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.02
+                + Complex32::new(noise(&mut rng), noise(&mut rng)) * snr_scale
         })
         .collect()
 }
@@ -1175,3 +1179,213 @@ fn cw_stays_quiet_on_a_steady_carrier() {
     assert!(letters <= 2, "a steady carrier decoded as {got:?}");
 }
 
+
+// ---------------------------------------------- PSK31 accuracy bench
+
+/// `snr_scale` for a wanted SNR in dB, measured in PSK31's own ~31 Hz
+/// bandwidth against a full-scale symbol — the figure a waterfall shows.
+fn psk_scale_for_snr(db: f32) -> f32 {
+    let n_total = (1.0f32 / 6.0).sqrt();
+    let in_bw = n_total * (31.25 / FS as f32).sqrt();
+    let wanted = 10f32.powf(-db / 20.0);
+    wanted / in_bw
+}
+
+/// Decode as the app does: through the tuning chain, at the bandwidth the
+/// decoder asks for, with the carrier arriving near baseband.
+fn decode_psk(sig: &[Complex32], tune: f32) -> String {
+    let mut d = psk31::Psk31Decoder::new(FS);
+    let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+    chain.set_offset(tune as f64 + d.offset_shift());
+    let mut audio = Vec::new();
+    let mut out = String::new();
+    for chunk in sig.chunks(4096) {
+        chain.process(chunk, &mut audio);
+        out.push_str(&d.process(&audio));
+    }
+    out.trim().to_string()
+}
+
+fn decode_psk_dbg(sig: &[Complex32], tune: f32) -> (String, f32, bool) {
+    let mut d = psk31::Psk31Decoder::new(FS);
+    let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+    chain.set_offset(tune as f64 + d.offset_shift());
+    let mut audio = Vec::new();
+    let mut out = String::new();
+    for chunk in sig.chunks(4096) {
+        chain.process(chunk, &mut audio);
+        out.push_str(&d.process(&audio));
+    }
+    (out.trim().to_string(), d.lock_hz(), d.locked())
+}
+
+#[test]
+#[ignore]
+fn bench_psk31_accuracy() {
+    let msg = "CQ CQ DE W1AW W1AW PSE K";
+    println!("\nsent: {msg:?}");
+
+    println!("\n== on frequency, by SNR (in 31 Hz) ==");
+    for db in [40, 30, 20, 15, 10, 6, 3, 0] {
+        let sig = gen_psk31_snr(msg, 0.0, psk_scale_for_snr(db as f32));
+        let (got, lock, locked) = decode_psk_dbg(&sig, 0.0);
+        println!(
+            "  {db:>2} dB  {:>4}  lock {lock:>+6.1} Hz {}  {got:?}",
+            format!("{:.0}%", accuracy(msg, &got) * 100.0),
+            if locked { "yes" } else { "NO " },
+        );
+    }
+
+    println!("\n== 15 dB, by residual tuning error ==");
+    for err in [-150.0f32, -100.0, -50.0, -20.0, 0.0, 20.0, 50.0, 100.0, 150.0] {
+        let sig = gen_psk31_snr(msg, err, psk_scale_for_snr(15.0));
+        let (got, lock, locked) = decode_psk_dbg(&sig, 0.0);
+        println!(
+            "  {err:>+7.0} Hz  {:>4}  lock {lock:>+6.1} Hz {}  {got:?}",
+            format!("{:.0}%", accuracy(msg, &got) * 100.0),
+            if locked { "yes" } else { "NO " },
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn debug_psk31_gates() {
+    let msg = "CQ CQ DE W1AW W1AW PSE K";
+    for db in [20, 10, 6, 3] {
+        eprintln!("--- {db} dB ---");
+        let sig = gen_psk31_snr(msg, 0.0, psk_scale_for_snr(db as f32));
+        let got = decode_psk(&sig, 0.0);
+        eprintln!("  => {got:?}");
+    }
+}
+
+/// PSK31 at an arbitrary sample rate, for span-level tests.
+pub(crate) fn gen_psk31_at(text: &str, fs: f64, offset_hz: f64, snr_scale: f32, secs: f64) -> Vec<Complex32> {
+    let sps = (fs as f32 / BAUD_TEST) as usize;
+    let mut bits: Vec<bool> = vec![false; 64];
+    loop {
+        for c in text.chars() {
+            for ch in VARICODE[c as usize].chars() {
+                bits.push(ch == '1');
+            }
+            bits.push(false);
+            bits.push(false);
+        }
+        if bits.len() * sps > (fs * secs) as usize {
+            break;
+        }
+    }
+    let mut syms: Vec<f32> = vec![1.0];
+    let mut cur = 1.0f32;
+    for b in &bits {
+        if !*b {
+            cur = -cur;
+        }
+        syms.push(cur);
+    }
+    let total = (syms.len() + 2) * sps;
+    let mut base = vec![0.0f32; total];
+    for (k, &a) in syms.iter().enumerate() {
+        let centre = (k + 1) * sps;
+        for n in 0..2 * sps {
+            let idx = centre + n - sps;
+            if idx >= total {
+                continue;
+            }
+            let x = (n as f32 - sps as f32) / sps as f32;
+            base[idx] += a * 0.5 * (1.0 + (PI * x).cos());
+        }
+    }
+    let mut rng = 0xfeed_1234u32;
+    base.iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let ph = 2.0 * PI * (offset_hz / fs) as f32 * i as f32;
+            Complex32::from_polar(v.abs(), ph + if v < 0.0 { PI } else { 0.0 })
+                + Complex32::new(noise(&mut rng), noise(&mut rng)) * snr_scale
+        })
+        .collect()
+}
+
+pub(crate) const BAUD_TEST: f32 = 31.25;
+
+#[test]
+#[ignore]
+fn bench_psk31_span_classify() {
+    // The span rate the app runs at, and the SNR figures a waterfall shows.
+    let fs = 192_000.0f64;
+    println!("\ndoes the span classifier flag PSK31 at all?");
+    for db in [30, 20, 15, 10, 6] {
+        // scan_span decimates to 8 kHz, so noise must be scaled for the
+        // 31 Hz signal bandwidth against the full span.
+        let n_total = (1.0f32 / 6.0).sqrt();
+        let in_bw = n_total * (31.25 / fs as f32).sqrt();
+        let scale = 10f32.powf(-(db as f32) / 20.0) / in_bw;
+        let iq = gen_psk31_at("CQ CQ DE W1AW K ", fs, 12_000.0, scale, 1.5);
+        let hits = psk31::scan_span(&iq, fs, &[(12_000.0, 20.0)]);
+        println!(
+            "  {db:>2} dB  scan_span -> {} hit(s) {:?}",
+            hits.len(),
+            hits.iter()
+                .map(|h| format!("{:+.1} Hz q={:.2}", h.offset_hz - 12_000.0, h.quality))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+// --------------------------------------------- PSK31 regression tests
+
+/// PSK31 exists to work weak signals — around 10 dB in its own 31 Hz is an
+/// ordinary one, not an edge case. `dc_focus` used to reject those: it hard
+/// -limited unfiltered wideband audio and compared the result against a fixed
+/// fraction, so it measured signal-to-noise rather than the concentration it
+/// was written to measure, and a perfectly good carrier scored 0.52 against a
+/// 0.70 bar.
+#[test]
+fn psk31_copies_a_weak_signal() {
+    let msg = "CQ CQ DE W1AW W1AW PSE K";
+    for db in [20.0f32, 15.0, 10.0] {
+        let sig = gen_psk31_snr(msg, 0.0, psk_scale_for_snr(db));
+        let got = decode_psk(&sig, 0.0);
+        let acc = accuracy(msg, &got);
+        assert!(
+            acc > 0.85,
+            "{db:.0} dB copied {:.0}%: {got:?}",
+            acc * 100.0
+        );
+    }
+}
+
+/// The residual tuning error an auto slot arrives with must not matter.
+#[test]
+fn psk31_pulls_in_a_mistuned_carrier() {
+    let msg = "CQ CQ DE W1AW W1AW PSE K";
+    for err in [-150.0f32, -50.0, 0.0, 50.0, 150.0] {
+        let sig = gen_psk31_snr(msg, err, psk_scale_for_snr(15.0));
+        let got = decode_psk(&sig, 0.0);
+        let acc = accuracy(msg, &got);
+        assert!(
+            acc > 0.85,
+            "{err:+.0} Hz of tuning error copied {:.0}%: {got:?}",
+            acc * 100.0
+        );
+    }
+}
+
+/// Everything that made weak PSK31 visible lowered a threshold, so the
+/// confirmation still has to reject a carrier that is not PSK31 at all.
+#[test]
+fn psk31_still_rejects_a_plain_carrier() {
+    let n = (12.0 * FS) as usize;
+    let mut rng = 0x33aa_55ffu32;
+    let sig: Vec<Complex32> = (0..n)
+        .map(|i| {
+            let ph = 2.0 * PI * 40.0 * i as f32 / FS as f32;
+            Complex32::from_polar(1.0, ph)
+                + Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.02
+        })
+        .collect();
+    let hits = psk31::scan_span(&sig, FS, &[(0.0, 20.0)]);
+    assert!(hits.is_empty(), "a steady carrier confirmed as PSK31: {hits:?}");
+}

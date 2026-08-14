@@ -16,7 +16,7 @@
 
 use super::{Decoder, FtMessage, PskView};
 use std::collections::VecDeque;
-use crate::dsp::mix_decim;
+use crate::dsp::{mix_decim, Rotator};
 use crate::report::is_callsign;
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
@@ -521,7 +521,7 @@ fn confirm_psk(buf: &[Complex32], fs: f32, hz: f32, sps: usize) -> Option<(f32, 
     if q < BPSK_QUALITY || !(REV_MIN..=REV_MAX).contains(&rev) {
         return None;
     }
-    if dc_focus(buf, fs, hz) < 0.70 {
+    if dc_focus(buf, fs, hz) < 0.25 {
         return None;
     }
     // Idle-like reversal rate is also what a CW tone at ±baud/2 produces.
@@ -532,54 +532,85 @@ fn confirm_psk(buf: &[Complex32], fs: f32, hz: f32, sps: usize) -> Option<(f32, 
     Some((q, rev))
 }
 
-/// Fraction of mixed energy sitting inside ±20 Hz. A real PSK31 carrier
-/// lives there; the z² cross-term of two neighbours lands near ±baud.
+/// How much more of the mixed energy sits inside ±20 Hz than noise alone
+/// would put there. A real PSK31 carrier lives in that window; the z² cross
+/// term of two neighbours lands near ±baud, out in the 20-50 Hz ring.
+///
+/// The measure is taken against a noise baseline rather than as a raw
+/// fraction. Every sample is hard-limited to unit magnitude first (so the
+/// raised-cosine amplitude notches cannot fake a DC peak when the carrier is
+/// really a baud away), and hard-limiting noise spreads it evenly across the
+/// bins — five of the thirteen counted are the ±20 Hz window, so pure noise
+/// scores 0.385, not 0. Comparing a raw fraction against a fixed threshold
+/// therefore tests signal-to-noise, not concentration, and rejected exactly
+/// the weak signals PSK31 exists to work: at 6 dB a perfectly good carrier
+/// scored 0.52 against a 0.70 bar. Subtracting the baseline leaves 0 for
+/// noise and 1 for a clean carrier, whatever the SNR.
 fn dc_focus(buf: &[Complex32], fs: f32, hz: f32) -> f32 {
-    const N: usize = 1024;
-    if buf.len() < N {
+    // Half a second where there is that much: sixteen symbols rather than
+    // four, which is the difference between an estimate and a guess.
+    let n_win = buf.len().min(4096);
+    if n_win < 1024 {
         return 1.0;
     }
-    let step = -2.0 * PI * hz / fs;
-    let mut phase = 0.0f32;
-    let start = buf.len() - N;
-    let mut mixed = [Complex32::new(0.0, 0.0); N];
-    for i in 0..N {
-        let (sin, cos) = phase.sin_cos();
-        phase += step;
-        let m = buf[start + i] * Complex32::new(cos, sin);
+    let n = n_win;
+    let mut osc = Rotator::new(-2.0 * PI * hz / fs);
+    let start = buf.len() - n;
+    // Channel-filter before hard-limiting. The span scout hands this the
+    // full 8 kHz of decimated audio, so a 31 Hz signal that is a healthy
+    // 10 dB in its own bandwidth is 11 dB *below* the noise across that
+    // audio — and a limiter fed that measures the noise's phase, not the
+    // carrier's. Filtering first is what lets the anti-AM limiting do its
+    // job (the raised-cosine notches are at 31 Hz, well inside this) while
+    // leaving a weak carrier standing.
+    let a = 1.0 - (-2.0 * PI * 60.0 / fs).exp();
+    let mut lp = [Complex32::new(0.0, 0.0); 3];
+    let mut mixed = vec![Complex32::new(0.0, 0.0); n];
+    for i in 0..n {
+        let mut m = buf[start + i] * osc.next();
+        for z in lp.iter_mut() {
+            *z += (m - *z) * a;
+            m = *z;
+        }
         // Strip AM so idle-PSK sidebands cannot fake a DC peak when the
         // carrier is actually sitting at ±baud.
-        let n = m.norm();
-        mixed[i] = if n > 1e-12 { m / n } else { m };
+        let nm = m.norm();
+        mixed[i] = if nm > 1e-12 { m / nm } else { m };
     }
-    let bin_hz = fs / N as f32;
+    let bin_hz = fs / n as f32;
     let mut low = 0.0f32;
     let mut high = 0.0f32;
+    let (mut n_low, mut n_high) = (0usize, 0usize);
     // Only a few DFT bins are needed (|f| ≤ 50 Hz) — but both signs: a
     // residual offset a few hertz *below* DC puts the carrier's energy in
     // the negative-frequency bins, and ignoring those rejects real PSK31.
-    let k_max = ((50.0 / bin_hz).ceil() as usize).min(N / 2);
+    let k_max = ((50.0 / bin_hz).ceil() as usize).min(n / 2);
     for k in 0..=k_max {
-        for &bin in &[k, N - k] {
-            if bin == N || (k == 0 && bin != 0) {
+        for &bin in &[k, n - k] {
+            if bin == n || (k == 0 && bin != 0) {
                 continue; // N-0 aliases bin 0; count DC once
             }
             let mut acc = Complex32::new(0.0, 0.0);
-            let w = -2.0 * PI * bin as f32 / N as f32;
-            for (i, &s) in mixed.iter().enumerate() {
-                let (sin, cos) = (w * i as f32).sin_cos();
-                acc += s * Complex32::new(cos, sin);
+            let mut w = Rotator::new(-2.0 * PI * bin as f32 / n as f32);
+            for &s in mixed.iter() {
+                acc += s * w.next();
             }
             let p = acc.norm_sqr();
             let f = k as f32 * bin_hz;
             if f <= 20.0 {
                 low += p;
+                n_low += 1;
             } else if f <= 50.0 {
                 high += p;
+                n_high += 1;
             }
         }
     }
-    low / (low + high).max(1e-20)
+    let raw = low / (low + high).max(1e-20);
+    // Bins counted: DC plus +/-7.8 and +/-15.6 Hz in the window, against
+    // +/-23.4 through +/-46.9 Hz outside it.
+    let baseline = n_low as f32 / (n_low + n_high).max(1) as f32;
+    ((raw - baseline) / (1.0 - baseline).max(1e-6)).clamp(0.0, 1.0)
 }
 
 fn env_notch(buf: &[Complex32], fs: f32, hz: f32, sps: usize) -> f32 {

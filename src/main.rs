@@ -1234,10 +1234,16 @@ impl App {
         // Always keep a rolling slice of radio IQ. The signature classifier
         // needs it in every mode; CW / PSK31 scouts reuse the same buffer.
         self.scout_iq.extend_from_slice(block);
+        // PSK31 is 31.25 baud, so 0.6 s is nineteen symbols — too few to
+        // confirm a weak signal is BPSK rather than noise, which is what kept
+        // copyable 10 dB signals off the screen entirely. The scouts get a
+        // longer look in the modes that run them.
         let secs = if self.mode == Mode::Cw
             || self.scan.as_ref().is_some_and(|s| s.kind == ScanKind::Cw)
         {
             0.85
+        } else if matches!(self.mode, Mode::Psk31 | Mode::Auto) {
+            1.60
         } else {
             0.60
         };
@@ -1250,6 +1256,13 @@ impl App {
             match self.mode {
                 Mode::Psk31 => refresh_psk_hits(self),
                 Mode::Cw => refresh_cw_hits(self),
+                // Auto needs both: the span classifier alone cannot see a
+                // narrowband signal that is perfectly copyable (see
+                // `scout_idents`), and auto mode is where that matters most.
+                Mode::Auto => {
+                    refresh_psk_hits(self);
+                    refresh_cw_hits(self);
+                }
                 _ => {}
             }
             self.scout_at = Instant::now();
@@ -1856,24 +1869,91 @@ fn next_signal(app: &mut App, forward: bool) {
 }
 
 fn refresh_psk_hits(app: &mut App) {
-    let mut peaks = find_peaks(&app.smoothed, 0.0, app.rate);
+    let mut peaks = scout_peaks(&app.smoothed, 0.0, app.rate);
     peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     peaks.truncate(24);
     app.psk_hits = psk31::scan_span(&app.scout_iq, app.rate, &peaks);
 }
 
 fn refresh_cw_hits(app: &mut App) {
-    let mut peaks = find_peaks(&app.smoothed, 0.0, app.rate);
+    let mut peaks = scout_peaks(&app.smoothed, 0.0, app.rate);
     peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     peaks.truncate(24);
     app.cw_hits = cw::scan_span(&app.scout_iq, app.rate, &peaks);
+}
+
+/// Turn what the narrowband scouts found into idents the auto fleet can use.
+///
+/// The span classifier only ever looks at signals the occupancy detector
+/// hands it, and that detector needs a peak 8 dB above the median *in a
+/// coarse FFT bin*. A PSK31 signal is 31 Hz wide in a 47 Hz bin, so one that
+/// is a perfectly copyable 10 dB in its own bandwidth reads as about 8 dB
+/// there and is never even offered for classification — measured: the whole
+/// auto path worked at 15 dB and saw nothing at 10, while the decoder itself
+/// copies at 10 dB and `scan_span` confirms it with quality 0.89.
+///
+/// The mode-specific scouts do not have that problem, because they mix each
+/// candidate down to baseband and match it there rather than reading a
+/// bin. They were already running — just not in the mode that needed them.
+fn scout_idents(app: &App) -> Vec<identify::Ident> {
+    if app.mode != Mode::Auto || app.smoothed.is_empty() {
+        return Vec::new();
+    }
+    let n = app.smoothed.len();
+    let bin = app.rate as f32 / n as f32;
+    let mut sorted = app.smoothed.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med = sorted[n / 2];
+    // The scouts report an offset, not a level; read the level back off the
+    // spectrum so a crowded span still spends its slots strongest-first.
+    let snr_at = |off_hz: f32| {
+        let i = ((off_hz / bin) + n as f32 / 2.0).round();
+        let i = (i.clamp(0.0, n as f32 - 1.0)) as usize;
+        app.smoothed[i] - med
+    };
+    let mut out = Vec::new();
+    for h in &app.psk_hits {
+        if h.quality < 0.75 {
+            continue;
+        }
+        out.push(identify::Ident {
+            offset_hz: h.offset_hz,
+            bw_hz: 62.0,
+            snr_db: snr_at(h.offset_hz),
+            kind: identify::Kind::Psk31,
+            score: h.quality,
+        });
+    }
+    for h in &app.cw_hits {
+        if h.quality < 0.55 {
+            continue;
+        }
+        out.push(identify::Ident {
+            offset_hz: h.offset_hz,
+            bw_hz: 150.0,
+            snr_db: snr_at(h.offset_hz),
+            kind: identify::Kind::Cw,
+            score: h.quality,
+        });
+    }
+    out
 }
 
 fn refresh_idents(app: &mut App) {
     if app.smoothed.is_empty() || app.scout_iq.len() < (app.rate * 0.25) as usize {
         return;
     }
-    let raw = identify::classify_span(&app.scout_iq, app.rate, &app.smoothed, app.center);
+    let mut raw = identify::classify_span(&app.scout_iq, app.rate, &app.smoothed, app.center);
+    // The classifier wins where it has an opinion; the scouts only add what
+    // it never saw, so this cannot override a considered classification.
+    for s in scout_idents(app) {
+        let known = raw
+            .iter()
+            .any(|r| (r.offset_hz - s.offset_hz).abs() < 120.0);
+        if !known {
+            raw.push(s);
+        }
+    }
     apply_idents(app, raw);
     merge_heard(app);
     let before = app.auto.len();
@@ -2524,6 +2604,67 @@ const SIGNAL_SNR_DB: f32 = 10.0;
 /// broadcast FM carrier or an SSB signal is a wide plateau, not a spike, and a
 /// strict local-maximum test walks straight past it.
 fn find_peaks(spectrum: &[f32], center: f64, rate: f64) -> Vec<(f64, f32)> {
+    find_peaks_above(spectrum, center, rate, SIGNAL_SNR_DB)
+}
+
+/// Candidate frequencies for the narrowband scouts.
+///
+/// `find_peaks` answers "where is the spectrum loud", by walking runs of bins
+/// over a threshold. That is the right question for a wide signal and the
+/// wrong one for a narrow one, twice over: a 31 Hz PSK31 signal spread across
+/// a 47 Hz bin does not reach the 10 dB bar until it is well above where the
+/// decoder copies it happily, and simply lowering the bar makes it worse —
+/// the noise then forms long contiguous runs that each collapse to a single
+/// peak, swallowing the real signal inside one.
+///
+/// So ask the other question: which bins are sharp local maxima standing out
+/// of their *own* neighbourhood. That is what a narrowband carrier looks like
+/// however weak it is, and the scout behind this mixes each candidate down
+/// and matches it, which is a far stronger test than any bin level.
+fn scout_peaks(spectrum: &[f32], center: f64, rate: f64) -> Vec<(f64, f32)> {
+    const NEAR: usize = 3; // local-max half-width
+    const CTX: usize = 40; // neighbourhood the prominence is measured against
+    const PROMINENCE_DB: f32 = 4.0;
+    let n = spectrum.len();
+    if n < 4 * CTX {
+        return Vec::new();
+    }
+    let dc = n / 2;
+    let edge = (n / 50).max(CTX);
+    let mut out: Vec<(f64, f32)> = Vec::new();
+    let mut ctx: Vec<f32> = Vec::with_capacity(2 * CTX + 1);
+    for i in edge..n - edge {
+        if i.abs_diff(dc) <= 2 {
+            continue; // the LO spike is not a signal
+        }
+        let v = spectrum[i];
+        if !(i - NEAR..=i + NEAR).all(|k| v >= spectrum[k]) {
+            continue;
+        }
+        // Median of the surroundings, excluding the peak's own skirts.
+        ctx.clear();
+        ctx.extend(
+            (i - CTX..=i + CTX)
+                .filter(|k| k.abs_diff(i) > NEAR)
+                .map(|k| spectrum[k]),
+        );
+        ctx.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let local = ctx[ctx.len() / 2];
+        if v - local < PROMINENCE_DB {
+            continue;
+        }
+        let freq = center + (i as f64 - n as f64 / 2.0) * rate / n as f64;
+        out.push((freq, v - local));
+    }
+    out
+}
+
+fn find_peaks_above(
+    spectrum: &[f32],
+    center: f64,
+    rate: f64,
+    snr_db: f32,
+) -> Vec<(f64, f32)> {
     let n = spectrum.len();
     if n < 8 {
         return Vec::new();
@@ -2531,7 +2672,7 @@ fn find_peaks(spectrum: &[f32], center: f64, rate: f64) -> Vec<(f64, f32)> {
     let mut sorted = spectrum.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let med = sorted[n / 2];
-    let thr = med + SIGNAL_SNR_DB;
+    let thr = med + snr_db;
     // The LO leaks a spike at the centre of the span; it is not a signal.
     let dc = n / 2;
     let edge = (n / 50).max(2);
@@ -5345,3 +5486,311 @@ mod tests {
 }
 
 
+
+#[cfg(test)]
+mod psk_auto_tests {
+    use super::*;
+
+    /// Drive one span of IQ through auto mode, including the periodic passes
+    /// that `feed` gates on wall-clock time — a test loop runs far faster
+    /// than real time and would otherwise never trigger them.
+    fn run_auto(app: &mut App, iq: &[Complex32], fs: f64) {
+        let mut spec = Spectrum::new(4096);
+        let mut out = Vec::new();
+        let per_pass = ((fs * 1.2) as usize / 16_384).max(1);
+        for (i, block) in iq.chunks(16_384).enumerate() {
+            app.feed(block, &mut spec, &mut out);
+            if i % per_pass == per_pass - 1 {
+                refresh_psk_hits(app);
+                refresh_cw_hits(app);
+                refresh_idents(app);
+            }
+        }
+    }
+
+    fn psk_span(offset: f64, db: f32, fs: f64, secs: f64) -> Vec<Complex32> {
+        let n_total = (1.0f32 / 6.0).sqrt();
+        let in_bw = n_total * (31.25 / fs as f32).sqrt();
+        let scale = 10f32.powf(-db / 20.0) / in_bw;
+        decoders::tests::gen_psk31_at("CQ CQ DE W1AW W1AW K ", fs, offset, scale, secs)
+    }
+
+    /// The whole reason a PSK31 signal on the band reaches the screen: the
+    /// span has to be searched for it, an ident raised, a slot built, and the
+    /// slot's own chain and decoder have to copy it. Each piece is tested
+    /// alone elsewhere; only together do they answer the question.
+    ///
+    /// Before the narrowband scouts ran in auto mode this needed 15 dB —
+    /// because the span classifier only sees what the occupancy detector
+    /// hands it, and that needs 8 dB *in a 47 Hz bin*, which a 31 Hz signal
+    /// cannot reach until well above where it decodes fine.
+    #[test]
+    fn psk31_reaches_the_screen_in_auto_mode() {
+        let fs = 192_000.0f64;
+        let iq = psk_span(1_500.0, 10.0, fs, 14.0);
+        let mut app = App::new(14_070_000.0, fs, Mode::Auto);
+        app.agc = AgcMode::Off;
+        run_auto(&mut app, &iq, fs);
+
+        assert!(
+            app.auto.iter().any(|s| s.kind == identify::Kind::Psk31),
+            "no PSK31 slot for a 10 dB signal; idents were {:?}",
+            app.idents.iter().map(|i| i.kind.label()).collect::<Vec<_>>()
+        );
+        let copy: String = app
+            .rows
+            .iter()
+            .filter(|r| r.kind == identify::Kind::Psk31)
+            .map(|r| r.copy.clone())
+            .collect();
+        assert!(
+            copy.contains("W1AW"),
+            "a 10 dB PSK31 signal produced no readable copy: {copy:?}"
+        );
+    }
+
+    /// Making weak signals visible must not make imaginary ones visible.
+    #[test]
+    fn auto_mode_invents_no_narrowband_signals_from_noise() {
+        let fs = 192_000.0f64;
+        let mut rng = 0x1234_5678u32;
+        let mut noise = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            (rng as f32 / u32::MAX as f32) - 0.5
+        };
+        let iq: Vec<Complex32> = (0..(fs * 14.0) as usize)
+            .map(|_| Complex32::new(noise(), noise()) * 0.3)
+            .collect();
+        let mut app = App::new(14_070_000.0, fs, Mode::Auto);
+        app.agc = AgcMode::Off;
+        run_auto(&mut app, &iq, fs);
+
+        let phantom: Vec<&str> = app
+            .idents
+            .iter()
+            .filter(|i| matches!(i.kind, identify::Kind::Psk31 | identify::Kind::Cw))
+            .map(|i| i.kind.label())
+            .collect();
+        assert!(phantom.is_empty(), "noise classified as {phantom:?}");
+        let chars: usize = app
+            .rows
+            .iter()
+            .map(|r| r.copy.chars().filter(|c| !c.is_whitespace()).count())
+            .sum();
+        assert!(chars <= 4, "noise produced {chars} characters of copy");
+    }
+
+    /// PSK31 through the whole automatic path: the span classifier has to
+    /// flag it, `reconcile_auto` has to build a slot for it, and the slot's
+    /// own chain and decoder have to copy it. Each of those is tested
+    /// elsewhere in isolation; only together do they answer whether a PSK31
+    /// signal on the band actually reaches the screen.
+    /// A PSK31 waterfall is not one signal — operators pack in every 50-100
+    /// Hz. This is the PSK31 analogue of the adjacent-station problem that
+    /// was wrecking CW copy.
+    #[test]
+    #[ignore]
+    fn bench_psk31_neighbours() {
+        let fs = 192_000.0f64;
+        let center = 14_070_000.0f64;
+        let n_total = (1.0f32 / 6.0).sqrt();
+        let in_bw = n_total * (31.25 / fs as f32).sqrt();
+        let scale = 10f32.powf(-20.0 / 20.0) / in_bw;
+        for sep in [200.0f64, 120.0, 80.0, 50.0] {
+            let want = decoders::tests::gen_psk31_at(
+                "CQ CQ DE W1AW W1AW K ", fs, 1_500.0, scale, 20.0);
+            let other = decoders::tests::gen_psk31_at(
+                "TEST DE G4XYZ G4XYZ K ", fs, 1_500.0 + sep, 0.0, 20.0);
+            let mut iq = want;
+            for (i, s) in iq.iter_mut().enumerate() {
+                if let Some(o) = other.get(i) {
+                    *s += o;
+                }
+            }
+            let mut app = App::new(center, fs, Mode::Auto);
+            app.agc = AgcMode::Off;
+            let mut spec = Spectrum::new(4096);
+            let mut out = Vec::new();
+            let per_pass = (fs * 1.2) as usize / 16_384;
+            for (i, block) in iq.chunks(16_384).enumerate() {
+                app.feed(block, &mut spec, &mut out);
+                if i % per_pass.max(1) == per_pass.max(1) - 1 {
+                    refresh_psk_hits(&mut app);
+                    refresh_idents(&mut app);
+                }
+            }
+            let idents: Vec<String> = app
+                .idents
+                .iter()
+                .map(|i| format!("{} @{:+.0}", i.kind.label(), i.offset_hz))
+                .collect();
+            let copy: Vec<String> = app
+                .rows
+                .iter()
+                .filter(|r| r.kind == identify::Kind::Psk31)
+                .map(|r| format!("{:.1}k: {:?}", r.dial_hz / 1000.0, r.copy))
+                .collect();
+            println!("--- {sep:.0} Hz apart ---");
+            println!("  idents: {idents:?}");
+            for c in &copy {
+                println!("  {c}");
+            }
+        }
+    }
+
+    /// Everything above lowered a threshold, so the question is what an
+    /// empty band now produces. Nothing may be invented out of noise.
+    #[test]
+    #[ignore]
+    fn bench_psk31_false_positives() {
+        let fs = 192_000.0f64;
+        for seed in [0x1234_5678u32, 0xfeed_face, 0x0bad_c0de] {
+            let mut rng = seed;
+            let mut noise = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                (rng as f32 / u32::MAX as f32) - 0.5
+            };
+            let iq: Vec<Complex32> = (0..(fs * 20.0) as usize)
+                .map(|_| Complex32::new(noise(), noise()) * 0.3)
+                .collect();
+            let mut app = App::new(14_070_000.0, fs, Mode::Auto);
+            app.agc = AgcMode::Off;
+            let mut spec = Spectrum::new(4096);
+            let mut out = Vec::new();
+            let per_pass = (fs * 1.2) as usize / 16_384;
+            for (i, block) in iq.chunks(16_384).enumerate() {
+                app.feed(block, &mut spec, &mut out);
+                if i % per_pass.max(1) == per_pass.max(1) - 1 {
+                    refresh_psk_hits(&mut app);
+                    refresh_cw_hits(&mut app);
+                    refresh_idents(&mut app);
+                }
+            }
+            let narrow: Vec<String> = app
+                .idents
+                .iter()
+                .filter(|i| {
+                    matches!(i.kind, identify::Kind::Psk31 | identify::Kind::Cw)
+                })
+                .map(|i| format!("{} @{:+.0}", i.kind.label(), i.offset_hz))
+                .collect();
+            let copy: usize = app
+                .rows
+                .iter()
+                .map(|r| r.copy.chars().filter(|c| !c.is_whitespace()).count())
+                .sum();
+            println!(
+                "  seed {seed:#x}: {} phantom ident(s) {narrow:?}, {copy} chars of copy",
+                narrow.len()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_psk31_end_to_end() {
+        let fs = 192_000.0f64;
+        let center = 14_070_000.0f64;
+        let offset = 1_500.0f64; // 14.0715 MHz, a real PSK31 watering hole
+        for db in [30, 20, 15, 10, 8, 6, 3] {
+            let n_total = (1.0f32 / 6.0).sqrt();
+            let in_bw = n_total * (31.25 / fs as f32).sqrt();
+            let scale = 10f32.powf(-(db as f32) / 20.0) / in_bw;
+            let iq = decoders::tests::gen_psk31_at(
+                "CQ CQ DE W1AW W1AW K ",
+                fs,
+                offset,
+                scale,
+                20.0,
+            );
+
+            let mut app = App::new(center, fs, Mode::Auto);
+            app.agc = AgcMode::Off;
+            run_auto(&mut app, &iq, fs);
+            let kinds: Vec<String> = app
+                .idents
+                .iter()
+                .map(|i| format!("{} @{:+.0}Hz q={:.2}", i.kind.label(), i.offset_hz, i.score))
+                .collect();
+            let slots: Vec<String> = app
+                .auto
+                .iter()
+                .map(|s| format!("{} @{:.1}k", s.kind.label(), s.dial_hz / 1000.0))
+                .collect();
+            let copy: String = app
+                .rows
+                .iter()
+                .filter(|r| r.kind == identify::Kind::Psk31)
+                .map(|r| r.copy.clone())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            println!("--- {db} dB ---");
+            println!("  idents: {kinds:?}");
+            println!("  slots:  {slots:?}");
+            println!("  copy:   {copy:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod scout_cost {
+    use super::*;
+
+    /// Auto mode now runs both narrowband scouts every 800 ms over 1.6 s of
+    /// span IQ. That is the price of seeing weak signals; it has to stay well
+    /// under the budget or the waterfall stutters.
+    #[test]
+    #[ignore]
+    fn bench_scout_cost() {
+        let fs = 192_000.0f64;
+        let mut rng = 0x1234_5678u32;
+        let mut noise = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            (rng as f32 / u32::MAX as f32) - 0.5
+        };
+        // A busy band: many narrow carriers for the scouts to chew on.
+        let n = (fs * 1.6) as usize;
+        let mut iq: Vec<Complex32> = (0..n)
+            .map(|_| Complex32::new(noise(), noise()) * 0.05)
+            .collect();
+        for k in 0..40 {
+            let off = -40_000.0 + k as f64 * 2_000.0;
+            for (i, s) in iq.iter_mut().enumerate() {
+                let ph = 2.0 * std::f64::consts::PI * off * i as f64 / fs;
+                *s += Complex32::from_polar(0.5, ph as f32);
+            }
+        }
+        let mut app = App::new(14_070_000.0, fs, Mode::Auto);
+        let mut spec = Spectrum::new(4096);
+        let mut out = Vec::new();
+        for block in iq.chunks(16_384) {
+            app.feed(block, &mut spec, &mut out);
+        }
+        for (name, f) in [
+            ("psk scout", refresh_psk_hits as fn(&mut App)),
+            ("cw scout", refresh_cw_hits as fn(&mut App)),
+        ] {
+            let t = Instant::now();
+            let passes = 5;
+            for _ in 0..passes {
+                f(&mut app);
+            }
+            let per = t.elapsed().as_secs_f64() / passes as f64;
+            println!(
+                "  {name}: {:.1} ms per pass ({:.1}% of the 800 ms budget)",
+                per * 1000.0,
+                per / 0.8 * 100.0
+            );
+        }
+        println!(
+            "  candidates: {} peaks",
+            scout_peaks(&app.smoothed, 0.0, app.rate).len()
+        );
+    }
+}

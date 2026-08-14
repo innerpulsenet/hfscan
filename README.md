@@ -114,6 +114,21 @@ IQ block, so its scroll rate is set by `w` and not by the sample rate.
   and the status line shows slot fill and decode count. Sync, LDPC and message
   unpacking come from [`mfsk-core`](https://crates.io/crates/mfsk-core).
 
+  Slot audio is buffered as raw f32 and normalised with a single slot-wide
+  gain at slot end, so a strong station starting mid-slot can neither clip
+  against the i16 rails nor pump the gain under a decode in progress. Decoding
+  runs multi-pass with successive interference cancellation (FT8: WSJT-X's
+  early-decode checkpoints; FT4: two SIC rounds): each decoded signal is
+  subtracted from the buffer and the residual decoded again, which recovers
+  weak stations sitting inside a strong neighbour's occupied bandwidth — the
+  exact situation a hot front end (bias-T feeding an LNA) creates. If slots
+  ever queue up faster than they decode, only the freshest is kept.
+
+  If the SDR's ADC itself clips (the classic bias-T/LNA symptom: signals hit
+  full scale and splatter intermod across the passband, costing weak decodes),
+  the status line warns `ADC overload: reduce gain`. Software can flag it, but
+  only backing the gain off — or dropping the bias-T — fixes it.
+
   These modes also replace the plain decode pane with a three-part view of the
   whole passband's traffic:
 

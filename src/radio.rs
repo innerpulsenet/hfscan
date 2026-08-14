@@ -60,6 +60,13 @@ fn run(
     stream.activate(None)?;
     let mut buf = vec![Complex32::new(0.0, 0.0); BLOCK];
     let mut overruns: u64 = 0;
+    // ADC overload watch: samples parked at the rails mean the front end is
+    // clipping (classic symptom of bias-T feeding an LNA without backing the
+    // gain off), which splatters intermod across the passband and costs weak
+    // decodes. Count over ~1 s windows so a single hot block doesn't nag.
+    let mut clipped: u64 = 0;
+    let mut counted: u64 = 0;
+    let mut ovl_quiet = std::time::Instant::now();
 
     loop {
         // Drain pending commands before the next read.
@@ -117,6 +124,26 @@ fn run(
         match stream.read(&mut [&mut buf[..]], 1_000_000) {
             Ok(0) => continue,
             Ok(n) => {
+                clipped += buf[..n]
+                    .iter()
+                    .filter(|c| c.re.abs() > 0.98 || c.im.abs() > 0.98)
+                    .count() as u64;
+                counted += n as u64;
+                if counted >= rate as u64 {
+                    // More than one sample in ten thousand at the rails, kept
+                    // up for a whole second, is overload — not a hot signal.
+                    if clipped * 10_000 > counted
+                        && ovl_quiet.elapsed() > std::time::Duration::from_secs(15)
+                    {
+                        let _ = log_tx.try_send(
+                            "ADC overload: signals at full scale — reduce gain (bias-T raises it)"
+                                .to_string(),
+                        );
+                        ovl_quiet = std::time::Instant::now();
+                    }
+                    clipped = 0;
+                    counted = 0;
+                }
                 // Drop blocks rather than block the radio if the UI falls behind.
                 match iq_tx.try_send(buf[..n].to_vec()) {
                     Ok(()) => {}

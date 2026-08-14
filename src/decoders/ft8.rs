@@ -27,14 +27,16 @@ pub const AUDIO_RATE: f64 = 12_000.0;
 pub const AUDIO_CENTRE: f64 = 1500.0;
 pub const FREQ_MIN: f32 = 200.0;
 pub const FREQ_MAX: f32 = 2900.0;
-const MAX_CAND: usize = 60;
+const MAX_CAND: usize = 100;
 
 pub struct FtDecoder {
     ft4: bool,
     slot_secs: f64,
     nmax: usize,
     nco: Nco,
-    buf: Vec<i16>,
+    /// Raw real audio for the slot, quantised to i16 only at slot end so a
+    /// single slot-wide gain can be used (see `append_audio`).
+    buf: Vec<f32>,
     slot: u64,
     jobs: Sender<Vec<i16>>,
     results: Receiver<Vec<FtMessage>>,
@@ -42,7 +44,6 @@ pub struct FtDecoder {
     decodes: u32,
     pending: bool,
     started: bool,
-    level: f32,
     last_fill: f32,
 }
 
@@ -55,9 +56,17 @@ impl FtDecoder {
 
         std::thread::spawn(move || {
             while let Ok(audio) = job_rx.recv() {
+                // If slots queued up faster than we can decode them (slow
+                // CPU, busy band), keep only the freshest: stale decodes are
+                // worth less than current ones, and the queue must stay
+                // bounded.
+                let mut latest = audio;
+                while let Ok(newer) = job_rx.try_recv() {
+                    latest = newer;
+                }
                 // One batch per slot (possibly empty), so the UI can tell
                 // "slot done, nothing heard".
-                if res_tx.send(decode_slot(&audio, ft4)).is_err() {
+                if res_tx.send(decode_slot(&latest, ft4)).is_err() {
                     return;
                 }
             }
@@ -80,7 +89,6 @@ impl FtDecoder {
             decodes: 0,
             pending: false,
             started: false,
-            level: 0.0,
             last_fill: 0.0,
         }
     }
@@ -97,43 +105,24 @@ impl FtDecoder {
         self.append_audio(samples);
     }
 
+    /// The buffered slot, quantised the same way `flush_slot` does it.
     #[cfg(test)]
-    pub fn audio_buffer(&self) -> &[i16] {
-        &self.buf
+    pub fn audio_buffer(&self) -> Vec<i16> {
+        quantize(&self.buf, self.nmax)
     }
 
-    /// Convert complex baseband from the tuning chain into the i16 USB audio
-    /// the FT decoder expects, appending to the slot buffer.
+    /// Convert complex baseband from the tuning chain into USB audio (real
+    /// part, dial at 0 Hz) and append it to the slot buffer.
     ///
-    /// The level is normalised rather than fixed-scaled: after narrowing a
-    /// 192 kHz span down to 3 kHz the residual amplitude is tiny, and a fixed
-    /// gain would quantise weak signals into nothing.
+    /// Samples are kept as raw f32 until slot end: quantising there with one
+    /// slot-wide gain beats tracking a running level, because a strong
+    /// station appearing mid-slot would otherwise clip against the i16 rails
+    /// until the tracker caught up, and the gain step it then applied would
+    /// shift the noise floor under the LDPC soft metrics mid-message.
     fn append_audio(&mut self, samples: &[Complex32]) {
         let mut shifted = Vec::with_capacity(samples.len());
         self.nco.mix(samples, &mut shifted);
-
-        let sum_sq: f32 = shifted.iter().map(|c| c.re * c.re).sum();
-        if sum_sq > 0.0 {
-            let rms = (sum_sq / shifted.len().max(1) as f32).sqrt();
-            // Track the level slowly so the scale is stable across a slot.
-            self.level = if self.level <= 0.0 {
-                rms
-            } else {
-                0.9 * self.level + 0.1 * rms
-            };
-        }
-        // Aim for a comfortable fraction of full scale.
-        let gain = if self.level > 1e-12 {
-            (4000.0 / self.level).min(1.0e7)
-        } else {
-            1.0
-        };
-
-        self.buf.extend(
-            shifted
-                .iter()
-                .map(|c| (c.re * gain).clamp(-32_767.0, 32_767.0) as i16),
-        );
+        self.buf.extend(shifted.iter().map(|c| c.re));
     }
 
     fn flush_slot(&mut self) {
@@ -141,14 +130,34 @@ impl FtDecoder {
         // startup would just waste a decode.
         self.last_fill = self.buf.len() as f32 / self.nmax as f32 * 100.0;
         if self.buf.len() >= self.nmax * 3 / 4 {
-            let mut audio = std::mem::take(&mut self.buf);
-            audio.resize(self.nmax, 0);
+            let audio = quantize(&self.buf, self.nmax);
             self.pending = true;
             let _ = self.jobs.send(audio);
         }
         self.buf.clear();
         self.buf.reserve(self.nmax + 4096);
     }
+}
+
+/// Normalise a whole slot to a comfortable fraction of full scale and
+/// quantise to the i16 audio the FT decoder expects. One fixed gain for the
+/// entire slot; after narrowing a 192 kHz span down to 3 kHz the residual
+/// amplitude is tiny, so a fixed absolute scale would quantise weak signals
+/// into nothing.
+fn quantize(buf: &[f32], nmax: usize) -> Vec<i16> {
+    let mut audio = buf.to_vec();
+    audio.resize(nmax, 0.0);
+    let sum_sq: f32 = audio.iter().map(|v| v * v).sum();
+    let rms = (sum_sq / audio.len().max(1) as f32).sqrt();
+    let gain = if rms > 1e-12 {
+        (4000.0 / rms).min(1.0e7)
+    } else {
+        1.0
+    };
+    audio
+        .iter()
+        .map(|v| (v * gain).clamp(-32_767.0, 32_767.0) as i16)
+        .collect()
 }
 
 fn current_slot(slot_secs: f64) -> u64 {
@@ -163,7 +172,13 @@ fn decode_slot(audio: &[i16], ft4: bool) -> Vec<FtMessage> {
     let stamp = slot_stamp();
     let mut out = Vec::new();
     if ft4 {
+        // sic_rounds(2): decode, subtract the decoded signals from the
+        // buffer, decode the residual again — this is how jt9 recovers weak
+        // signals sitting inside a strong neighbour's occupied bandwidth,
+        // which is exactly the situation a hot front end (bias-T + LNA)
+        // creates.
         let res = DecodeRequest::<Ft4>::new(audio, FREQ_MIN, FREQ_MAX, 1.0, MAX_CAND)
+            .sic_rounds(2)
             .decode()
             .results;
         for r in &res {
@@ -178,7 +193,11 @@ fn decode_slot(audio: &[i16], ft4: bool) -> Vec<FtMessage> {
             }
         }
     } else {
+        // sic_early: WSJT-X's early-decode architecture — progressively
+        // longer audio prefixes with subtraction between checkpoints. A
+        // recall superset of plain multi-pass SIC.
         let res = DecodeRequest::<Ft8>::new(audio, FREQ_MIN, FREQ_MAX, 1.0, MAX_CAND)
+            .sic_early()
             .decode()
             .results;
         for r in &res {
@@ -278,7 +297,6 @@ impl Decoder for FtDecoder {
         self.msgs.clear();
         self.decodes = 0;
         self.started = false;
-        self.level = 0.0;
         self.slot = current_slot(self.slot_secs);
     }
 }

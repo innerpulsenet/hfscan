@@ -365,6 +365,44 @@ fn ft8_decodes_a_slot() {
     );
 }
 
+/// A weak signal parked next to a much stronger one must still decode: the
+/// SIC pass has to subtract the strong signal and find it. This is the
+/// live-band situation a hot front end (bias-T feeding an LNA) creates.
+#[test]
+fn ft8_decodes_weak_beside_strong() {
+    use mfsk_core::ft8::wave_gen::{message_to_tones, tones_to_i16};
+    use mfsk_core::msg::wsjt77::pack77;
+
+    let nmax = 15 * 12_000;
+    // Accumulate in i32 so the mix can't wrap before the final clamp.
+    let mut audio = vec![0i32; nmax];
+    let start = (0.5 * 12_000.0) as usize;
+    let strong = pack77("CQ", "W1AW", "FN31").expect("pack77");
+    let weak = pack77("CQ", "JA1ABC", "PM95").expect("pack77");
+    for (msg77, hz, amp) in [(&strong, 1500.0f32, 20_000), (&weak, 1515.0, 3_500)] {
+        let frame = tones_to_i16(&message_to_tones(msg77), hz, amp);
+        for (i, &s) in frame.iter().enumerate() {
+            if start + i < audio.len() {
+                audio[start + i] += s as i32;
+            }
+        }
+    }
+    let audio: Vec<i16> = audio
+        .iter()
+        .map(|v| (*v).clamp(-32_767, 32_767) as i16)
+        .collect();
+
+    let out = ft8::FtDecoder::decode_audio(&audio, false);
+    assert!(
+        out.iter().any(|l| l.contains("CQ W1AW FN31")),
+        "strong signal missing: {out:?}"
+    );
+    assert!(
+        out.iter().any(|l| l.contains("CQ JA1ABC PM95")),
+        "weak signal masked by its neighbour: {out:?}"
+    );
+}
+
 #[test]
 fn ft4_decodes_a_slot() {
     let out = ft_roundtrip(true, "JA1ABC", "PM95", 1500.0);

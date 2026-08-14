@@ -1075,21 +1075,22 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     // you can see a slot is about to be decoded (and that the clock is sane).
     let now = utc_secs();
     let utc = format!(
-        "UTC {:02}:{:02}:{:02}",
+        "{:02}:{:02}:{:02}",
         (now / 3600.0) as u64 % 24,
         (now / 60.0) as u64 % 60,
         now as u64 % 60
     );
     let slot = match app.mode {
-        Mode::Ft8 => format!("  slot -{:2.0}s", 15.0 - now % 15.0),
-        Mode::Ft4 => format!("  slot -{:2.1}s", 7.5 - now % 7.5),
-        _ => String::new(),
+        Mode::Ft8 => Some(format!("-{:2.0}s", 15.0 - now % 15.0)),
+        Mode::Ft4 => Some(format!("-{:2.1}s", 7.5 - now % 7.5)),
+        _ => None,
     };
-    let spotting = if let Some(r) = &app.reporter {
-        format!("  spots {}", r.sent_count())
-    } else {
-        String::new()
-    };
+
+    // Colour code every datum so the eye can jump straight to it: labels dim
+    // grey, values coloured by what they mean.
+    let dim = Style::default().fg(Color::DarkGray);
+    let lbl = |s: &'static str| Span::styled(s, dim);
+    let val = |s: String| Span::styled(s, Style::default().fg(Color::White));
 
     let mut spans1 = vec![
         Span::styled(
@@ -1098,48 +1099,141 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(marker),
+        Span::styled(marker, Style::default().fg(Color::Magenta)),
     ];
     if !app.my_call.is_empty() {
         spans1.push(Span::styled(
             format!("   de {}", app.my_call),
-            Style::default().fg(Color::Cyan),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     }
-    spans1.push(Span::raw(format!(
-        "   centre {:.3}  cursor {:+.0} Hz  {}  view {:.2} kHz (x{:.0})  step {:.0} Hz  {:.1} Hz/bin",
-        app.center / 1000.0,
-        app.cursor,
-        band,
-        (hi - lo) / 1000.0,
-        app.zoom,
-        app.step_hz(),
-        app.bin_hz(),
-    )));
+    spans1.extend([
+        lbl("   centre "),
+        val(format!("{:.3}", app.center / 1000.0)),
+        lbl("  cursor "),
+        Span::styled(
+            format!("{:+.0} Hz", app.cursor),
+            Style::default().fg(Color::LightCyan),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            band,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        lbl("  view "),
+        val(format!("{:.2} kHz", (hi - lo) / 1000.0)),
+        Span::styled(format!(" (x{:.0})", app.zoom), dim),
+        lbl("  step "),
+        val(format!("{:.0} Hz", app.step_hz())),
+        Span::styled(format!("  {:.1} Hz/bin", app.bin_hz()), dim),
+    ]);
     let line1 = Line::from(spans1);
-    let line2 = Line::from(format!(
-        "{}  {}  {}{}  snr {:+.0} dB  sq {}  {}  bias-T {}  wf {}ms  {}{}  {}",
-        app.mode.label(),
-        dec_status,
-        utc,
-        slot,
-        app.cursor_snr,
+
+    // Mode gets its own hue so the active decoder is obvious at a glance.
+    let mode_color = match app.mode {
+        Mode::Off => Color::DarkGray,
+        Mode::Cw => Color::Yellow,
+        Mode::Rtty => Color::Magenta,
+        Mode::Psk31 => Color::LightBlue,
+        Mode::Ft8 => Color::Green,
+        Mode::Ft4 => Color::LightGreen,
+    };
+    let snr_color = if app.cursor_snr >= 10.0 {
+        Color::Green
+    } else if app.cursor_snr >= 0.0 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+    let mut spans2 = vec![
+        Span::styled(
+            app.mode.label(),
+            Style::default()
+                .fg(mode_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        val(dec_status),
+        lbl("  UTC "),
+        Span::styled(utc, Style::default().fg(Color::LightBlue)),
+    ];
+    if let Some(slot) = slot {
+        spans2.push(lbl("  slot "));
+        spans2.push(Span::styled(slot, Style::default().fg(Color::Magenta)));
+    }
+    spans2.extend([
+        lbl("  snr "),
+        Span::styled(
+            format!("{:+.0} dB", app.cursor_snr),
+            Style::default().fg(snr_color),
+        ),
+        lbl("  sq "),
         if app.squelch {
-            format!("{:.0}", app.squelch_db)
+            Span::styled(
+                format!("{:.0}", app.squelch_db),
+                Style::default().fg(Color::Cyan),
+            )
         } else {
-            "off".to_string()
+            Span::styled("off", dim)
         },
-        if app.agc {
-            "AGC".to_string()
-        } else {
-            format!("{:.0} dB", app.gain)
-        },
-        if app.biast { "ON" } else { "off" },
-        WF_INTERVALS_MS[app.wf_idx],
-        if app.scan.is_some() { "SCANNING" } else { "" },
-        spotting,
-        app.log.back().cloned().unwrap_or_default(),
+        Span::raw("  "),
+    ]);
+    if app.agc {
+        spans2.push(Span::styled(
+            "AGC",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        spans2.push(lbl("gain "));
+        spans2.push(Span::styled(
+            format!("{:.0} dB", app.gain),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    spans2.push(lbl("  bias-T "));
+    spans2.push(if app.biast {
+        Span::styled(
+            "ON",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("off", dim)
+    });
+    spans2.push(lbl("  wf "));
+    spans2.push(Span::styled(
+        format!("{}ms", WF_INTERVALS_MS[app.wf_idx]),
+        dim,
     ));
+    if app.scan.is_some() {
+        spans2.push(Span::styled(
+            "  SCANNING",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(r) = &app.reporter {
+        spans2.push(lbl("  spots "));
+        spans2.push(Span::styled(
+            r.sent_count().to_string(),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    if let Some(msg) = app.log.back() {
+        spans2.push(Span::styled(
+            format!("  {msg}"),
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    let line2 = Line::from(spans2);
 
     let p = Paragraph::new(vec![line1, line2]).block(
         Block::default()

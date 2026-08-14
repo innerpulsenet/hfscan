@@ -1,0 +1,13 @@
+[package]
+name = "hfscan"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+mfsk-core = "0.9.1"
+num-complex = "0.4.6"
+ratatui = "0.29.0"
+rustfft = "6.4.1"
+soapysdr = { version = "0.5.1", features = ["log"] }

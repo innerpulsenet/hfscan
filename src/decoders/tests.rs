@@ -34,8 +34,17 @@ fn morse_for(c: char) -> &'static str {
     }
 }
 
+/// Residual tuning error the decoder actually sees.
+///
+/// The tuning chain mixes the cursor (or the auto slot's dial) to DC, and
+/// `CwDecoder::offset_shift` is zero, so a CW carrier arrives near baseband —
+/// never at an audio pitch. The decoder's own +/-180 Hz search exists to mop
+/// up what the classifier got wrong, so a small offset is the realistic case.
+/// Feeding it a 600 Hz tone tests a receiver the app never builds.
+const CW_TONE: f32 = 50.0;
+
 fn gen_cw(text: &str, wpm: f32, snr_scale: f32) -> Vec<Complex32> {
-    gen_cw_at(text, wpm, snr_scale, 600.0)
+    gen_cw_at(text, wpm, snr_scale, CW_TONE)
 }
 
 fn gen_cw_at(text: &str, wpm: f32, snr_scale: f32, tone: f32) -> Vec<Complex32> {
@@ -162,7 +171,7 @@ fn cw_follows_a_speed_change() {
 #[test]
 fn cw_decodes_a_sloppy_fist() {
     let key = gen_cw_key("CQ CQ DE W1AW W1AW K", 20.0, 2.2, &[0.85, 1.1, 1.0, 0.9, 1.15]);
-    let sig = key_to_iq(&key, 0.02, 600.0);
+    let sig = key_to_iq(&key, 0.02, CW_TONE);
     let mut d = cw::CwDecoder::new(FS);
     let mut out = String::new();
     for chunk in sig.chunks(4096) {
@@ -194,7 +203,7 @@ fn cw_survives_dropouts_and_spikes() {
     let mut i = (0.095 * FS as f32) as usize;
     while i + glitch < sig.len() {
         for (k, s) in sig[i..i + glitch].iter_mut().enumerate() {
-            let ph = 2.0 * PI * 600.0 * (i + k) as f32 / FS as f32;
+            let ph = 2.0 * PI * CW_TONE * (i + k) as f32 / FS as f32;
             *s += Complex32::from_polar(0.9, ph);
         }
         i += (0.19 * FS as f32) as usize;
@@ -808,3 +817,361 @@ fn ft8_survives_the_tuning_chain() {
         "signal did not survive the chain, got {out:?}"
     );
 }
+
+// ------------------------------------------------- CW accuracy bench
+
+/// Levenshtein distance, for scoring decoded text against what was sent.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let sub = prev[j - 1] + usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = sub.min(prev[j] + 1).min(cur[j - 1] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Fraction of characters recovered, 0..1.
+fn accuracy(sent: &str, got: &str) -> f32 {
+    if sent.is_empty() {
+        return 1.0;
+    }
+    let d = edit_distance(sent, got);
+    1.0 - (d as f32 / sent.chars().count() as f32).min(1.0)
+}
+
+/// `snr_scale` for a wanted SNR in dB, measured in the decoder's 400 Hz
+/// bandwidth against a full-scale mark.
+fn scale_for_snr(db: f32) -> f32 {
+    // noise() is uniform(-0.5,0.5): variance 1/12 per component, so a
+    // complex sample has variance 1/6 before scaling, spread over FS.
+    let n_total = (1.0f32 / 6.0).sqrt();
+    let in_bw = n_total * (400.0 / FS as f32).sqrt();
+    let wanted = 10f32.powf(-db / 20.0);
+    wanted / in_bw
+}
+
+/// Decode as the app does: through the same tuning chain, at the same
+/// bandwidth the decoder asks for. Handing the decoder raw wideband audio
+/// instead measures a receiver nobody has.
+fn decode_cw(sig: &[Complex32], tone: f32) -> String {
+    let mut d = cw::CwDecoder::new(FS);
+    let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+    chain.set_offset(tone as f64 + d.offset_shift());
+    let mut audio = Vec::new();
+    let mut out = String::new();
+    for chunk in sig.chunks(4096) {
+        chain.process(chunk, &mut audio);
+        out.push_str(&d.process(&audio));
+    }
+    out.trim().to_string()
+}
+
+/// Same as `decode_cw` but reports what the decoder thought it was doing.
+fn decode_cw_dbg(sig: &[Complex32], tone: f32) -> (String, f32, f32) {
+    let mut d = cw::CwDecoder::new(FS);
+    let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+    chain.set_offset(tone as f64 + d.offset_shift());
+    let mut audio = Vec::new();
+    let mut out = String::new();
+    for chunk in sig.chunks(4096) {
+        chain.process(chunk, &mut audio);
+        out.push_str(&d.process(&audio));
+    }
+    (out.trim().to_string(), d.wpm(), d.lock_hz())
+}
+
+#[test]
+#[ignore]
+fn bench_cw_detail() {
+    let msg = "CQ CQ DE W1AW W1AW K";
+    println!("\nsent: {msg:?}\n");
+    for wpm in [12.0f32, 18.0, 25.0, 35.0] {
+        for db in [40, 20, 10] {
+            let sig = gen_cw(msg, wpm, scale_for_snr(db as f32));
+            let (got, est, lock) = decode_cw_dbg(&sig, 0.0);
+            println!(
+                "{wpm:>3.0} WPM {db:>3} dB  acc {:>4}  est {est:>4.1} WPM  lock {lock:>+6.1} Hz  {got:?}",
+                format!("{:.0}%", accuracy(msg, &got) * 100.0)
+            );
+        }
+        println!();
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_cw_long() {
+    // A realistic over: long enough that acquisition is a small fraction.
+    let msg = "CQ CQ DE W1AW W1AW K UR RST 599 599 QTH NEWINGTON CT \
+               NAME JOE JOE HW CPY? BK TNX FER THE QSO 73 ES GL DE W1AW K";
+    for wpm in [15.0f32, 20.0, 28.0] {
+        for db in [30, 15, 8] {
+            let sig = gen_cw(msg, wpm, scale_for_snr(db as f32));
+            let (got, est, _) = decode_cw_dbg(&sig, 0.0);
+            // Accuracy over the whole over, and over everything after the
+            // first 20 characters — acquisition versus steady state.
+            let tail_sent: String = msg.chars().skip(20).collect();
+            let tail_got: String = got.chars().skip(20).collect();
+            println!(
+                "{wpm:>3.0} WPM {db:>3} dB  all {:>4}  tail {:>4}  est {est:.1} WPM",
+                format!("{:.0}%", accuracy(msg, &got) * 100.0),
+                format!("{:.0}%", accuracy(&tail_sent, &tail_got) * 100.0),
+            );
+            if db == 15 {
+                println!("        {got:?}");
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_cw_tuning_error() {
+    let msg = "CQ CQ DE W1AW W1AW K UR RST 599 QTH NEWINGTON DE W1AW K";
+    // The chain is tuned where the classifier said; the tone is off by
+    // `err`, which is what auto mode actually hands the decoder.
+    println!("chain tuned to 700 Hz, tone offset by err, 20 WPM");
+    print!("{:>8}", "err Hz");
+    for db in [30, 15, 8] {
+        print!("{:>9}", format!("{db}dB"));
+    }
+    println!();
+    for err in [0.0f32, 25.0, 50.0, 100.0, 150.0, 200.0, -100.0, -200.0] {
+        print!("{err:>8.0}");
+        for db in [30, 15, 8] {
+            let sig = gen_cw_at(msg, 20.0, scale_for_snr(db as f32), 700.0 + err);
+            let got = decode_cw(&sig, 700.0);
+            print!("{:>9}", format!("{:.0}%", accuracy(msg, &got) * 100.0));
+        }
+        println!();
+    }
+    println!();
+    for err in [50.0f32, 150.0, 200.0] {
+        let sig = gen_cw_at(msg, 20.0, scale_for_snr(15.0), 700.0 + err);
+        let (got, _, lock) = decode_cw_dbg(&sig, 700.0);
+        println!("  err {err:>4.0} Hz  lock {lock:>+6.1} Hz  {got:?}");
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_cw_neighbour() {
+    let msg = "CQ CQ DE W1AW W1AW K UR RST 599 QTH NEWINGTON DE W1AW K";
+    let qrm = "TEST DE G4XYZ G4XYZ 599 001 001 TU QRZ TEST G4XYZ K";
+    println!("wanted at 700 Hz, 20 WPM, 15 dB; a second CW station nearby");
+    println!("{:>10}{:>8}{:>8}{:>8}", "sep Hz", "-6dB", "same", "+6dB");
+    for sep in [500.0f32, 400.0, 300.0, 250.0, 200.0, 150.0, 100.0] {
+        print!("{sep:>10.0}");
+        for rel in [0.5f32, 1.0, 2.0] {
+            let want = gen_cw_at(msg, 20.0, scale_for_snr(15.0), 700.0);
+            // A second station, keyed differently, at 25 WPM.
+            let other = gen_cw_at(qrm, 25.0, 0.0, 700.0 + sep);
+            let mut sig = want.clone();
+            for (i, s) in sig.iter_mut().enumerate() {
+                if let Some(o) = other.get(i) {
+                    *s += o * rel;
+                }
+            }
+            let got = decode_cw(&sig, 700.0);
+            print!("{:>8}", format!("{:.0}%", accuracy(msg, &got) * 100.0));
+        }
+        println!();
+    }
+    println!("\nwhich station did it pick? (scored against both)");
+    for sep in [200.0f32, 150.0, 100.0] {
+        for rel in [1.0f32, 2.0] {
+            let want = gen_cw_at(msg, 20.0, scale_for_snr(15.0), 700.0);
+            let other = gen_cw_at(qrm, 25.0, 0.0, 700.0 + sep);
+            let mut sig = want.clone();
+            for (i, s) in sig.iter_mut().enumerate() {
+                if let Some(o) = other.get(i) {
+                    *s += o * rel;
+                }
+            }
+            let (got, _, lock) = decode_cw_dbg(&sig, 700.0);
+            println!(
+                "  sep {sep:>4.0} Hz  qrm {:>4}  lock {lock:>+6.1} Hz  wanted {:>4}  qrm {:>4}  {got:?}",
+                if rel > 1.5 { "+6dB" } else { "same" },
+                format!("{:.0}%", accuracy(msg, &got) * 100.0),
+                format!("{:.0}%", accuracy(qrm, &got) * 100.0),
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_cw_accuracy() {
+    let msg = "CQ CQ DE W1AW W1AW K";
+    println!("\nsent: {msg:?}\n");
+
+    println!("== on frequency, by speed and SNR ==");
+    print!("{:>6}", "WPM");
+    for db in [40, 20, 15, 10, 6, 3, 0] {
+        print!("{:>8}", format!("{db}dB"));
+    }
+    println!();
+    for wpm in [12.0f32, 18.0, 25.0, 35.0] {
+        print!("{wpm:>6.0}");
+        for db in [40, 20, 15, 10, 6, 3, 0] {
+            let sig = gen_cw(msg, wpm, scale_for_snr(db as f32));
+            let got = decode_cw(&sig, 0.0);
+            print!("{:>8}", format!("{:.0}%", accuracy(msg, &got) * 100.0));
+        }
+        println!();
+    }
+
+    println!("\n== 20 WPM, 15 dB, by residual tuning error ==");
+    for tone in [-200.0f32, -100.0, -50.0, 0.0, 50.0, 100.0, 200.0, 300.0] {
+        let sig = gen_cw_at(msg, 20.0, scale_for_snr(15.0), tone);
+        let got = decode_cw(&sig, 0.0);
+        println!(
+            "  {tone:>6.0} Hz  {:>4}  {got:?}",
+            format!("{:.0}%", accuracy(msg, &got) * 100.0)
+        );
+    }
+
+    println!("\n== what it actually produces, 20 WPM on frequency ==");
+    for db in [40, 20, 15, 10, 6, 3] {
+        let sig = gen_cw(msg, 20.0, scale_for_snr(db as f32));
+        println!("  {db:>2} dB  {:?}", decode_cw(&sig, 0.0));
+    }
+}
+
+// --------------------------------------------- CW regression tests
+
+/// The one that matters most on a real band.
+///
+/// The tuning chain hands the decoder a 400 Hz passband, and CW operators
+/// routinely sit 100-300 Hz apart inside it. Without a post-mix channel
+/// filter the envelope detector sums both stations and the slicer is keyed
+/// by whichever one happens to be transmitting, so the copy is noise — which
+/// is what a listener sees on any busy band, and what no clean single-signal
+/// test can catch.
+#[test]
+fn cw_rejects_an_adjacent_station() {
+    let msg = "CQ CQ DE W1AW W1AW K UR RST 599 QTH NEWINGTON DE W1AW K";
+    let qrm = "TEST DE G4XYZ G4XYZ 599 001 001 TU QRZ TEST G4XYZ K";
+    for sep in [250.0f32, 200.0, -200.0] {
+        // Equal strength, keyed at a different speed so the interference is
+        // uncorrelated with the wanted station's timing.
+        let want = gen_cw_at(msg, 20.0, scale_for_snr(15.0), CW_TONE);
+        let other = gen_cw_at(qrm, 27.0, 0.0, CW_TONE + sep);
+        let mut sig = want;
+        for (i, s) in sig.iter_mut().enumerate() {
+            if let Some(o) = other.get(i) {
+                *s += o;
+            }
+        }
+        let got = decode_cw(&sig, 0.0);
+        let acc = accuracy(msg, &got);
+        assert!(
+            acc > 0.9,
+            "a station {sep:.0} Hz away wrecked the copy ({:.0}%): {got:?}",
+            acc * 100.0
+        );
+    }
+}
+
+/// Copy must start with the first character actually sent.
+///
+/// Two things used to corrupt it: the filter chain fills from zero, and
+/// slicing that ramp keys a phantom mark before the station has said
+/// anything; and the dit estimate starts at 20 WPM, so the first characters
+/// of an operator sending anything else are read against the wrong ruler.
+#[test]
+fn cw_starts_clean_at_any_speed() {
+    for wpm in [12.0f32, 18.0, 25.0, 35.0] {
+        let sig = gen_cw("CQ CQ DE W1AW W1AW K", wpm, scale_for_snr(20.0));
+        let got = decode_cw(&sig, 0.0);
+        assert!(
+            got.starts_with("CQ"),
+            "at {wpm:.0} WPM the copy did not start with what was sent: {got:?}"
+        );
+    }
+}
+
+/// Steady-state copy on a signal weak enough to be worth decoding by
+/// machine. 8 dB in 400 Hz is a perfectly ordinary HF signal.
+#[test]
+fn cw_copies_a_long_over_at_low_snr() {
+    let msg = "CQ CQ DE W1AW W1AW K UR RST 599 599 QTH NEWINGTON CT \
+               NAME JOE JOE HW CPY? BK TNX FER THE QSO 73 ES GL DE W1AW K";
+    for wpm in [15.0f32, 20.0, 28.0] {
+        let sig = gen_cw(msg, wpm, scale_for_snr(8.0));
+        let got = decode_cw(&sig, 0.0);
+        let acc = accuracy(msg, &got);
+        assert!(
+            acc > 0.9,
+            "{wpm:.0} WPM at 8 dB copied {:.0}%: {got:?}",
+            acc * 100.0
+        );
+    }
+}
+
+/// The classifier places an auto slot from a spectrum peak, so the carrier
+/// arrives with some tuning error. The decoder's own search must pull it in
+/// across the range that error can plausibly cover.
+#[test]
+fn cw_pulls_in_a_mistuned_carrier() {
+    let msg = "CQ CQ DE W1AW W1AW K UR RST 599 QTH NEWINGTON DE W1AW K";
+    for err in [-100.0f32, -50.0, 0.0, 50.0, 100.0] {
+        let sig = gen_cw_at(msg, 20.0, scale_for_snr(15.0), err);
+        let got = decode_cw(&sig, 0.0);
+        let acc = accuracy(msg, &got);
+        assert!(
+            acc > 0.9,
+            "{err:+.0} Hz of tuning error copied {:.0}%: {got:?}",
+            acc * 100.0
+        );
+    }
+}
+
+/// An empty frequency must stay empty.
+///
+/// Auto mode points a decoder at whatever the classifier flagged, and the
+/// squelch deliberately does not gate CW (the passband scout has to keep
+/// listening). So the decoder sees noise routinely, and noise sliced by a
+/// threshold that has settled into it spells plausible-looking letters —
+/// the fastest way to make a whole pane of copy worthless.
+#[test]
+fn cw_stays_quiet_on_noise() {
+    for seed in [0x1234_5678u32, 0xdead_beef, 0x0bad_f00d] {
+        let mut rng = seed;
+        let n = (12.0 * FS) as usize;
+        let sig: Vec<Complex32> = (0..n)
+            .map(|_| Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.3)
+            .collect();
+        let got = decode_cw(&sig, 0.0);
+        let letters = got.chars().filter(|c| !c.is_whitespace()).count();
+        assert!(
+            letters <= 2,
+            "12 s of noise produced {letters} characters: {got:?}"
+        );
+    }
+}
+
+/// A carrier — someone tuning up, or a birdie — is not Morse either.
+#[test]
+fn cw_stays_quiet_on_a_steady_carrier() {
+    let n = (10.0 * FS) as usize;
+    let mut rng = 0x5eed_1234u32;
+    let sig: Vec<Complex32> = (0..n)
+        .map(|i| {
+            let ph = 2.0 * PI * CW_TONE * i as f32 / FS as f32;
+            Complex32::from_polar(1.0, ph)
+                + Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.02
+        })
+        .collect();
+    let got = decode_cw(&sig, 0.0);
+    let letters = got.chars().filter(|c| !c.is_whitespace()).count();
+    assert!(letters <= 2, "a steady carrier decoded as {got:?}");
+}
+

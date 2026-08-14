@@ -25,6 +25,144 @@ const ENV_HIST: usize = 700;
 /// 5–70 WPM. Below that is not Morse; above it the 4 ms envelope lags.
 const DIT_MIN_S: f32 = 0.017; // ~70 WPM
 const DIT_MAX_S: f32 = 0.24; // ~5 WPM
+/// Marks held before the clock is trusted and the copy starts flowing.
+/// Enough to cluster a dit and a dah from — about two characters — without
+/// making a station that sends only "K" wait forever.
+const WARMUP_MARKS: usize = 8;
+/// Envelope samples discarded at start-up and after a re-lock, while the
+/// filter chain fills. At the 1 kHz envelope rate this is 60 ms — an order
+/// of magnitude past the settling time of everything in front of it, and
+/// far shorter than the gap before a station starts sending.
+const SETTLE_MS: u32 = 60;
+
+/// Post-mix low-pass corner, and how many poles of it.
+///
+/// The tuning chain hands the decoder a 400 Hz passband, which on a busy CW
+/// band holds two or three stations. The envelope detector sums whatever is
+/// in front of it, so a neighbour keys the slicer with *its* timing and the
+/// copy becomes noise — the single worst thing that can happen to a CW
+/// decoder, and invisible on a clean synthetic signal.
+///
+/// Mixing the wanted tone to DC puts each neighbour at its own offset, where
+/// a narrow low-pass can reject it. 150 Hz over four poles is 2.6 dB down at
+/// 60 Hz — past the keying sidebands of even a 50 WPM fist — while a station
+/// 200 Hz off is 18 dB down and one at 300 Hz is 28 dB down.
+const POST_MIX_HZ: f32 = 150.0;
+const POST_MIX_POLES: usize = 4;
+
+/// Cascaded complex one-poles: the post-mix channel filter.
+struct NarrowLpf {
+    z: [Complex32; POST_MIX_POLES],
+    a: f32,
+}
+
+impl NarrowLpf {
+    fn new(fs: f32) -> Self {
+        Self {
+            z: [Complex32::new(0.0, 0.0); POST_MIX_POLES],
+            a: 1.0 - (-2.0 * PI * POST_MIX_HZ / fs).exp(),
+        }
+    }
+
+    fn process(&mut self, x: Complex32) -> Complex32 {
+        let mut v = x;
+        for z in self.z.iter_mut() {
+            *z += (v - *z) * self.a;
+            v = *z;
+        }
+        v
+    }
+
+    fn reset(&mut self) {
+        self.z = [Complex32::new(0.0, 0.0); POST_MIX_POLES];
+    }
+}
+
+/// Read a dit and a dah length out of a run of mark lengths, or decide the
+/// run is not Morse at all.
+///
+/// Keyed Morse puts its marks in two tight clusters about three units apart.
+/// Noise sliced by a threshold sitting inside it produces marks with an
+/// exponential-looking spread and no such structure, so requiring the
+/// structure is what separates a real fist from an empty frequency — the
+/// difference between copy and the letters that noise spells.
+///
+/// Returns `(dit, dah)` in envelope samples.
+fn morse_clock(marks: &[f32]) -> Option<(f32, f32)> {
+    if marks.len() < 4 {
+        return None;
+    }
+    let mut v: Vec<f32> = marks.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Two-mean cluster, seeded at the extremes.
+    let (mut c1, mut c2) = (v[0], v[v.len() - 1]);
+    if c2 <= c1 * 1.05 {
+        // All one length: dits alone (or dahs alone) is legitimate Morse but
+        // gives no ratio to work from, so take it as dits.
+        return Some((c1.max(1e-6), 3.0 * c1.max(1e-6)));
+    }
+    for _ in 0..12 {
+        let (mut s1, mut n1, mut s2, mut n2) = (0.0, 0.0, 0.0, 0.0);
+        for &x in &v {
+            if (x - c1).abs() <= (x - c2).abs() {
+                s1 += x;
+                n1 += 1.0;
+            } else {
+                s2 += x;
+                n2 += 1.0;
+            }
+        }
+        if n1 > 0.0 {
+            c1 = s1 / n1;
+        }
+        if n2 > 0.0 {
+            c2 = s2 / n2;
+        }
+    }
+    let (short, long) = if c1 <= c2 { (c1, c2) } else { (c2, c1) };
+    if short < 1e-6 {
+        return None;
+    }
+    // A dah is 3 dits; allow a heavy or light fist, but not anything.
+    let r = long / short;
+    if !(1.9..=4.4).contains(&r) {
+        return None;
+    }
+    // Every mark must sit close to one of the two lengths. This is the test
+    // that actually separates Morse from noise: a keyer (or a hand) quantises
+    // its marks, and sliced noise does not, however conveniently eight of its
+    // marks may happen to fall into two groups.
+    let near = v
+        .iter()
+        .filter(|&&x| {
+            let d = (x - short).abs().min((x - long).abs());
+            d <= 0.30 * if (x - short).abs() < (x - long).abs() { short } else { long }
+        })
+        .count();
+    if near * 10 < v.len() * 8 {
+        return None;
+    }
+    Some((short, long))
+}
+
+/// Whether the gaps between marks are keyed by the same clock as the marks.
+///
+/// Morse spaces come in three lengths — one dit between elements, three
+/// between characters, seven between words — so the short gaps land on the
+/// same dit the marks did. Noise has no reason to oblige, which makes this
+/// the cheapest strong check available: it tests a relationship between two
+/// independent measurements rather than the shape of either one.
+fn gaps_match_clock(gaps: &[f32], dit: f32) -> bool {
+    if gaps.len() < 3 || dit <= 0.0 {
+        return true;
+    }
+    let mut v: Vec<f32> = gaps.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // The inter-element gap is the commonest, so the lower half of the
+    // distribution is the one to compare against a dit.
+    let short = v[v.len() / 4];
+    (0.45..=2.2).contains(&(short / dit))
+}
 
 /// A CW tone found by the span scout or the in-passband searcher.
 #[derive(Clone, Debug)]
@@ -57,6 +195,10 @@ pub struct CwDecoder {
     marks: VecDeque<f32>,
     /// Fast-adapt elements remaining after idle or a speed-change snap.
     acquire: u32,
+    /// Elements held while the clock is still unknown, oldest first.
+    warmup: Vec<(f32, bool)>,
+    /// Whether `warmup` is collecting rather than the clock being trusted.
+    warming: bool,
     symbol: String,
     text: String,
     idle: f32,
@@ -69,11 +211,17 @@ pub struct CwDecoder {
     tune_err: f32,
     prev_mixed: Complex32,
     have_mixed: bool,
+    /// Whether the peak/floor trackers have been seeded.
+    have_env: bool,
+    /// Envelope samples still to discard while the filters fill.
+    settle: u32,
     /// Searches to skip after a manual nudge so AFC does not fight the user.
     hold_tune: u32,
 
     mix_hz: f32,
     mix_phase: f32,
+    /// Rejects the neighbours the 400 Hz chain filter lets through.
+    post: NarrowLpf,
     locked: bool,
     lock_score: f32,
     hits: Vec<CwHit>,
@@ -99,10 +247,11 @@ impl CwDecoder {
             // ~3 ms envelope: still passes a 50 WPM dit (~24 ms) with room
             // to spare, but follows QRQ edges better than 4 ms.
             smooth: OnePole::new(0.003 * fs),
+            post: NarrowLpf::new(fs),
             peak: 0.0,
             floor: 0.0,
             peak_decay: 1.0 - (-1.0f32 / (0.6 * env_rate)).exp(),
-            floor_attack: 1.0 - (-1.0f32 / (2.0 * env_rate)).exp(),
+            floor_attack: 1.0 - (-1.0f32 / (0.35 * env_rate)).exp(),
             floor_decay: 1.0 - (-1.0f32 / (0.05 * env_rate)).exp(),
             decim_ctr: 0,
             key_down: false,
@@ -112,6 +261,8 @@ impl CwDecoder {
             dah: 0.18 * env_rate,
             marks: VecDeque::with_capacity(MARK_HIST + 1),
             acquire: 16,
+            warmup: Vec::new(),
+            warming: true,
             symbol: String::new(),
             text: String::new(),
             idle: 0.0,
@@ -124,6 +275,8 @@ impl CwDecoder {
             tune_err: 0.0,
             prev_mixed: Complex32::new(0.0, 0.0),
             have_mixed: false,
+            have_env: false,
+            settle: SETTLE_MS,
             hold_tune: 0,
             mix_hz: 0.0,
             mix_phase: 0.0,
@@ -185,6 +338,111 @@ impl CwDecoder {
     }
 
     fn on_mark_end(&mut self, len: f32) {
+        // Nothing in Morse is longer than a dah. A mark several dahs long is
+        // a carrier, a tuner-upper, or the channel filter and the threshold
+        // tracker settling at switch-on — classifying it prepends a phantom
+        // dah to the first real character.
+        if len > 6.0 * self.dah || len > 1.2 * self.env_rate {
+            self.symbol.clear();
+            self.warmup.clear();
+            return;
+        }
+        // While the clock is still being learned the elements are held, not
+        // classified: the dit estimate starts at 20 WPM, so a station sending
+        // anything else has its first characters decoded against the wrong
+        // ruler and comes out as garbage. Held elements are replayed once the
+        // cluster below has a speed to classify them with.
+        if self.warming {
+            self.warmup.push((len, true));
+            if self.warmup.iter().filter(|(_, m)| *m).count() >= WARMUP_MARKS {
+                self.flush_warmup();
+            }
+            return;
+        }
+        self.classify_mark(len);
+
+        // The structure check has to keep running, not just gate entry. Noise
+        // that flukes its way through one warm-up would otherwise be decoded
+        // for as long as it lasts, and on an empty frequency that is forever.
+        // A real fist stays inside `morse_clock`'s tolerance; noise does not,
+        // and dropping back to warm-up costs only the next few elements.
+        if self.marks.len() >= WARMUP_MARKS {
+            let recent: Vec<f32> = self.marks.iter().copied().collect();
+            if morse_clock(&recent).is_none() {
+                self.symbol.clear();
+                self.warmup.clear();
+                self.warming = true;
+                self.marks.clear();
+            }
+        }
+    }
+
+    /// Set the clock from the held elements, then replay them.
+    ///
+    /// Clustering the whole warm-up at once beats tracking through it: the
+    /// first characters get the same speed estimate as the rest of the
+    /// transmission rather than whatever the tracker had converged to by the
+    /// time it reached them.
+    fn flush_warmup(&mut self) {
+        let marks: Vec<f32> = self
+            .warmup
+            .iter()
+            .filter(|(_, m)| *m)
+            .map(|(l, _)| *l)
+            .collect();
+        let gaps: Vec<f32> = self
+            .warmup
+            .iter()
+            .filter(|(_, m)| !*m)
+            .map(|(l, _)| *l)
+            .collect();
+        let clock = morse_clock(&marks).filter(|(dit, _)| gaps_match_clock(&gaps, *dit));
+        let Some((dit, dah)) = clock else {
+            // These marks are not Morse — on an empty frequency the slicer
+            // keys on the band noise, because `floor` chases the envelope
+            // minima rather than its mean and the thresholds end up sitting
+            // inside the noise. Rather than emit the letters that noise
+            // spells, drop what was held and keep waiting for a real fist.
+            // The oldest mark goes so a signal starting mid-buffer can still
+            // fill the window.
+            if let Some(i) = self.warmup.iter().position(|(_, m)| *m) {
+                self.warmup.drain(..=i);
+            } else {
+                self.warmup.clear();
+            }
+            return;
+        };
+        self.dit = dit;
+        self.dah = dah;
+        self.clamp_dit();
+        self.marks.clear();
+        for &m in marks.iter().take(MARK_HIST) {
+            self.marks.push_back(m);
+        }
+
+        let mut held: Vec<(f32, bool)> = std::mem::take(&mut self.warmup);
+        // A stray mark or two picked up off the band before the station
+        // started, separated from the real copy by more than a word space, is
+        // not part of it — and prepending the letter that noise spelled to
+        // someone's callsign is the most visible way to be wrong.
+        if let Some(cut) = held.iter().position(|(l, m)| !*m && *l > 7.0 * dit)
+            && held[..cut].iter().filter(|(_, m)| *m).count() <= 2
+        {
+            held.drain(..=cut);
+        }
+        self.warming = false;
+        self.acquire = 8;
+        for (len, is_mark) in held {
+            if is_mark {
+                self.classify_mark(len);
+            } else {
+                self.on_space_end(len);
+            }
+        }
+    }
+
+    /// Classify one mark against the current clock and add it to the symbol.
+    fn classify_mark(&mut self, len: f32) {
         let dit = self.dit.max(1e-6);
         let ratio = len / dit;
         // Classify against the midpoint of the *tracked* dit and dah, not a
@@ -294,6 +552,14 @@ impl CwDecoder {
     }
 
     fn on_space_end(&mut self, len: f32) {
+        // Held with the marks, so the gaps are read against the same clock
+        // the marks around them end up classified with.
+        if self.warming {
+            if !self.warmup.is_empty() {
+                self.warmup.push((len, false));
+            }
+            return;
+        }
         // Spaces never update dit — Farnsworth sending would otherwise
         // drag the estimate out to the character gap.
         if len >= 2.0 * self.dit {
@@ -406,6 +672,7 @@ impl CwDecoder {
         if let Some(h) = self.hits.first().cloned() {
             if (h.offset_hz - self.mix_hz).abs() > 8.0 {
                 self.mix_phase = 0.0;
+                self.post.reset();
             }
             self.mix_hz = h.offset_hz;
             self.lock_score = h.score;
@@ -416,12 +683,15 @@ impl CwDecoder {
     fn clear_lock_state(&mut self) {
         self.mix_hz = 0.0;
         self.mix_phase = 0.0;
+        self.post.reset();
         self.locked = false;
         self.lock_score = 0.0;
         self.hits.clear();
         self.search_buf.clear();
         self.since_search = 0;
         self.symbol.clear();
+        self.warmup.clear();
+        self.warming = true;
         self.key_down = false;
         self.run = 0.0;
         self.pending = 0.0;
@@ -430,6 +700,8 @@ impl CwDecoder {
         self.idle = 0.0;
         self.peak = 0.0;
         self.floor = 0.0;
+        self.have_env = false;
+        self.settle = SETTLE_MS;
         self.quality = 0.0;
         self.env_hist.clear();
         self.key_hist.clear();
@@ -493,6 +765,7 @@ impl Decoder for CwDecoder {
             self.lock_score = h.score;
             self.locked = true;
             self.mix_phase = 0.0;
+            self.post.reset();
             self.symbol.clear();
             self.acquire = 12;
             h.offset_hz
@@ -548,7 +821,10 @@ impl Decoder for CwDecoder {
         }
 
         for &raw in samples {
-            let s = self.mix(raw);
+            let mixed = self.mix(raw);
+            // Everything downstream — the discriminator as much as the
+            // envelope — sees only the wanted channel.
+            let s = self.post.process(mixed);
             if self.have_mixed && s.norm() > 1e-9 && self.prev_mixed.norm() > 1e-9 {
                 let d = s * self.prev_mixed.conj();
                 let inst = d.arg() * self.fs / (2.0 * PI);
@@ -567,21 +843,59 @@ impl Decoder for CwDecoder {
             }
             self.decim_ctr = 0;
 
+            // The envelope smoother, the channel filter and the tuning
+            // chain in front of them all start at zero, so the first tens of
+            // milliseconds are a ramp up to the band noise rather than a
+            // measurement of it. Slicing that ramp keys the decoder and
+            // prepends a phantom mark to the first real character; seeding
+            // the trackers from it is just as wrong, because everything
+            // sampled during the ramp reads far below the true floor.
+            //
+            // So: drop the ramp, then seed both trackers from real noise.
+            // With `floor` starting at the noise instead of at zero, the
+            // snr_ok guard below can finally tell a signal from the band.
+            if self.settle > 0 {
+                self.settle -= 1;
+                continue;
+            }
+            if !self.have_env {
+                self.peak = env;
+                self.floor = env;
+                self.have_env = true;
+            }
+
             if env > self.peak {
                 self.peak = env;
             } else {
                 self.peak += (env - self.peak) * self.peak_decay;
             }
-            if env < self.floor {
-                self.floor += (env - self.floor) * self.floor_decay;
-            } else {
-                self.floor += (env - self.floor) * self.floor_attack;
+            // The floor is the band, so it is measured from the band: only
+            // while the key is up, and as an average rather than a chase of
+            // the minima. Tracking minima put it well below the noise, which
+            // left the thresholds — struck as fractions of peak-minus-floor
+            // — sitting inside the noise, so an empty frequency keyed the
+            // slicer and spelled letters. A fast path down remains, or a
+            // signal fading out would strand the floor at its level.
+            if !self.key_down {
+                let a = if env < self.floor {
+                    self.floor_decay
+                } else {
+                    self.floor_attack
+                };
+                self.floor += (env - self.floor) * a;
             }
 
             let span = (self.peak - self.floor).max(1e-9);
             let on_thr = self.floor + 0.52 * span;
             let off_thr = self.floor + 0.32 * span;
-            let snr_ok = self.peak > 2.2 * self.floor.max(1e-9);
+            // Noise is not flat: the envelope of a Rayleigh-distributed band
+            // peaks 2.5-3x its own mean over the peak tracker's window, so a
+            // 2.2x gate let an empty frequency key the slicer and spell a
+            // phantom letter before every transmission. 2.8x clears that
+            // while the post-mix filter's narrower noise bandwidth keeps a
+            // real signal well above it — measured flat to 10 dB and 90%+ at
+            // 6 dB, where 3.2x and above start costing weak copy.
+            let snr_ok = self.peak > 2.8 * self.floor.max(1e-9);
 
             let next = if self.key_down {
                 env > off_thr
@@ -629,9 +943,22 @@ impl Decoder for CwDecoder {
                 if self.idle > 8.0 * self.dit && !self.symbol.is_empty() {
                     self.push_symbol();
                 }
-                // New station after a pause: learn their speed quickly.
+                // A pause this long means the next thing heard is very
+                // likely a different station: hold their first elements and
+                // re-learn the clock rather than reading them against the
+                // last operator's speed.
                 if self.idle > 1.6 * self.env_rate {
                     self.acquire = self.acquire.max(12);
+                    if !self.warming {
+                        self.push_symbol();
+                        self.warming = true;
+                    }
+                }
+                // Whatever is still held when the band goes quiet has to be
+                // released, or a short transmission is never shown at all.
+                if self.warming && !self.warmup.is_empty() && self.idle > 3.0 * self.env_rate {
+                    self.flush_warmup();
+                    self.warming = true;
                 }
             }
         }

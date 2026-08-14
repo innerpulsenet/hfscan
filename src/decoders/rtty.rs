@@ -267,7 +267,9 @@ const LTRS: [char; 32] = [
 #[rustfmt::skip]
 const FIGS: [char; 32] = [
     '\0', '3', '\0', '-', ' ', '\'', '8', '7',
-    '\0', '$', '4', '\u{7}', ',', '!', ':', '(',
+    // Index 3 is BELL in Baudot; it is dropped rather than emitted, since a
+    // control character in the transcript corrupts the terminal grid.
+    '\0', '$', '4', '\0', ',', '!', ':', '(',
     '5',  '"', ')', '2', '#', '6', '0', '1',
     '9',  '?', '&', '\0', '.', '/', ';', '\0',
 ];

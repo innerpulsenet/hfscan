@@ -131,7 +131,15 @@ impl Psk31Decoder {
         let lpf_a = 1.0 - (-2.0 * PI * 60.0 / fs).exp();
         let mut varicode = HashMap::with_capacity(128);
         for (i, code) in VARICODE.iter().enumerate() {
-            varicode.insert(*code, i as u8 as char);
+            // Only the printable half of the table is mapped. Noise decodes
+            // to random varicode, and the control codes it lands on (ESC,
+            // BEL, CR, the C0 block) would go straight through to the
+            // terminal and corrupt the display. An unmapped code emits
+            // nothing at all, which is the honest result for noise anyway.
+            let c = i as u8 as char;
+            if c == '\n' || (' '..='~').contains(&c) {
+                varicode.insert(*code, c);
+            }
         }
         Self {
             fs,

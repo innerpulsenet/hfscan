@@ -24,7 +24,7 @@ use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use report::{is_callsign, Reporter};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -110,6 +110,58 @@ const AUTO_FLUSH_SECS: f64 = 2.0;
 /// station is not silent for the minute it takes to fill a screen line.
 const AUTO_LINE: usize = 48;
 
+/// Longest transcript the auto pane keeps. Rows are fixed-height, so this is
+/// also how far back the pane can be scrolled.
+const DECODE_LOG_MAX: usize = 800;
+
+/// One line of copy from one automatic decoder, kept in columns.
+///
+/// Keeping the pieces apart is what makes the pane both structured (the
+/// frequency and mode columns line up, and are coloured per mode) and safe to
+/// scroll: every entry renders to exactly one row, so the row count is known
+/// without measuring text, and the viewport can never disagree with the
+/// scroll offset about how tall the content is.
+#[derive(Clone)]
+struct DecodeEntry {
+    /// UTC hh:mm:ss when the line was emitted.
+    stamp: String,
+    /// Where the copy was heard. Zero for the scanner's own remarks, which
+    /// render without the frequency and mode columns.
+    dial_hz: f64,
+    kind: identify::Kind,
+    mode: &'static str,
+    /// Already sanitised: printable, no control characters, no newlines.
+    text: String,
+}
+
+/// Strip anything that would corrupt the terminal grid out of decoder output.
+///
+/// Demodulators fed noise produce arbitrary bytes. Escape sequences, C0/C1
+/// controls, zero-width and combining characters all render as fewer (or
+/// more) cells than the layout assumed, which shifts every following cell and
+/// leaves the frame's own border characters in the wrong columns — the damage
+/// then persists frame to frame. Everything kept here occupies exactly one
+/// cell. Newlines are dropped: callers split on them first.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            ' '..='~' => c,
+            // Punctuation a decoder may legitimately produce, plus the few
+            // marks the scanner writes into its own remarks. All single-cell.
+            '°' | '±' | 'µ' | '→' | '←' | '—' | '–' | '…' | '·' => c,
+            _ => ' ',
+        })
+        .collect()
+}
+
+/// `sanitize` for a whole transcript, keeping line structure intact.
+fn sanitize_text(s: &str) -> String {
+    s.split('\n')
+        .map(sanitize)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// One automatically tuned decoder inside the current span.
 ///
 /// `Mode::Auto` runs a fleet of these instead of the single cursor-following
@@ -170,10 +222,6 @@ impl AutoSlot {
             _ => 120.0,
         };
         self.kind == kind && (self.dial_hz - dial_hz).abs() < slack
-    }
-
-    fn label(&self) -> String {
-        format!("{:>9.1} {:<4}", self.dial_hz / 1000.0, self.decoder.name())
     }
 }
 
@@ -373,6 +421,10 @@ struct App {
     decoder: Option<Box<dyn Decoder>>,
     chain: DecodeChain,
     text: String,
+    /// One row per line of copy in `Mode::Auto`, newest last. Auto mode has
+    /// many decoders talking at once, so its output is kept as records with
+    /// their own columns rather than folded into the flat transcript.
+    decode_log: VecDeque<DecodeEntry>,
     /// Structured FT8/FT4 decodes, newest last; drives the FT panes.
     ft_msgs: VecDeque<FtMessage>,
     /// Stations heard, in first-heard order so the list updates in place.
@@ -382,6 +434,11 @@ struct App {
     /// Scroll offsets: transcript lines up from live, stations/slots skipped,
     /// waterfall entries back in time. Zero means pinned to live.
     msg_scroll: usize,
+    /// Rows the decode pane last drew with. The scroll clamp needs the
+    /// viewport height, which only the renderer knows; recording it here
+    /// keeps the offset and what is on screen from disagreeing about how far
+    /// back the copy goes.
+    msg_rows: std::cell::Cell<usize>,
     st_scroll: usize,
     act_scroll: usize,
     wf_scroll: usize,
@@ -550,10 +607,12 @@ impl App {
             decoder: None,
             chain: DecodeChain::new(rate, 400.0, Mode::Off.audio_rate()),
             text: String::new(),
+            decode_log: VecDeque::new(),
             ft_msgs: VecDeque::new(),
             stations: Vec::new(),
             decode_zoom: 0,
             msg_scroll: 0,
+            msg_rows: std::cell::Cell::new(0),
             st_scroll: 0,
             act_scroll: 0,
             wf_scroll: 0,
@@ -599,6 +658,8 @@ impl App {
         self.apply_rx_filter();
         self.ft_msgs.clear();
         self.stations.clear();
+        self.decode_log.clear();
+        self.msg_scroll = 0;
         self.st_scroll = 0;
         self.act_scroll = 0;
         self.psk_hits.clear();
@@ -682,6 +743,46 @@ impl App {
         Duration::from_millis(WF_INTERVALS_MS[self.wf_idx])
     }
 
+    /// How many lines of copy the decode pane could show, at most.
+    ///
+    /// Auto mode's log is one line per entry; the flat transcript is measured
+    /// unwrapped, which under-counts on a narrow pane but is still a real
+    /// bound — the render clamps the offset to the wrapped length anyway.
+    fn transcript_len(&self) -> usize {
+        match self.mode {
+            Mode::Auto => self.decode_log.len(),
+            // In FT modes the same offset scrolls the message table.
+            Mode::Ft8 | Mode::Ft4 => self.ft_msgs.len(),
+            _ => self.text.lines().count(),
+        }
+    }
+
+    /// Move the decode pane up (positive) or down (negative), clamped to the
+    /// copy that actually exists above the viewport. Letting the offset run
+    /// past the top is what makes a scrolled-back pane take dozens of dead
+    /// keypresses to get back to live, and puts a nonsense count in the title.
+    fn scroll_transcript(&mut self, delta: isize) {
+        let max = self.transcript_len().saturating_sub(self.msg_rows.get());
+        let next = self.msg_scroll as isize + delta;
+        self.msg_scroll = next.clamp(0, max as isize) as usize;
+    }
+
+    /// Put a remark of the scanner's own — a scan summary, a state change —
+    /// into the auto transcript, so it reads in sequence with the copy around
+    /// it rather than vanishing when auto mode stops showing `text`.
+    fn push_decode_note(&mut self, text: String) {
+        self.decode_log.push_back(DecodeEntry {
+            stamp: utc_stamp(),
+            dial_hz: 0.0,
+            kind: identify::Kind::Unknown,
+            mode: "",
+            text: sanitize(&text),
+        });
+        while self.decode_log.len() > DECODE_LOG_MAX {
+            self.decode_log.pop_front();
+        }
+    }
+
     fn log(&mut self, msg: String) {
         self.log.push_back(msg.clone());
         while self.log.len() > 6 {
@@ -706,7 +807,8 @@ impl App {
     /// into the transcript, each line tagged with the frequency it came from.
     fn feed_auto(&mut self, block: &[Complex32]) {
         let soft = self.agc == AgcMode::Soft;
-        let mut lines: Vec<String> = Vec::new();
+        let stamp = utc_stamp();
+        let mut lines: Vec<DecodeEntry> = Vec::new();
         // (message, dial, mode) — spotting needs `&self.reporter`, so it
         // cannot happen while `self.auto` is mutably borrowed.
         let mut spots: Vec<(FtMessage, f64, &'static str)> = Vec::new();
@@ -717,13 +819,20 @@ impl App {
                 slot.agc.process(&mut slot.audio);
             }
             let text = slot.decoder.process(&slot.audio);
-            let tag = slot.label();
+            let (dial_hz, kind, mode) = (slot.dial_hz, slot.kind, slot.decoder.name());
+            let row = |text: String| DecodeEntry {
+                stamp: stamp.clone(),
+                dial_hz,
+                kind,
+                mode,
+                text: sanitize(&text),
+            };
 
             // Slot-based modes hand back whole lines already; the
             // character-at-a-time modes need collecting into readable ones.
             if matches!(slot.kind, identify::Kind::Ft8 | identify::Kind::Ft4) {
                 for m in slot.decoder.take_messages() {
-                    lines.push(format!("{tag}  {}", m.format()));
+                    lines.push(row(m.format()));
                     spots.push((m, slot.dial_hz, slot.decoder.name()));
                 }
             } else {
@@ -743,7 +852,7 @@ impl App {
                     let line: String = slot.partial.drain(..=i).collect();
                     let line = line.trim_end().to_string();
                     if !line.is_empty() {
-                        lines.push(format!("{tag}  {line}"));
+                        lines.push(row(line));
                     }
                 }
                 let idle = slot.quiet as f64 >= AUTO_FLUSH_SECS * slot.chain.fs_out();
@@ -756,29 +865,37 @@ impl App {
                         .nth(AUTO_LINE * 2)
                         .map_or(slot.partial.len(), |(i, _)| i);
                     let line: String = slot.partial.drain(..take).collect();
-                    lines.push(format!("{tag}  {}", line.trim_end()));
+                    lines.push(row(line.trim_end().to_string()));
                 }
             }
         }
 
+        // A row of nothing but spaces survives sanitising but says nothing.
+        let mut added = 0usize;
         for line in lines {
-            self.text.push_str(&line);
-            self.text.push('\n');
+            if line.text.trim().is_empty() {
+                continue;
+            }
+            self.decode_log.push_back(line);
+            added += 1;
         }
-        if self.text.len() > 8000 {
-            let cut = self.text.len() - 6000;
-            // Never split a UTF-8 character when trimming the transcript.
-            let cut = (cut..self.text.len())
-                .find(|i| self.text.is_char_boundary(*i))
-                .unwrap_or(self.text.len());
-            self.text = self.text[cut..].to_string();
+        while self.decode_log.len() > DECODE_LOG_MAX {
+            self.decode_log.pop_front();
+        }
+        // Scrolled-back readers stay on the line they were reading as new
+        // copy arrives underneath them, instead of being dragged along.
+        if self.msg_scroll > 0 && added > 0 {
+            self.scroll_transcript(added as isize);
         }
         if let Some(r) = &self.reporter {
             for (m, dial, mode) in &spots {
                 r.spot(m, *dial, mode);
             }
         }
-        for (m, _, _) in spots {
+        for (mut m, _, _) in spots {
+            // PSK31 spots reach this table too, and their text comes straight
+            // off a demodulator that may have been listening to noise.
+            m.text = sanitize(&m.text);
             self.update_stations(&m);
             self.ft_msgs.push_back(m);
         }
@@ -1043,10 +1160,15 @@ impl App {
             if let Some(d) = &mut self.decoder {
                 let new = if open { d.process(out) } else { String::new() };
                 if !new.is_empty() {
-                    self.text.push_str(&new);
-                    // Keep the transcript bounded.
+                    // Never let raw demodulator bytes reach the terminal.
+                    self.text.push_str(&sanitize_text(&new));
+                    // Keep the transcript bounded, without splitting a
+                    // character in half at the cut.
                     if self.text.len() > 8000 {
                         let cut = self.text.len() - 6000;
+                        let cut = (cut..self.text.len())
+                            .find(|i| self.text.is_char_boundary(*i))
+                            .unwrap_or(self.text.len());
                         self.text = self.text[cut..].to_string();
                     }
                 }
@@ -1344,6 +1466,7 @@ fn run_app<B: Backend>(
                     }
                     KeyCode::Char('x') => {
                         app.text.clear();
+                        app.decode_log.clear();
                         app.ft_msgs.clear();
                         app.stations.clear();
                         app.msg_scroll = 0;
@@ -1355,11 +1478,11 @@ fn run_app<B: Backend>(
                     }
                     KeyCode::Up => {
                         let n = if shift { 10 } else { 1 };
-                        app.msg_scroll = app.msg_scroll.saturating_add(n);
+                        app.scroll_transcript(n as isize);
                     }
                     KeyCode::Down => {
                         let n = if shift { 10 } else { 1 };
-                        app.msg_scroll = app.msg_scroll.saturating_sub(n);
+                        app.scroll_transcript(-(n as isize));
                     }
                     KeyCode::Char('W') => {
                         app.wf_res = app.wf_res.next();
@@ -1493,19 +1616,19 @@ fn scroll_pane_at(app: &mut App, area: Rect, col: u16, row: u16, delta: isize) {
             if inside(cols[0]) {
                 adj(&mut app.act_scroll);
             } else if inside(cols[1]) {
-                adj(&mut app.msg_scroll);
+                app.scroll_transcript(delta);
             } else {
                 adj(&mut app.st_scroll);
             }
         } else if matches!(app.mode, Mode::Cw | Mode::Psk31) {
             let cols = cw_cols(chunks[3]);
             if inside(cols[1]) {
-                adj(&mut app.msg_scroll);
+                app.scroll_transcript(delta);
             } else if inside(cols[2]) {
                 adj(&mut app.st_scroll);
             }
         } else {
-            adj(&mut app.msg_scroll);
+            app.scroll_transcript(delta);
         }
     } else if inside(chunks[2]) {
         adj(&mut app.wf_scroll);
@@ -2146,11 +2269,15 @@ fn step_scan(app: &mut App) -> Option<bool> {
             results.dedup_by(|a, b| (a.freq - b.freq).abs() < 40.0);
             app.text
                 .push_str(&format!("\n--- {label} scan (low → high) ---\n"));
+            app.push_decode_note(format!("--- {label} scan (low → high) ---"));
             for h in results.iter() {
-                app.text
-                    .push_str(&format!("{:>10.3} kHz  q={:.0}%\n", h.freq / 1000.0, h.score));
+                let row = format!("{:>10.3} kHz  q={:.0}%", h.freq / 1000.0, h.score);
+                app.text.push_str(&row);
+                app.text.push('\n');
+                app.push_decode_note(row);
             }
             app.text.push_str(&format!("--- end of {label} scan ---\n"));
+            app.push_decode_note(format!("--- end of {label} scan ---"));
             app.log(format!("{label} scan: {} signal(s)", results.len()));
             if let Some(first) = results.first() {
                 let f = first.freq;
@@ -2190,6 +2317,7 @@ fn step_scan(app: &mut App) -> Option<bool> {
             });
             results.dedup_by(|a, b| (a.freq - b.freq).abs() < 200.0);
             app.text.push_str("\n--- scan results (strongest first) ---\n");
+            app.push_decode_note("--- scan results (strongest first) ---".into());
             for h in results.iter().take(25) {
                 let marker = bands::MARKERS
                     .iter()
@@ -2197,14 +2325,18 @@ fn step_scan(app: &mut App) -> Option<bool> {
                     .map(|m| m.label)
                     .unwrap_or("");
                 let kind = if h.label.is_empty() { marker } else { h.label };
-                app.text.push_str(&format!(
-                    "{:>10.3} kHz  {:5.1} dB  {}\n",
+                let row = format!(
+                    "{:>10.3} kHz  {:5.1} dB  {}",
                     h.freq / 1000.0,
                     h.score,
                     kind
-                ));
+                );
+                app.text.push_str(&row);
+                app.text.push('\n');
+                app.push_decode_note(row);
             }
             app.text.push_str("--- end of scan ---\n");
+            app.push_decode_note("--- end of scan ---".into());
             let n = results.iter().filter(|h| !h.label.is_empty()).count();
             app.log(format!("scan complete — {n} labelled"));
         }
@@ -2737,9 +2869,13 @@ fn draw_activity(f: &mut Frame, area: Rect, app: &App) {
         if room > 8 {
             let sep = if used == 0 { "" } else { " │ " };
             let budget = room.saturating_sub(sep.len());
-            let mut text = note.text.clone();
-            if text.len() > budget {
-                text.truncate(budget.saturating_sub(1));
+            // Measured and cut in cells, not bytes: a byte-index truncate can
+            // split a character and leaves the status line wider than the room
+            // it was given, which pushes the frame's own border off the grid.
+            let note_text = sanitize(&note.text);
+            let mut text = note_text.clone();
+            if note_text.chars().count() > budget {
+                text = note_text.chars().take(budget.saturating_sub(1)).collect();
                 text.push('…');
             }
             spans.push(Span::styled(sep, Style::default().fg(Color::DarkGray)));
@@ -3214,8 +3350,14 @@ fn draw_waterfall(f: &mut Frame, area: Rect, app: &App) {
 /// unless `scroll` (lines up from live) says otherwise. In FT mode CQ calls
 /// are highlighted.
 fn transcript_lines(app: &App, width: usize, rows: usize, ft: bool) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    app.msg_rows.set(rows);
     let mut wrapped: Vec<String> = Vec::new();
     for line in app.text.split('\n') {
+        // Sanitising here as well as at ingestion keeps a decoder that is
+        // added later from being able to corrupt the grid, and guarantees one
+        // char is one cell so this hard wrap matches what is drawn.
+        let line = sanitize(line);
         if line.is_empty() {
             wrapped.push(String::new());
             continue;
@@ -3278,12 +3420,97 @@ fn draw_decode(f: &mut Frame, area: Rect, app: &App) {
             app.msg_scroll
         );
     }
+    // A title wider than the box overruns the top border and takes the frame
+    // with it, so it is cut to what the border can hold.
+    let cap = area.width.saturating_sub(2) as usize;
+    if title.chars().count() > cap {
+        title = title.chars().take(cap).collect();
+    }
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
-    let body = transcript_lines(app, inner.width.max(1) as usize, inner.height as usize, false);
-    f.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+    if app.mode == Mode::Auto {
+        f.render_widget(Paragraph::new(decode_log_lines(app, inner)), inner);
+        return;
+    }
+    let body = transcript_lines(app, inner.width as usize, inner.height as usize, false);
+    f.render_widget(Paragraph::new(body), inner);
+}
+
+/// The automatic transcript as fixed columns: time, frequency, mode, copy.
+///
+/// Every entry is exactly one row, truncated rather than wrapped, so the
+/// pane's height in rows is its length in entries. That is what makes the
+/// scroll offset unambiguous, and it means no line can ever spill past the
+/// right-hand border. Wide readers get the time column; narrow ones lose it
+/// before the copy itself is squeezed.
+fn decode_log_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
+    let rows = inner.height as usize;
+    let width = inner.width as usize;
+    app.msg_rows.set(rows);
+    let total = app.decode_log.len();
+    let max = total.saturating_sub(rows);
+    let start = total.saturating_sub(rows + app.msg_scroll.min(max));
+    let end = (start + rows).min(total);
+
+    let show_time = width >= 46;
+    // time (8) + gap, freq (9) + gap, mode (4) + two gaps before the copy.
+    let head = if show_time { 9 + 10 + 6 } else { 10 + 6 };
+    let copy_width = width.saturating_sub(head).max(8);
+
+    let dim = Style::default().fg(Color::DarkGray);
+    if total == 0 {
+        let hint = if show_time {
+            "  time      kHz  mode  copy"
+        } else {
+            "       kHz  mode  copy"
+        };
+        return vec![Line::from(Span::styled(hint, dim))];
+    }
+    app.decode_log
+        .iter()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .map(|e| {
+            let (r, g, b) = ident_rgb(e.kind);
+            let mut spans: Vec<Span<'static>> = Vec::with_capacity(6);
+            if show_time {
+                spans.push(Span::styled(format!("{} ", e.stamp), dim));
+            }
+            if e.dial_hz > 0.0 {
+                spans.push(Span::styled(
+                    format!("{:>9.1} ", e.dial_hz / 1000.0),
+                    Style::default().fg(Color::Gray),
+                ));
+                spans.push(Span::styled(
+                    format!("{:<4}  ", e.mode),
+                    Style::default().fg(Color::Rgb(r, g, b)),
+                ));
+            } else {
+                // The scanner's own remarks keep the copy column aligned but
+                // leave the frequency and mode columns empty.
+                spans.push(Span::raw(" ".repeat(16)));
+            }
+            let mut copy: String = e.text.chars().take(copy_width).collect();
+            if e.text.chars().count() > copy_width && copy_width > 1 {
+                copy.pop();
+                copy.push('…');
+            }
+            let style = if e.dial_hz <= 0.0 {
+                dim
+            } else if e.text.starts_with("CQ") || e.text.contains(" CQ ") {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            spans.push(Span::styled(copy, style));
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn cw_cols(area: Rect) -> [Rect; 3] {
@@ -3371,7 +3598,7 @@ fn draw_cw_text(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     let body = transcript_lines(app, inner.width.max(1) as usize, inner.height as usize, false);
-    f.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+    f.render_widget(Paragraph::new(body), inner);
 }
 
 fn draw_cw_tuner(f: &mut Frame, area: Rect, app: &App, view: Option<&CwView>) {
@@ -3834,6 +4061,7 @@ fn draw_ft_messages(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let rows = inner.height as usize - 1; // one row for the column header
+    app.msg_rows.set(rows);
     let w = inner.width as usize;
 
     // One structured line per decode: clear UTC time, SNR, timing offset and
@@ -3916,6 +4144,12 @@ fn utc_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Current UTC time as hh:mm:ss, for stamping lines of copy.
+fn utc_stamp() -> String {
+    let s = utc_secs() as i64 % 86400;
+    format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+}
+
 /// hhmmss (as stamped on a slot) to seconds of day.
 fn stamp_secs(stamp: &str) -> i64 {
     let field = |r: std::ops::Range<usize>| stamp.get(r).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
@@ -3976,6 +4210,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("  ← →         tune by one step   (shift: 10 steps)"),
         Line::from("  ↑ / ↓       scroll the decode transcript (shift: 10 lines)"),
+        Line::from("              auto mode lists time, kHz, mode, then the copy"),
         Line::from("  wheel       scroll the pane under the mouse (waterfall too)"),
         Line::from("  z / Z       zoom in / out — also sets the tuning step"),
         Line::from("  n / N       next / previous signal (CW/PSK31: confirmed)"),
@@ -4059,7 +4294,7 @@ mod tests {
         }
     }
 
-    use super::{identify, AutoSlot, MAX_AUTO_SLOTS};
+    use super::{identify, MAX_AUTO_SLOTS};
     use num_complex::Complex32;
     use std::time::{Duration, Instant};
 
@@ -4175,17 +4410,24 @@ mod tests {
     /// frequencies that no longer exist.
     #[test]
     fn auto_slot_labels_carry_the_frequency_and_mode() {
-        let slot = AutoSlot::new(
-            identify::Kind::Cw,
-            7_033_250.0,
-            7_030_000.0,
-            192_000.0,
-            false,
-        )
-        .expect("CW slot");
-        let label = slot.label();
-        assert!(label.contains("7033.2") || label.contains("7033.3"), "{label}");
-        assert!(label.contains("CW"), "{label}");
+        let mut app = App::new(7_030_000.0, 192_000.0, Mode::Auto);
+        app.decode_log.push_back(super::DecodeEntry {
+            stamp: "12:34:56".into(),
+            dial_hz: 7_033_250.0,
+            kind: identify::Kind::Cw,
+            mode: "CW",
+            text: "CQ DE W1AW".into(),
+        });
+        let rect = ratatui::layout::Rect::new(0, 0, 80, 4);
+        let line = &super::decode_log_lines(&app, rect)[0];
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            rendered.contains("7033.2") || rendered.contains("7033.3"),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("CW"), "{rendered:?}");
+        assert!(rendered.contains("12:34:56"), "{rendered:?}");
+        assert!(rendered.contains("CQ DE W1AW"), "{rendered:?}");
     }
 
     /// Keyed CW at `tone_hz` off the span centre, sending `text` at `wpm`.
@@ -4279,27 +4521,30 @@ mod tests {
         }
 
         assert!(
-            !app.text.is_empty(),
+            !app.decode_log.is_empty(),
             "auto mode decoded nothing from a clean CW signal"
         );
-        // Every line names the frequency and mode it came from.
-        for line in app.text.lines().filter(|l| !l.trim().is_empty()) {
-            let tag: Vec<&str> = line.split_whitespace().take(2).collect();
+        // Every entry carries the frequency and mode it came from, and its
+        // copy is printable — nothing that could corrupt the terminal grid.
+        for e in &app.decode_log {
+            assert!(e.dial_hz > 0.0 && !e.mode.is_empty(), "untagged entry");
             assert!(
-                tag.len() == 2 && tag[0].parse::<f64>().is_ok(),
-                "transcript line is not tagged with frequency and mode: {line:?}"
+                e.text.chars().all(|c| (' '..='~').contains(&c)),
+                "unprintable copy reached the transcript: {:?}",
+                e.text
             );
         }
         let ours: String = app
-            .text
-            .lines()
-            .filter(|l| l.contains("7033.0"))
+            .decode_log
+            .iter()
+            .filter(|e| (e.dial_hz - 7_033_000.0).abs() < 100.0)
+            .map(|e| e.text.as_str())
             .collect::<Vec<_>>()
             .join(" ");
         assert!(
             !ours.is_empty(),
-            "nothing from the signal's own frequency; transcript was {:?}",
-            app.text
+            "nothing from the signal's own frequency; heard {:?}",
+            app.decode_log.iter().map(|e| e.dial_hz).collect::<Vec<_>>()
         );
         assert!(
             ours.contains("CQ") || ours.contains("W1AW") || ours.contains("DE"),
@@ -4530,6 +4775,110 @@ mod tests {
     }
 
     /// Scrolling the transcript shows older lines; zero stays pinned to live.
+    /// A decoder fed noise emits arbitrary bytes. If an escape sequence or a
+    /// zero-width character reaches the terminal the grid shifts, the frame's
+    /// own borders land in the wrong columns, and the damage compounds frame
+    /// after frame. Nothing that leaves the auto pane may be more or less
+    /// than one cell wide.
+    #[test]
+    fn hostile_decoder_output_cannot_corrupt_the_grid() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
+        let junk = "\u{1b}[2J\u{1b}[31mRED\u{7}\r\n\u{0}\u{200b}\u{feff}日本語\ttab";
+        for i in 0..40 {
+            app.decode_log.push_back(super::DecodeEntry {
+                stamp: "12:34:56".into(),
+                dial_hz: 14_070_000.0 + i as f64,
+                kind: identify::Kind::Psk31,
+                mode: "PSK",
+                text: super::sanitize(junk),
+            });
+        }
+        // And a line far longer than any pane is wide.
+        app.decode_log.push_back(super::DecodeEntry {
+            stamp: "12:34:57".into(),
+            dial_hz: 14_074_000.0,
+            kind: identify::Kind::Cw,
+            mode: "CW",
+            text: "X".repeat(500),
+        });
+
+        for (w, h) in [(80u16, 24u16), (40, 12), (200, 60)] {
+            for scroll in [0usize, 7, 9999] {
+                app.msg_scroll = scroll;
+                let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+                t.draw(|f| super::draw(f, &app)).unwrap();
+                let buf = t.backend().buffer();
+                for y in 0..h {
+                    for x in 0..w {
+                        let sym = buf[(x, y)].symbol();
+                        assert_eq!(
+                            sym.chars().count(),
+                            1,
+                            "cell ({x},{y}) is not one character: {sym:?}"
+                        );
+                        let c = sym.chars().next().unwrap();
+                        assert!(
+                            !c.is_control(),
+                            "control character reached cell ({x},{y}): {c:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Scrolling the auto pane must never move content past its own border,
+    /// and must come back to live in as many steps as it went up.
+    #[test]
+    fn auto_pane_scrolls_within_its_bounds() {
+        let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
+        for i in 0..50 {
+            app.decode_log.push_back(super::DecodeEntry {
+                stamp: "00:00:00".into(),
+                dial_hz: 14_070_000.0,
+                kind: identify::Kind::Cw,
+                mode: "CW",
+                text: format!("line {i}"),
+            });
+        }
+        let rect = ratatui::layout::Rect::new(0, 0, 60, 5);
+        let text_of = |l: &super::Line| {
+            l.spans.iter().map(|s| s.content.to_string()).collect::<String>()
+        };
+
+        let live = super::decode_log_lines(&app, rect);
+        assert_eq!(live.len(), 5);
+        assert!(text_of(live.last().unwrap()).ends_with("line 49"));
+        // Nothing renders wider than the pane it is drawn into.
+        for l in &live {
+            assert!(text_of(l).chars().count() <= 60, "{:?}", text_of(l));
+        }
+
+        app.scroll_transcript(10);
+        let up = super::decode_log_lines(&app, rect);
+        assert!(text_of(up.last().unwrap()).ends_with("line 39"));
+
+        // Scrolling past the top clamps, so one keypress-worth of down-scroll
+        // moves rather than burning off a nonsense offset.
+        for _ in 0..200 {
+            app.scroll_transcript(10);
+        }
+        // The clamp stops exactly where the oldest line reaches the top row.
+        assert_eq!(app.msg_scroll, app.decode_log.len() - 5);
+        let top = super::decode_log_lines(&app, rect);
+        assert!(text_of(top.first().unwrap()).ends_with("line 0"));
+        app.scroll_transcript(-10);
+        let back = super::decode_log_lines(&app, rect);
+        assert!(
+            text_of(back.first().unwrap()).ends_with("line 10"),
+            "{:?}",
+            text_of(back.first().unwrap())
+        );
+    }
+
     #[test]
     fn transcript_scrolls() {
         let mut app = App::new(14_074_000.0, 192_000.0, Mode::Off);
@@ -4581,3 +4930,4 @@ mod tests {
         assert!(text.contains("14074.2"), "activity RF range missing:\n{text}");
     }
 }
+

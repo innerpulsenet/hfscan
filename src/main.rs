@@ -34,6 +34,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// A radio rate that divides evenly by both 8 kHz and 12 kHz, so every mode
 /// (including FT8/FT4) gets its exact audio rate.
 const FT_SAFE_RATE: f64 = 192_000.0;
+/// SoapySDRPlay3 maps 250 kS/s to its low-IF, 6 MS/s internally-decimated
+/// path. It is an optional acquisition mode because FT modes require an exact
+/// 12 kHz divisor and therefore return to `FT_SAFE_RATE`.
+const LOW_IF_RATE: f64 = 250_000.0;
 
 const WF_INTERVALS_MS: [u64; 5] = [100, 250, 500, 1000, 2000];
 
@@ -409,6 +413,13 @@ struct Args {
     /// Sample rate in Hz; this is also the width of the spectrum view
     #[arg(short, long, default_value_t = FT_SAFE_RATE)]
     rate: f64,
+    /// Prefer the SDRplay low-IF acquisition path (250 kS/s). FT8/FT4 still
+    /// switch to 192 kS/s so their audio clock remains exact.
+    #[arg(long)]
+    low_if: bool,
+    /// Receiver frequency correction in parts per million.
+    #[arg(long, default_value_t = 0.0)]
+    ppm: f64,
     /// FFT size (1024..32768); higher gives finer resolution
     #[arg(long, default_value_t = 8192)]
     fft: usize,
@@ -453,18 +464,44 @@ struct App {
     cursor: f64, // offset from centre, Hz
     zoom: f64,   // 1.0 = whole span; higher zooms in around the cursor
     gain: f64,
+    /// SDRplay gain reductions. Unlike `gain`, larger means *less* gain.
+    rfgr: f64,
+    ifgr: f64,
+    gain_control: radio::GainControl,
     agc: AgcMode,
+    agc_setpoint: i32,
     biast: bool,
+    rf_notch: bool,
+    rf_notch_auto: bool,
+    dab_notch: bool,
+    iq_correction: bool,
+    ppm: f64,
+    radio_driver: String,
+    radio_hardware: String,
+    radio_caps: Option<radio::Capabilities>,
+    actual_bandwidth: f64,
+    actual_rate: f64,
+    hardware_agc_actual: bool,
+    dropped_blocks: u64,
+    clipped_fraction: f64,
+    low_if: bool,
     smooth_idx: usize,
     rx_filter: RxFilter,
     soft_agc: SoftAgc,
     hw_trim_at: Instant,
     hw_hot: u32,
     hw_quiet: u32,
+    /// After adding IF gain, compare the measured wideband floor with the
+    /// commanded step. A near 1:1 response means external noise dominates and
+    /// further gain would only spend ADC headroom.
+    gain_probe: Option<(Instant, f32, f32)>,
+    external_noise_dominant: bool,
     band_idx: usize,
     /// Last hardware gain used on each HF band, so a hot band cannot
     /// starve the next one after `b`.
     band_gains: Vec<f64>,
+    band_rfgr: Vec<f64>,
+    band_ifgr: Vec<f64>,
 
     spectrum: Vec<f32>,
     noise_tracker: dsp::NoiseFloor,
@@ -555,6 +592,8 @@ struct App {
     pending_tune: Option<f64>,
     /// Slow hardware-gain nudge from the software AGC supervisor.
     pending_gain: Option<f64>,
+    pending_rfgr: Option<f64>,
+    pending_ifgr: Option<f64>,
 }
 
 /// How long a chip stays fully readable after the last classify hit.
@@ -652,16 +691,38 @@ impl App {
             cursor: 0.0,
             zoom: 1.0,
             gain: 36.0,
+            rfgr: 3.0,
+            ifgr: 40.0,
+            gain_control: radio::GainControl::Overall { min: 0.0, max: 48.0 },
             agc: AgcMode::Soft,
+            agc_setpoint: -30,
             biast: false,
+            rf_notch: false,
+            rf_notch_auto: true,
+            dab_notch: false,
+            iq_correction: true,
+            ppm: 0.0,
+            radio_driver: "unknown".into(),
+            radio_hardware: "unknown".into(),
+            radio_caps: None,
+            actual_bandwidth: rate,
+            actual_rate: rate,
+            hardware_agc_actual: false,
+            dropped_blocks: 0,
+            clipped_fraction: 0.0,
+            low_if: (rate - LOW_IF_RATE).abs() < 1.0,
             smooth_idx: 1, // medium
             rx_filter: RxFilter::Auto,
             soft_agc: SoftAgc::new(mode.audio_rate()),
             hw_trim_at: Instant::now(),
             hw_hot: 0,
             hw_quiet: 0,
+            gain_probe: None,
+            external_noise_dominant: false,
             band_idx: 0,
             band_gains: vec![36.0; bands::BANDS.len()],
+            band_rfgr: vec![3.0; bands::BANDS.len()],
+            band_ifgr: vec![40.0; bands::BANDS.len()],
             spectrum: Vec::new(),
             noise_tracker: dsp::NoiseFloor::new(),
             noise_floor: Vec::new(),
@@ -717,6 +778,8 @@ impl App {
             ident_at: Instant::now(),
             pending_tune: None,
             pending_gain: None,
+            pending_rfgr: None,
+            pending_ifgr: None,
         };
         app.set_mode(mode);
         app
@@ -768,20 +831,99 @@ impl App {
         self.chain.set_bandwidth(self.rx_bandwidth());
     }
 
-    /// Keep the ADC in a comfortable range without touching the spectrum
-    /// every block. Only runs in software-AGC mode, at most every 1.5 s.
-    fn supervise_hw_gain(&mut self, block: &[Complex32]) {
-        let mut peak = 0.0f32;
-        for s in block {
-            let m = s.re.abs().max(s.im.abs());
-            if m > peak {
-                peak = m;
+    fn queue_more_hw_gain(&mut self, measured_dbfs: f32) -> bool {
+        match self.gain_control {
+            radio::GainControl::Sdrplay {
+                rfgr_min,
+                ifgr_min,
+                ..
+            } => {
+                // IFGR is a calibrated dB reduction and is therefore the fine
+                // control. Preserve the RF/LNA state until IF trim is exhausted.
+                if self.ifgr > ifgr_min {
+                    let old = self.ifgr;
+                    self.ifgr = (self.ifgr - 2.0).max(ifgr_min);
+                    self.pending_ifgr = Some(self.ifgr);
+                    self.gain_probe = Some((Instant::now(), measured_dbfs, (old - self.ifgr) as f32));
+                    true
+                } else if self.rfgr > rfgr_min {
+                    self.rfgr = (self.rfgr - 1.0).max(rfgr_min);
+                    self.pending_rfgr = Some(self.rfgr);
+                    true
+                } else {
+                    false
+                }
+            }
+            radio::GainControl::Overall { max, .. } => {
+                let old = self.gain;
+                self.gain = (self.gain + 2.0).min(max);
+                self.pending_gain = Some(self.gain);
+                if self.gain > old {
+                    self.gain_probe = Some((Instant::now(), measured_dbfs, (self.gain - old) as f32));
+                    true
+                } else {
+                    false
+                }
             }
         }
-        if peak > 0.85 {
+    }
+
+    fn queue_less_hw_gain(&mut self) -> bool {
+        self.gain_probe = None;
+        self.external_noise_dominant = false;
+        match self.gain_control {
+            radio::GainControl::Sdrplay {
+                rfgr_max,
+                ifgr_max,
+                ..
+            } => {
+                // RFGR moves the LNA first, protecting the mixer from strong
+                // out-of-band stations; IFGR then supplies fine extra headroom.
+                if self.rfgr < rfgr_max {
+                    self.rfgr = (self.rfgr + 1.0).min(rfgr_max);
+                    self.pending_rfgr = Some(self.rfgr);
+                    true
+                } else if self.ifgr < ifgr_max {
+                    self.ifgr = (self.ifgr + 3.0).min(ifgr_max);
+                    self.pending_ifgr = Some(self.ifgr);
+                    true
+                } else {
+                    false
+                }
+            }
+            radio::GainControl::Overall { min, .. } => {
+                let old = self.gain;
+                self.gain = (self.gain - 3.0).max(min);
+                self.pending_gain = Some(self.gain);
+                self.gain < old
+            }
+        }
+    }
+
+    /// Keep the converter in a comfortable range using a robust high
+    /// percentile as well as the absolute peak. Rail-only detection reacts
+    /// after damage; a sustained hot percentile catches lost headroom first.
+    fn supervise_hw_gain(&mut self, block: &[Complex32]) {
+        let (peak, p999, rms_dbfs) = block_level_metrics(block);
+        let floor_dbfs = sampled_median(&self.noise_floor).unwrap_or(rms_dbfs);
+
+        if let Some((at, before, step)) = self.gain_probe
+            && at.elapsed() >= Duration::from_millis(1200)
+        {
+            let response = floor_dbfs - before;
+            self.external_noise_dominant = response >= step * 0.55;
+            if self.external_noise_dominant {
+                self.log(format!(
+                    "gain probe: floor followed {response:+.1} dB — external noise dominates"
+                ));
+            }
+            self.gain_probe = None;
+        }
+
+        if peak > 0.92 || p999 > 0.72 {
             self.hw_hot = self.hw_hot.saturating_add(1);
             self.hw_quiet = 0;
-        } else if peak < 0.04 {
+        } else if p999 < 0.08 {
             self.hw_quiet = self.hw_quiet.saturating_add(1);
             self.hw_hot = 0;
         } else {
@@ -791,18 +933,21 @@ impl App {
         if self.hw_trim_at.elapsed() < Duration::from_millis(1500) {
             return;
         }
-        if self.hw_hot >= 4 && self.gain > 2.0 {
-            self.gain = (self.gain - 3.0).max(0.0);
-            self.pending_gain = Some(self.gain);
+        if self.hw_hot >= 4 && self.queue_less_hw_gain() {
             self.hw_trim_at = Instant::now();
             self.hw_hot = 0;
-            self.log(format!("AGC: hardware gain {:+.0} dB (hot ADC)", self.gain));
-        } else if self.hw_quiet >= 12 && self.gain < 46.0 {
-            self.gain = (self.gain + 2.0).min(48.0);
-            self.pending_gain = Some(self.gain);
+            self.log(format!(
+                "AGC: less hardware gain (hot ADC: p99.9 {:.0}%)",
+                p999 * 100.0
+            ));
+        } else if self.hw_quiet >= 12
+            && !self.external_noise_dominant
+            && self.gain_probe.is_none()
+            && self.queue_more_hw_gain(floor_dbfs)
+        {
             self.hw_trim_at = Instant::now();
             self.hw_quiet = 0;
-            self.log(format!("AGC: hardware gain {:+.0} dB (quiet ADC)", self.gain));
+            self.log("AGC: more hardware gain (quiet converter)".into());
         }
     }
 
@@ -1451,6 +1596,47 @@ fn rate_ok_for_ft(rate: f64) -> bool {
     (d - d.round()).abs() < 1e-9 && d >= 1.0
 }
 
+/// Peak, 99.9th percentile component magnitude, and complex RMS in dBFS.
+/// Sampling every eighth point keeps this cheap while making it insensitive
+/// to one isolated impulse (the wideband blanker handles those separately).
+fn block_level_metrics(block: &[Complex32]) -> (f32, f32, f32) {
+    if block.is_empty() {
+        return (0.0, 0.0, -120.0);
+    }
+    let mut peak = 0.0f32;
+    let mut power = 0.0f64;
+    let mut levels = Vec::with_capacity(block.len() / 8 + 1);
+    for (i, s) in block.iter().enumerate() {
+        let m = s.re.abs().max(s.im.abs());
+        peak = peak.max(m);
+        power += s.norm_sqr() as f64;
+        if i % 8 == 0 {
+            levels.push(m);
+        }
+    }
+    levels.sort_unstable_by(f32::total_cmp);
+    let idx = ((levels.len() - 1) as f32 * 0.999).round() as usize;
+    let p999 = levels[idx.min(levels.len() - 1)];
+    let rms = (power / block.len() as f64).sqrt() as f32;
+    (peak, p999, 20.0 * rms.max(1e-6).log10())
+}
+
+fn sampled_median(values: &[f32]) -> Option<f32> {
+    if values.is_empty() {
+        return None;
+    }
+    let stride = (values.len() / 256).max(1);
+    let mut sampled: Vec<f32> = values.iter().step_by(stride).copied().collect();
+    sampled.sort_unstable_by(f32::total_cmp);
+    Some(sampled[sampled.len() / 2])
+}
+
+fn automatic_rf_notch(freq_hz: f64) -> bool {
+    // Keep the MW rejection network out when it would reject the wanted
+    // station. Above 2 MHz both MW and FM broadcast energy are out of band.
+    freq_hz >= 2_000_000.0
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     // Route SoapySDR's chatter into the `log` facade. With no logger installed
@@ -1458,13 +1644,17 @@ fn main() -> Result<()> {
     soapysdr::configure_logging();
 
     let mode = parse_mode(&args.mode);
-    let mut rate = args.rate;
+    let mut rate = if args.low_if { LOW_IF_RATE } else { args.rate };
     if needs_exact_audio(mode) && !rate_ok_for_ft(rate) {
         rate = FT_SAFE_RATE;
     }
 
     let radio = radio::spawn(args.device.clone(), rate, args.freq)?;
     let mut app = App::new(args.freq, rate, mode);
+    app.ppm = args.ppm;
+    if args.ppm.abs() >= 0.0001 {
+        let _ = radio.cmd.send(radio::Cmd::Ppm(args.ppm));
+    }
 
     // Station identity: CLI flags win over the config file.
     let (file_call, file_grid) = load_config();
@@ -1483,7 +1673,9 @@ fn main() -> Result<()> {
     } else {
         app.log("press o to set your callsign (enables pskreporter spotting)".into());
     }
-    if rate != args.rate {
+    if args.low_if && (rate - LOW_IF_RATE).abs() < 1.0 {
+        app.log("low-IF acquisition: 250000 Hz (SDRplay 6 MS/s decimated path)".into());
+    } else if rate != args.rate {
         app.log(format!("sample rate forced to {rate:.0} Hz for FT8/FT4"));
     }
     app.fft_idx = FFT_SIZES
@@ -1540,6 +1732,9 @@ fn run_app<B: Backend>(
         while let Ok(msg) = radio.log.try_recv() {
             app.log(msg);
         }
+        while let Ok(event) = radio.events.try_recv() {
+            apply_radio_event(app, event);
+        }
         while let Ok(msg) = app.rlog.try_recv() {
             app.log(msg);
         }
@@ -1554,6 +1749,12 @@ fn run_app<B: Backend>(
         }
         if let Some(g) = app.pending_gain.take() {
             let _ = radio.cmd.send(radio::Cmd::Gain(g));
+        }
+        if let Some(g) = app.pending_rfgr.take() {
+            let _ = radio.cmd.send(radio::Cmd::Rfgr(g));
+        }
+        if let Some(g) = app.pending_ifgr.take() {
+            let _ = radio.cmd.send(radio::Cmd::Ifgr(g));
         }
 
         if last_draw.elapsed() >= Duration::from_millis(50) {
@@ -1652,12 +1853,7 @@ fn run_app<B: Backend>(
                         let next = app.mode.next();
                         // FT8/FT4 need a radio rate that divides by 12 kHz.
                         if needs_exact_audio(next) && !rate_ok_for_ft(app.rate) {
-                            app.rate = FT_SAFE_RATE;
-                            let _ = radio.cmd.send(radio::Cmd::Rate(FT_SAFE_RATE));
-                            // The front end's time constants are in samples,
-                            // so its estimates belong to the old rate.
-                            app.front = dsp::FrontEnd::new(FT_SAFE_RATE);
-                            app.waterfall.clear();
+                            set_radio_rate(app, radio, FT_SAFE_RATE);
                             app.log(format!("sample rate -> {FT_SAFE_RATE:.0} Hz for FT"));
                         }
                         app.set_mode(next);
@@ -1704,6 +1900,19 @@ fn run_app<B: Backend>(
                         app.log(format!("waterfall: {what}"));
                     }
                     KeyCode::Char('a') => cycle_agc(app, radio),
+                    KeyCode::Char(';') => {
+                        if app.radio_caps.as_ref().is_some_and(|c| c.agc_setpoint) {
+                            app.agc_setpoint = match app.agc_setpoint {
+                                i if i <= -40 => -30,
+                                i if i <= -30 => -20,
+                                _ => -40,
+                            };
+                            let _ = radio.cmd.send(radio::Cmd::AgcSetpoint(app.agc_setpoint));
+                            app.log(format!("hardware AGC setpoint {} dBFS", app.agc_setpoint));
+                        } else {
+                            app.log("hardware AGC setpoint is not exposed by this backend".into());
+                        }
+                    }
                     KeyCode::Char('e') => {
                         app.smooth_idx = (app.smooth_idx + 1) % SMOOTH_LABELS.len();
                         app.log(format!(
@@ -1728,12 +1937,40 @@ fn run_app<B: Backend>(
                         app.biast = !app.biast;
                         let _ = radio.cmd.send(radio::Cmd::BiasT(app.biast));
                     }
+                    KeyCode::Char('m') => cycle_rf_notch(app, radio),
+                    KeyCode::Char('D') => {
+                        if app.radio_caps.as_ref().is_some_and(|c| c.dab_notch) {
+                            app.dab_notch = !app.dab_notch;
+                            let _ = radio.cmd.send(radio::Cmd::DabNotch(app.dab_notch));
+                        } else {
+                            app.log("DAB notch is not exposed by this backend".into());
+                        }
+                    }
+                    KeyCode::Char('I') => {
+                        if app.radio_caps.as_ref().is_some_and(|c| c.iq_correction) {
+                            app.iq_correction = !app.iq_correction;
+                            let _ = radio.cmd.send(radio::Cmd::IqCorrection(app.iq_correction));
+                        } else {
+                            app.log("driver IQ correction is not exposed by this backend".into());
+                        }
+                    }
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        if app.radio_caps.as_ref().is_some_and(|c| c.ppm) {
+                            let delta = if matches!(k.code, KeyCode::Char('Y')) { 0.1 } else { -0.1 };
+                            app.ppm = (app.ppm + delta).clamp(-100.0, 100.0);
+                            let _ = radio.cmd.send(radio::Cmd::Ppm(app.ppm));
+                            app.log(format!("frequency correction {:+.1} ppm", app.ppm));
+                        } else {
+                            app.log("frequency correction is not exposed by this backend".into());
+                        }
+                    }
+                    KeyCode::Char('h') => toggle_low_if(app, radio),
                     KeyCode::Char('+') | KeyCode::Char('=') => {
-                        app.gain = (app.gain + 2.0).min(48.0);
+                        adjust_manual_gain(app, true);
                         apply_agc_mode(app, radio, AgcMode::Off);
                     }
                     KeyCode::Char('-') => {
-                        app.gain = (app.gain - 2.0).max(0.0);
+                        adjust_manual_gain(app, false);
                         apply_agc_mode(app, radio, AgcMode::Off);
                     }
                     KeyCode::Char('k') => {
@@ -2163,23 +2400,183 @@ fn cycle_agc(app: &mut App, radio: &radio::Radio) {
     apply_agc_mode(app, radio, app.agc.next());
 }
 
+fn adjust_manual_gain(app: &mut App, more: bool) {
+    app.external_noise_dominant = false;
+    match app.gain_control {
+        radio::GainControl::Overall { min, max } => {
+            app.gain = (app.gain + if more { 2.0 } else { -2.0 }).clamp(min, max);
+        }
+        radio::GainControl::Sdrplay {
+            rfgr_min,
+            rfgr_max,
+            ifgr_min,
+            ifgr_max,
+        } => {
+            if more {
+                if app.ifgr > ifgr_min {
+                    app.ifgr = (app.ifgr - 2.0).max(ifgr_min);
+                } else {
+                    app.rfgr = (app.rfgr - 1.0).max(rfgr_min);
+                }
+            } else if app.rfgr < rfgr_max {
+                app.rfgr = (app.rfgr + 1.0).min(rfgr_max);
+            } else {
+                app.ifgr = (app.ifgr + 2.0).min(ifgr_max);
+            }
+        }
+    }
+}
+
+fn send_manual_gain(app: &App, radio: &radio::Radio) {
+    match app.gain_control {
+        radio::GainControl::Overall { .. } => {
+            let _ = radio.cmd.send(radio::Cmd::Gain(app.gain));
+        }
+        radio::GainControl::Sdrplay { .. } => {
+            let _ = radio.cmd.send(radio::Cmd::Rfgr(app.rfgr));
+            let _ = radio.cmd.send(radio::Cmd::Ifgr(app.ifgr));
+        }
+    }
+}
+
+fn cycle_rf_notch(app: &mut App, radio: &radio::Radio) {
+    if !app.radio_caps.as_ref().is_some_and(|c| c.rf_notch) {
+        app.log("RF/MW/FM notch is not exposed by this backend".into());
+        return;
+    }
+    if app.rf_notch_auto {
+        app.rf_notch_auto = false;
+        app.rf_notch = true;
+        app.log("RF notch forced on".into());
+    } else if app.rf_notch {
+        app.rf_notch = false;
+        app.log("RF notch forced off".into());
+    } else {
+        app.rf_notch_auto = true;
+        app.rf_notch = automatic_rf_notch(app.center);
+        app.log(format!(
+            "RF notch auto ({})",
+            if app.rf_notch { "on for HF" } else { "off for MW/LW" }
+        ));
+    }
+    let _ = radio.cmd.send(radio::Cmd::RfNotch(app.rf_notch));
+}
+
+fn set_radio_rate(app: &mut App, radio: &radio::Radio, rate: f64) {
+    app.rate = rate;
+    app.low_if = (rate - LOW_IF_RATE).abs() < 1.0;
+    let _ = radio.cmd.send(radio::Cmd::Rate(rate));
+    app.front = dsp::FrontEnd::new(rate);
+    app.noise_tracker = dsp::NoiseFloor::new();
+    app.waterfall.clear();
+    app.spectrum.clear();
+    app.smoothed.clear();
+    app.spec_work.clear();
+    app.wf_accum.clear();
+    app.auto.clear();
+    app.set_mode(app.mode);
+}
+
+fn toggle_low_if(app: &mut App, radio: &radio::Radio) {
+    if matches!(app.mode, Mode::Ft8 | Mode::Ft4 | Mode::Auto) {
+        app.log("low-IF mode is unavailable in FT/AUTO: those decoders require an exact 12 kHz clock".into());
+        return;
+    }
+    let rate = if app.low_if { FT_SAFE_RATE } else { LOW_IF_RATE };
+    set_radio_rate(app, radio, rate);
+    app.log(if app.low_if {
+        "acquisition: low-IF 250 kS/s (benchmark against zero-IF for your site)".into()
+    } else {
+        "acquisition: zero-IF 192 kS/s".into()
+    });
+}
+
+fn apply_radio_event(app: &mut App, event: radio::Event) {
+    match event {
+        radio::Event::Capabilities(caps) => {
+            app.radio_driver = caps.driver.clone();
+            app.radio_hardware = caps.hardware.clone();
+            app.gain_control = caps.gain.clone();
+            app.radio_caps = Some(caps);
+            let model = match app.gain_control {
+                radio::GainControl::Sdrplay { .. } => "split RFGR/IFGR",
+                radio::GainControl::Overall { .. } => "aggregate gain",
+            };
+            app.log(format!(
+                "receiver: {} / {} ({model})",
+                app.radio_driver, app.radio_hardware
+            ));
+        }
+        radio::Event::State(s) => {
+            if let Some(v) = s.agc {
+                app.hardware_agc_actual = v;
+            }
+            if let Some(v) = s.overall_gain {
+                app.gain = v;
+            }
+            if let Some(v) = s.rfgr {
+                app.rfgr = v;
+            }
+            if let Some(v) = s.ifgr {
+                app.ifgr = v;
+            }
+            if let Some(v) = s.agc_setpoint {
+                app.agc_setpoint = v;
+            }
+            if let Some(v) = s.rf_notch {
+                app.rf_notch = v;
+            }
+            if let Some(v) = s.dab_notch {
+                app.dab_notch = v;
+            }
+            if let Some(v) = s.iq_correction {
+                app.iq_correction = v;
+            }
+            if let Some(v) = s.ppm {
+                app.ppm = v;
+            }
+            if let Some(v) = s.bandwidth {
+                app.actual_bandwidth = v;
+            }
+            if let Some(v) = s.rate {
+                app.actual_rate = v;
+            }
+        }
+        radio::Event::StreamStats {
+            dropped_blocks,
+            clipped_fraction,
+        } => {
+            app.dropped_blocks = dropped_blocks;
+            app.clipped_fraction = clipped_fraction;
+        }
+    }
+}
+
 fn apply_agc_mode(app: &mut App, radio: &radio::Radio, mode: AgcMode) {
     app.agc = mode;
     match mode {
         AgcMode::Soft => {
             let _ = radio.cmd.send(radio::Cmd::Agc(false));
-            let _ = radio.cmd.send(radio::Cmd::Gain(app.gain));
+            send_manual_gain(app, radio);
             app.soft_agc.reset();
             app.log(format!("AGC soft (hang)  hw {:+.0} dB", app.gain));
         }
         AgcMode::Hardware => {
+            if app.radio_caps.as_ref().is_some_and(|c| c.agc_setpoint) {
+                let _ = radio.cmd.send(radio::Cmd::AgcSetpoint(app.agc_setpoint));
+            }
             let _ = radio.cmd.send(radio::Cmd::Agc(true));
-            app.log("AGC hardware (fast — can pump)".into());
+            app.log(format!("AGC hardware (setpoint {} dBFS)", app.agc_setpoint));
         }
         AgcMode::Off => {
             let _ = radio.cmd.send(radio::Cmd::Agc(false));
-            let _ = radio.cmd.send(radio::Cmd::Gain(app.gain));
-            app.log(format!("AGC off  gain {:+.0} dB", app.gain));
+            send_manual_gain(app, radio);
+            app.log(match app.gain_control {
+                radio::GainControl::Sdrplay { .. } => {
+                    format!("AGC off  RFGR {:.0} IFGR {:.0}", app.rfgr, app.ifgr)
+                }
+                radio::GainControl::Overall { .. } => format!("AGC off  gain {:+.0} dB", app.gain),
+            });
         }
     }
 }
@@ -2391,6 +2788,8 @@ fn retune(app: &mut App, radio: &radio::Radio, freq: f64) {
     let freq = freq.clamp(100_000.0, 30_000_000.0);
     if app.band_idx < app.band_gains.len() {
         app.band_gains[app.band_idx] = app.gain;
+        app.band_rfgr[app.band_idx] = app.rfgr;
+        app.band_ifgr[app.band_idx] = app.ifgr;
     }
     let old_band = app.band_idx;
     app.center = freq;
@@ -2423,8 +2822,14 @@ fn retune(app: &mut App, radio: &radio::Radio, freq: f64) {
     app.soft_agc.reset();
     app.hw_hot = 0;
     app.hw_quiet = 0;
+    app.gain_probe = None;
+    app.external_noise_dominant = false;
     app.hw_trim_at = Instant::now();
     let _ = radio.cmd.send(radio::Cmd::Tune(freq));
+    if app.rf_notch_auto && app.radio_caps.as_ref().is_some_and(|c| c.rf_notch) {
+        app.rf_notch = automatic_rf_notch(freq);
+        let _ = radio.cmd.send(radio::Cmd::RfNotch(app.rf_notch));
+    }
     if let Some(b) = bands::band_for(freq) {
         app.band_idx = bands::BANDS
             .iter()
@@ -2433,7 +2838,15 @@ fn retune(app: &mut App, radio: &radio::Radio, freq: f64) {
     }
     if app.band_idx != old_band && app.band_idx < app.band_gains.len() {
         app.gain = app.band_gains[app.band_idx];
-        app.pending_gain = Some(app.gain);
+        app.rfgr = app.band_rfgr[app.band_idx];
+        app.ifgr = app.band_ifgr[app.band_idx];
+        match app.gain_control {
+            radio::GainControl::Overall { .. } => app.pending_gain = Some(app.gain),
+            radio::GainControl::Sdrplay { .. } => {
+                app.pending_rfgr = Some(app.rfgr);
+                app.pending_ifgr = Some(app.ifgr);
+            }
+        }
     }
 }
 
@@ -3100,14 +3513,29 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ));
-            spans2.push(lbl(" hw"));
+            spans2.push(lbl(" hw "));
+            spans2.push(Span::styled(
+                format!("{} dBFS", app.agc_setpoint),
+                Style::default().fg(Color::Gray),
+            ));
         }
         AgcMode::Off => {
-            spans2.push(lbl("gain "));
-            spans2.push(Span::styled(
-                format!("{:.0} dB", app.gain),
-                Style::default().fg(Color::Yellow),
-            ));
+            match app.gain_control {
+                radio::GainControl::Sdrplay { .. } => {
+                    spans2.push(lbl("GR "));
+                    spans2.push(Span::styled(
+                        format!("RF{:.0}/IF{:.0}", app.rfgr, app.ifgr),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                radio::GainControl::Overall { .. } => {
+                    spans2.push(lbl("gain "));
+                    spans2.push(Span::styled(
+                        format!("{:.0} dB", app.gain),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+            }
         }
     }
     spans2.push(lbl("  fil "));
@@ -3128,6 +3556,36 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     } else {
         Span::styled("off", dim)
     });
+    if app.rf_notch {
+        spans2.push(Span::styled(
+            if app.rf_notch_auto { "  MW/FM-A" } else { "  MW/FM" },
+            Style::default().fg(Color::LightGreen),
+        ));
+    }
+    if app.dab_notch {
+        spans2.push(Span::styled("  DAB", Style::default().fg(Color::LightGreen)));
+    }
+    if app.ppm.abs() >= 0.05 {
+        spans2.push(Span::styled(
+            format!("  {:+.1}ppm", app.ppm),
+            Style::default().fg(Color::LightCyan),
+        ));
+    }
+    if app.low_if {
+        spans2.push(Span::styled("  low-IF", Style::default().fg(Color::LightBlue)));
+    }
+    if app.dropped_blocks > 0 {
+        spans2.push(Span::styled(
+            format!("  drop {}", app.dropped_blocks),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    if app.clipped_fraction > 0.0001 {
+        spans2.push(Span::styled(
+            format!("  clip {:.2}%", app.clipped_fraction * 100.0),
+            Style::default().fg(Color::Red),
+        ));
+    }
     spans2.push(lbl("  wf "));
     spans2.push(Span::styled(
         format!("{}ms", WF_INTERVALS_MS[app.wf_idx]),
@@ -4780,7 +5238,12 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  v           enlarge the decode pane (cycles sizes)"),
         Line::from("  w / W       waterfall speed / subcell resolution"),
         Line::from("  f / F       FFT size (frequency resolution)"),
-        Line::from("  a           AGC: soft hang → hardware → off   + / - gain"),
+        Line::from("  a           AGC: soft hang → hardware → off   + / - more/less gain"),
+        Line::from("  ;           hardware AGC setpoint: −40 / −30 / −20 dBFS"),
+        Line::from("  m           MW/FM RF notch: auto / forced on / forced off"),
+        Line::from("  D / I       toggle DAB notch / driver IQ correction"),
+        Line::from("  y / Y       frequency correction −/+ 0.1 ppm"),
+        Line::from("  h           acquisition path: 192k zero-IF / 250k low-IF"),
         Line::from("  e           spectrum smoothing (light / medium / heavy)"),
         Line::from("  j           impulse blanker (off / gentle / normal / aggressive)"),
         Line::from("  l           RX bandpass (auto / 80 / 200 / 500 / 1.5k / 3k)"),
@@ -6039,6 +6502,52 @@ mod scout_cost {
             "  candidates: {} peaks",
             scout_peaks(&app.smoothed, &app.noise_floor, 0.0, app.rate).len()
         );
+    }
+}
+
+#[cfg(test)]
+mod receiver_control_tests {
+    use super::*;
+
+    #[test]
+    fn sdrplay_manual_gain_uses_reduction_in_the_right_direction() {
+        let mut app = App::new(14_070_000.0, FT_SAFE_RATE, Mode::Off);
+        app.gain_control = radio::GainControl::Sdrplay {
+            rfgr_min: 0.0,
+            rfgr_max: 9.0,
+            ifgr_min: 20.0,
+            ifgr_max: 59.0,
+        };
+        app.rfgr = 3.0;
+        app.ifgr = 40.0;
+        adjust_manual_gain(&mut app, true);
+        assert_eq!((app.rfgr, app.ifgr), (3.0, 38.0));
+        adjust_manual_gain(&mut app, false);
+        assert_eq!((app.rfgr, app.ifgr), (4.0, 38.0));
+    }
+
+    #[test]
+    fn percentile_level_does_not_call_one_impulse_sustained_overload() {
+        let mut block = vec![Complex32::new(0.02, -0.02); 16_384];
+        block[123] = Complex32::new(1.0, 1.0);
+        let (peak, p999, dbfs) = block_level_metrics(&block);
+        assert_eq!(peak, 1.0);
+        assert!(p999 < 0.03, "one impulse polluted p99.9: {p999}");
+        assert!(dbfs < -25.0, "one impulse polluted RMS: {dbfs}");
+    }
+
+    #[test]
+    fn automatic_broadcast_notch_protects_wanted_mw() {
+        assert!(!automatic_rf_notch(1_000_000.0));
+        assert!(!automatic_rf_notch(1_999_999.0));
+        assert!(automatic_rf_notch(3_500_000.0));
+        assert!(automatic_rf_notch(14_070_000.0));
+    }
+
+    #[test]
+    fn low_if_rate_is_deliberately_not_an_ft_clock() {
+        assert!(!rate_ok_for_ft(LOW_IF_RATE));
+        assert!(rate_ok_for_ft(FT_SAFE_RATE));
     }
 }
 

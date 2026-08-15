@@ -15,7 +15,19 @@
 > Implementation notes for future agents: the full one-dit CW boxcar merged
 > short gaps, so the regression-safe measured setting is 0.35 dit. The scout
 > gate restores the former 4 dB rule on crowded/unsettled frames. Audio-domain
-> operator NR, gain-policy probing, and 75% Welch overlap remain optional.
+> operator NR and 75% Welch overlap remain optional.
+>
+> **RECEIVER-CONTROL FOLLOW-UP: FINISHED — 2026-08-14.** The gain-policy
+> probe from item 9 is now implemented, together with Soapy capability/readback
+> reporting, correct SDRplay RFGR/IFGR gain-reduction control, per-band split-gain
+> memory, percentile headroom supervision, hardware AGC setpoint control,
+> automatic/override MW/FM rejection, DAB and IQ-correction controls, PPM
+> correction, a selectable 250 kS/s low-IF acquisition path, and visible stream
+> drop/clipping counters. Unsupported controls are reported instead of silently
+> accepted, and an RSP opened through `miri` produces a backend warning. The
+> low-IF path intentionally returns to 192 kS/s for FT8/FT4/AUTO because those
+> modes require an exact 12 kHz audio clock. Verification for this follow-up:
+> 106 passed, 0 failed, 26 ignored.
 
 Goal: significantly improve weak-signal decode performance. Extra CPU is
 acceptable everywhere; the 192 kHz front-end path currently costs a few
@@ -23,9 +35,10 @@ percent of one core, so there is a large budget available.
 
 Current architecture (for orientation):
 
-- `src/radio.rs` — SoapySDR worker thread. Manual gain (default 36 dB), a
-  slow hardware-gain supervisor in `main.rs::supervise_hw_gain`, ADC clip
-  counting, driver DC-offset mode requested.
+- `src/radio.rs` — SoapySDR worker thread. Capability discovery/readback,
+  aggregate gain for generic receivers or split RFGR/IFGR gain reduction for
+  SDRplay, notch/IQ/PPM settings, stream-drop and ADC-clip reporting. A slow
+  percentile/floor-probing supervisor lives in `main.rs::supervise_hw_gain`.
 - `src/dsp.rs::FrontEnd` — software DC removal (~2 Hz one-pole) and a
   **scalar** IQ imbalance correction (one gain + one cross term for the whole
   span), applied to every raw block in `main.rs::feed` before anything else.
@@ -249,7 +262,8 @@ slots:
 - **Audio-domain spectral NR** (Ephraim-Malah / decision-directed Wiener on
   the decoder audio path) as a UI toggle for CW/RTTY by ear — helps the
   operator, rarely helps the decoders; low priority.
-- **Gain policy refinement**: `supervise_hw_gain` reacts to clipping and
+- **Gain policy refinement — DONE in receiver-control follow-up**:
+  `supervise_hw_gain` reacts to clipping and
   quiet, but doesn't verify the external-noise-dominates condition. Add a
   check: on gain changes, compare the tracked noise floor (item 4) step to
   the gain step; if the floor doesn't follow the gain up (ADC-noise
@@ -257,7 +271,9 @@ slots:
   — extra gain only costs headroom. Keep the per-band gain memory.
 - **75 % Welch overlap** in `Spectrum` for the scout path (more segments
   averaged per second → calmer floor → item 4 thresholds can drop further).
-  Pure CPU trade; bench with `bench_window_tradeoff`.
+  Pure CPU trade; bench with `bench_window_tradeoff`. A 2026-08-14 trial
+  regressed two PSK31 auto-detection tests (weak copy and LO blanking), so it
+  remains deferred until its estimator weighting/timing is reworked.
 
 ## Suggested sequencing for implementation
 

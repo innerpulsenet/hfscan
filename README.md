@@ -23,6 +23,8 @@ Options:
 | --- | --- | --- |
 | `--freq` | 14070000 | starting centre frequency, Hz |
 | `--rate` | 192000 | sample rate, and therefore the width of the spectrum view |
+| `--low-if` | off | request the SDRplay 250 kS/s low-IF acquisition path (not used for FT modes) |
+| `--ppm` | 0 | receiver frequency correction in parts per million |
 | `--mode` | off | start with a decoder running: `off`, `cw`, `rtty`, `psk31`, `ft8`, `ft4` |
 | `--fft` | 8192 | FFT size; higher gives finer frequency resolution |
 | `--device` | `driver=sdrplay` | SoapySDR device arguments |
@@ -55,7 +57,12 @@ switches the radio to 192 kHz automatically if the current rate will not do.
 | `v` | enlarge the decode pane (cycles normal / large / huge) |
 | `w` / `W` | waterfall speed (100 ms … 2 s per row) / hi-res frequency mode |
 | `f` / `F` | FFT size — frequency resolution (1024 … 32768) |
-| `a` | cycle AGC: soft hang → hardware → off; `+` / `-` set manual gain |
+| `a` | cycle AGC: soft hang → hardware → off; `+` / `-` request more/less manual gain |
+| `;` | cycle hardware AGC setpoint: −40 / −30 / −20 dBFS |
+| `m` | cycle SDRplay MW/FM notch: auto / forced on / forced off |
+| `D` / `I` | toggle SDRplay DAB notch / driver IQ correction |
+| `y` / `Y` | frequency correction −/+ 0.1 ppm |
+| `h` | switch 192 kS/s zero-IF / 250 kS/s low-IF acquisition |
 | `e` | spectrum smoothing: light / medium / heavy |
 | `l` | RX bandpass: auto (mode default) / 80 / 200 / 500 / 1500 / 3000 Hz |
 | `k` | squelch on/off; `,` / `.` adjust the threshold |
@@ -106,13 +113,28 @@ it does not flicker.
 
 AGC defaults to a *hang* loop on the decoder path: it ducks quickly when
 the audio is hot, holds for ~0.8 s, then creeps gain back only if the
-signal stays quiet. A slow supervisor trims the hardware gain if the ADC
-is clipping or starved, so the spectrum does not pump. `a` cycles hang →
-device AGC (fast, can pump) → manual (`+` / `-`).
+signal stays quiet. A slow supervisor uses the 99.9th-percentile converter
+level (not merely rail hits) and stops adding gain once a measured gain probe
+shows that external noise already dominates. `a` cycles hang → device AGC →
+manual (`+` / `-`); `;` selects the hardware AGC target where supported.
+
+At startup hfscan inventories the actual Soapy backend, gain elements and
+readable controls, then reads settings back after changes. With SoapySDRPlay3,
+manual gain is deliberately split into `RFGR` (coarse RF/LNA gain reduction)
+and `IFGR` (fine IF gain reduction): larger numbers mean *less* gain. Other
+receivers retain conventional aggregate gain in dB. If an SDRplay device is
+opened through the `miri` backend, hfscan warns that these SDRplay-specific
+controls are unavailable rather than presenting controls that do nothing.
+
+The MW/FM rejection network defaults to automatic: on above 2 MHz and off
+while receiving MW/LW. `m` can override it. The DAB notch is left off on HF.
+Driver IQ correction is enabled when available, with the software front end
+continuing to remove residual imbalance. The status line shows low-IF mode,
+active notches, PPM correction, clipping, and dropped IQ blocks.
 
 Changing band (`b` / `B`, or a retune that leaves the band) resets the
 spectrum scale, waterfall, scout list and hang AGC, and restores the
-hardware gain last used on that band. Otherwise a hot band can leave the
+hardware gain last used on that band (both RFGR and IFGR on SDRplay). Otherwise a hot band can leave the
 colour scale and front-end gain wound up so the original band looks
 empty — as if a filter had switched on.
 

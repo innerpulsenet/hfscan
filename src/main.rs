@@ -19,6 +19,7 @@ use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseEventKind,
 };
+use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -30,6 +31,47 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Restores the user's terminal even if the TUI returns early or panics.
+/// A process abort inside a native SDR driver cannot run Rust destructors,
+/// which is why unsafe automatic backend fallbacks must also be avoided.
+struct TerminalSession {
+    active: bool,
+}
+
+impl TerminalSession {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = std::io::stdout();
+        if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+            let _ = disable_raw_mode();
+            return Err(e.into());
+        }
+        Ok(Self { active: true })
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        disable_raw_mode()?;
+        let mut stdout = std::io::stdout();
+        execute!(stdout, LeaveAlternateScreen, DisableMouseCapture, Show)?;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = disable_raw_mode();
+            let mut stdout = std::io::stdout();
+            let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture, Show);
+            self.active = false;
+        }
+    }
+}
 
 /// A radio rate that divides evenly by both 8 kHz and 12 kHz, so every mode
 /// (including FT8/FT4) gets its exact audio rate.
@@ -1650,6 +1692,7 @@ fn main() -> Result<()> {
     }
 
     let radio = radio::spawn(args.device.clone(), rate, args.freq)?;
+    rate = radio.rate;
     let mut app = App::new(args.freq, rate, mode);
     app.ppm = args.ppm;
     if args.ppm.abs() >= 0.0001 {
@@ -1675,8 +1718,10 @@ fn main() -> Result<()> {
     }
     if args.low_if && (rate - LOW_IF_RATE).abs() < 1.0 {
         app.log("low-IF acquisition: 250000 Hz (SDRplay 6 MS/s decimated path)".into());
-    } else if rate != args.rate {
+    } else if needs_exact_audio(mode) && (rate - FT_SAFE_RATE).abs() < 1.0 && rate != args.rate {
         app.log(format!("sample rate forced to {rate:.0} Hz for FT8/FT4"));
+    } else if rate != args.rate {
+        app.log(format!("backend sample rate: {rate:.0} Hz"));
     }
     app.fft_idx = FFT_SIZES
         .iter()
@@ -1687,20 +1732,13 @@ fn main() -> Result<()> {
         .position(|b| args.freq >= b.start && args.freq <= b.end)
         .unwrap_or(5);
 
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let mut terminal_session = TerminalSession::enter()?;
+    let stdout = std::io::stdout();
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let res = run_app(&mut terminal, &mut app, &radio, args.fft);
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    terminal_session.restore()?;
     let _ = radio.cmd.send(radio::Cmd::Quit);
     res
 }
@@ -2539,7 +2577,7 @@ fn apply_radio_event(app: &mut App, event: radio::Event) {
                 app.actual_bandwidth = v;
             }
             if let Some(v) = s.rate {
-                app.actual_rate = v;
+                accept_actual_rate(app, v);
             }
         }
         radio::Event::StreamStats {
@@ -2550,6 +2588,28 @@ fn apply_radio_event(app: &mut App, event: radio::Event) {
             app.clipped_fraction = clipped_fraction;
         }
     }
+}
+
+fn accept_actual_rate(app: &mut App, rate: f64) {
+    app.actual_rate = rate;
+    if (app.rate - rate).abs() < 1.0 {
+        return;
+    }
+    let requested = app.rate;
+    app.rate = rate;
+    app.low_if = (rate - LOW_IF_RATE).abs() < 1.0;
+    app.front = dsp::FrontEnd::new(rate);
+    app.noise_tracker = dsp::NoiseFloor::new();
+    app.waterfall.clear();
+    app.spectrum.clear();
+    app.smoothed.clear();
+    app.spec_work.clear();
+    app.wf_accum.clear();
+    app.auto.clear();
+    app.set_mode(app.mode);
+    app.log(format!(
+        "backend clamped sample rate from {requested:.0} to {rate:.0} Hz"
+    ));
 }
 
 fn apply_agc_mode(app: &mut App, radio: &radio::Radio, mode: AgcMode) {

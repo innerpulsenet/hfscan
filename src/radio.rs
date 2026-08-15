@@ -78,6 +78,18 @@ pub struct Radio {
     pub iq: Receiver<Vec<Complex32>>,
     pub log: Receiver<String>,
     pub events: Receiver<Event>,
+    /// Actual rate selected by the driver. Some backends clamp the request.
+    pub rate: f64,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Radio {
+    fn drop(&mut self) {
+        let _ = self.cmd.send(Cmd::Quit);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 const BLOCK: usize = 16384;
@@ -94,9 +106,17 @@ pub fn spawn(args: String, rate: f64, freq: f64) -> Result<Radio> {
     let _ = event_tx.try_send(Event::Capabilities(caps.clone()));
     log_capabilities(&dev, &caps, &log_tx);
 
-    dev.set_sample_rate(Rx, 0, rate)
+    let requested_rate = rate;
+    dev.set_sample_rate(Rx, 0, requested_rate)
         .context("setting sample rate")?;
-    if let Err(e) = set_bandwidth(&dev, rate, &log_tx) {
+    let actual_rate = dev.sample_rate(Rx, 0).unwrap_or(requested_rate);
+    if (actual_rate - rate).abs() >= 1.0 {
+        let _ = log_tx.try_send(format!(
+            "sample rate requested {:.0} Hz, backend selected {:.0} Hz",
+            rate, actual_rate
+        ));
+    }
+    if let Err(e) = set_bandwidth(&dev, actual_rate, &log_tx) {
         let _ = log_tx.try_send(format!("analog bandwidth unavailable: {e}"));
     }
     dev.set_frequency(Rx, 0, freq, ())
@@ -148,8 +168,16 @@ pub fn spawn(args: String, rate: f64, freq: f64) -> Result<Radio> {
     ));
     publish_state(&dev, &caps, &event_tx);
 
-    std::thread::spawn(move || {
-        if let Err(e) = run(dev, caps, rate, cmd_rx, iq_tx, log_tx.clone(), event_tx) {
+    let worker = std::thread::spawn(move || {
+        if let Err(e) = run(
+            dev,
+            caps,
+            actual_rate,
+            cmd_rx,
+            iq_tx,
+            log_tx.clone(),
+            event_tx,
+        ) {
             let _ = log_tx.try_send(format!("radio thread stopped: {e:#}"));
         }
     });
@@ -159,6 +187,8 @@ pub fn spawn(args: String, rate: f64, freq: f64) -> Result<Radio> {
         iq: iq_rx,
         log: log_rx,
         events: event_rx,
+        rate: actual_rate,
+        worker: Some(worker),
     })
 }
 
@@ -319,15 +349,16 @@ fn run(
                 Ok(Cmd::Rate(r)) => {
                     let _ = stream.deactivate(None);
                     drop(stream);
-                    let ok = dev.set_sample_rate(Rx, 0, r);
+                    let requested = r;
+                    let ok = dev.set_sample_rate(Rx, 0, requested);
                     if let Err(ref e) = ok {
                         let _ = log_tx.try_send(format!("rate failed: {e}"));
                     } else {
-                        rate = dev.sample_rate(Rx, 0).unwrap_or(r);
-                        if let Err(e) = dev.set_bandwidth(Rx, 0, r) {
+                        rate = dev.sample_rate(Rx, 0).unwrap_or(requested);
+                        if let Err(e) = dev.set_bandwidth(Rx, 0, rate) {
                             let _ = log_tx.try_send(format!("analog bandwidth unchanged: {e}"));
                         }
-                        let bw = dev.bandwidth(Rx, 0).unwrap_or(r);
+                        let bw = dev.bandwidth(Rx, 0).unwrap_or(rate);
                         let _ = log_tx.try_send(format!(
                             "sample rate {:.0} Hz, analog bandwidth {:.0} Hz",
                             rate, bw

@@ -176,6 +176,8 @@ pub struct CwDecoder {
     fs: f32,
     env_rate: f32,
     smooth: OnePole,
+    matched: VecDeque<f32>,
+    matched_sum: f32,
     peak: f32,
     floor: f32,
     peak_decay: f32,
@@ -247,6 +249,8 @@ impl CwDecoder {
             // ~3 ms envelope: still passes a 50 WPM dit (~24 ms) with room
             // to spare, but follows QRQ edges better than 4 ms.
             smooth: OnePole::new(0.003 * fs),
+            matched: VecDeque::new(),
+            matched_sum: 0.0,
             post: NarrowLpf::new(fs),
             peak: 0.0,
             floor: 0.0,
@@ -701,6 +705,8 @@ impl CwDecoder {
         self.peak = 0.0;
         self.floor = 0.0;
         self.have_env = false;
+        self.matched.clear();
+        self.matched_sum = 0.0;
         self.settle = SETTLE_MS;
         self.quality = 0.0;
         self.env_hist.clear();
@@ -849,12 +855,23 @@ impl Decoder for CwDecoder {
             self.prev_mixed = s;
             self.have_mixed = true;
 
-            let env = self.smooth.process(s.norm());
+            let raw_env = self.smooth.process(s.norm());
             self.decim_ctr += 1;
             if self.decim_ctr < ENV_DECIM {
                 continue;
             }
             self.decim_ctr = 0;
+
+            // A one-dit boxcar is the matched filter for the shortest Morse
+            // element. Re-size it continuously as the recovered clock moves;
+            // the state/debounce pass below then removes isolated excursions.
+            let matched_n = (0.35 * self.dit).round().clamp(4.0, self.env_rate * DIT_MAX_S) as usize;
+            self.matched.push_back(raw_env);
+            self.matched_sum += raw_env;
+            while self.matched.len() > matched_n {
+                self.matched_sum -= self.matched.pop_front().unwrap_or(0.0);
+            }
+            let env = self.matched_sum / self.matched.len().max(1) as f32;
 
             // The envelope smoother, the channel filter and the tuning
             // chain in front of them all start at zero, so the first tens of

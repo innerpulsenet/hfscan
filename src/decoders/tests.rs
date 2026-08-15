@@ -1133,6 +1133,49 @@ fn cw_starts_clean_at_any_speed() {
     }
 }
 
+fn cw_envelope_filter_gain_db() -> f32 {
+    let mut rng = 0x71ac_2049u32;
+    let dit = 60usize;
+    let n = 6000;
+    let raw: Vec<f32> = (0..n).map(|i| {
+        let mark = (i / dit) % 4 < 2;
+        (if mark { 0.18 } else { 0.0 }) + noise(&mut rng) * 0.45
+    }).collect();
+    let window = (0.35 * dit as f32) as usize;
+    let mut sum = 0.0;
+    let mut filtered = Vec::with_capacity(n);
+    for i in 0..n {
+        sum += raw[i];
+        if i >= window { sum -= raw[i - window]; }
+        filtered.push(sum / (i + 1).min(window) as f32);
+    }
+    let snr = |x: &[f32]| {
+        let mut on = Vec::new(); let mut off = Vec::new();
+        for i in window..n {
+            let pos = i % dit;
+            if pos < window || pos + window >= dit { continue; }
+            if (i / dit) % 4 < 2 { on.push(x[i]); } else { off.push(x[i]); }
+        }
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+        let (mo, mf) = (mean(&on), mean(&off));
+        let var = on.iter().map(|v| (v-mo).powi(2)).chain(off.iter().map(|v| (v-mf).powi(2))).sum::<f32>() / (on.len()+off.len()) as f32;
+        (mo-mf).abs() / var.sqrt()
+    };
+    20.0 * (snr(&filtered) / snr(&raw)).log10()
+}
+
+#[test]
+fn cw_matched_envelope_gains_two_db() {
+    let gain = cw_envelope_filter_gain_db();
+    assert!(gain >= 2.0, "matched envelope gained only {gain:.1} dB");
+}
+
+#[test]
+#[ignore]
+fn bench_cw_matched_envelope() {
+    println!("CW clock-matched envelope separation gain: {:.1} dB", cw_envelope_filter_gain_db());
+}
+
 /// Steady-state copy on a signal weak enough to be worth decoding by
 /// machine. 8 dB in 400 Hz is a perfectly ordinary HF signal.
 #[test]

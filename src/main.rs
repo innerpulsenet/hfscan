@@ -2,6 +2,7 @@
 //! SDRplay RSP1A (or any SoapySDR device).
 
 mod bands;
+mod bench;
 mod decoders;
 mod dsp;
 mod identify;
@@ -522,6 +523,11 @@ struct Args {
     /// Your amateur radio callsign — enables spot reporting to pskreporter.info
     #[arg(long)]
     call: Option<String>,
+    /// Characterise the receiver instead of starting the UI: what the driver
+    /// actually offers, whether the band plan survives contact with it, and
+    /// where the gain knee is. Connect an antenna and pick a clear frequency.
+    #[arg(long)]
+    bench: bool,
     /// Your Maidenhead grid locator (e.g. FN42), sent with reception reports
     #[arg(long)]
     grid: Option<String>,
@@ -1848,6 +1854,13 @@ fn main() -> Result<()> {
     // Route SoapySDR's chatter into the `log` facade. With no logger installed
     // it is discarded, which keeps driver messages off the TUI.
     soapysdr::configure_logging();
+
+    if args.bench {
+        return bench::run(
+            &args.device,
+            args.freq.unwrap_or(bands::BANDS[bands::DEFAULT_BAND].default),
+        );
+    }
 
     let mode = parse_mode(&args.mode);
     // Opening on a band has to look exactly like switching to it: same centre,
@@ -6262,17 +6275,21 @@ mod tests {
     }
 
     /// How the operator likes the waterfall to look must not change what the
-    /// receiver hears. The classifier and both scouts used to read the same
-    /// buffer the waterfall is drawn from, so `e` — nominally a cosmetic
-    /// preference — widened every peak the detectors saw and slowed their
-    /// response to a station coming up.
+    /// receiver hears. The classifier, both scouts, the band scanner and the
+    /// cursor SNR used to read the same buffer the waterfall is drawn from, so
+    /// `e` — nominally a cosmetic preference — widened every peak they saw and
+    /// slowed their response to a station coming up.
+    ///
+    /// The detectors' buffer is compared directly rather than the idents that
+    /// come out of it: `feed` gates its scout passes on wall-clock timers, so
+    /// how many fire during a test depends on machine load, and comparing the
+    /// end result would be measuring that instead.
     #[test]
     fn spectrum_smoothing_does_not_move_detection() {
         let fs = 192_000.0f64;
-        // Two CW carriers close enough that heavy smoothing can merge them,
-        // plus a PSK31 signal, in noise.
         let mut rng = 0x5a5a_1234u32;
         let n = (fs * 2.0) as usize;
+        // Two CW carriers close enough that heavy smoothing merges them.
         let iq: Vec<Complex32> = (0..n)
             .map(|i| {
                 let t = i as f32;
@@ -6281,8 +6298,7 @@ mod tests {
                     super::dsp::frontend_tests::noise(&mut rng),
                 ) * 0.02;
                 for off in [8_000.0f32, 8_600.0, -12_000.0] {
-                    let keyed = ((t / fs as f32 * 12.0) as u32) % 2 == 0;
-                    if keyed {
+                    if ((t / fs as f32 * 12.0) as u32) % 2 == 0 {
                         let ph = 2.0 * std::f32::consts::PI * off * t / fs as f32;
                         v += Complex32::from_polar(0.25, ph);
                     }
@@ -6300,22 +6316,20 @@ mod tests {
             for block in iq.chunks(16_384) {
                 app.feed(block, &mut spec, &mut out);
             }
-            super::refresh_idents(&mut app);
-            let mut got: Vec<String> = app
-                .idents
-                .iter()
-                .map(|i| format!("{} @{:.0}", i.kind.label(), i.offset_hz))
-                .collect();
-            got.sort();
-            got
+            (app.detect_spec.clone(), app.smoothed.clone())
         };
 
-        let light = run(0);
-        let medium = run(1);
-        let heavy = run(2);
-        assert!(!medium.is_empty(), "test signal produced no detections");
-        assert_eq!(light, medium, "'light' smoothing changed what was detected");
-        assert_eq!(heavy, medium, "'heavy' smoothing changed what was detected");
+        let (light_det, light_disp) = run(0);
+        let (med_det, med_disp) = run(1);
+        let (heavy_det, heavy_disp) = run(2);
+
+        assert!(!med_det.is_empty(), "no spectrum was produced");
+        assert_eq!(light_det, med_det, "'light' changed the detectors' spectrum");
+        assert_eq!(heavy_det, med_det, "'heavy' changed the detectors' spectrum");
+
+        // ...and the setting must still do something, or this proves nothing.
+        assert_ne!(light_disp, med_disp, "'light' did not change the display");
+        assert_ne!(heavy_disp, med_disp, "'heavy' did not change the display");
     }
 
     /// Spots broken down by mode, so a span carrying four decoders shows

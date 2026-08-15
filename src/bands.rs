@@ -49,17 +49,17 @@ pub const DEFAULT_BAND: usize = 5; // 20m
 
 pub const BANDS: &[Band] = &[
     Band { name: "160m", start: 1_800_000.0,   end: 2_000_000.0,   default: 1_900_000.0,   span: 384_000.0 },
-    Band { name: "80m",  start: 3_500_000.0,   end: 4_000_000.0,   default: 3_610_000.0,   span: 384_000.0 },
+    Band { name: "80m",  start: 3_500_000.0,   end: 4_000_000.0,   default: 3_750_000.0,   span: 768_000.0 },
     Band { name: "60m",  start: 5_330_000.0,   end: 5_405_000.0,   default: 5_367_500.0,   span: 192_000.0 },
-    Band { name: "40m",  start: 7_000_000.0,   end: 7_300_000.0,   default: 7_150_000.0,   span: 384_000.0 },
+    Band { name: "40m",  start: 7_000_000.0,   end: 7_300_000.0,   default: 7_150_000.0,   span: 768_000.0 },
     Band { name: "30m",  start: 10_100_000.0,  end: 10_150_000.0,  default: 10_125_000.0,  span: 192_000.0 },
-    Band { name: "20m",  start: 14_000_000.0,  end: 14_350_000.0,  default: 14_175_000.0,  span: 384_000.0 },
+    Band { name: "20m",  start: 14_000_000.0,  end: 14_350_000.0,  default: 14_175_000.0,  span: 768_000.0 },
     Band { name: "17m",  start: 18_068_000.0,  end: 18_168_000.0,  default: 18_118_000.0,  span: 192_000.0 },
-    Band { name: "15m",  start: 21_000_000.0,  end: 21_450_000.0,  default: 21_160_000.0,  span: 384_000.0 },
+    Band { name: "15m",  start: 21_000_000.0,  end: 21_450_000.0,  default: 21_225_000.0,  span: 768_000.0 },
     Band { name: "12m",  start: 24_890_000.0,  end: 24_990_000.0,  default: 24_940_000.0,  span: 192_000.0 },
-    Band { name: "10m",  start: 28_000_000.0,  end: 29_700_000.0,  default: 28_125_000.0,  span: 384_000.0 },
-    Band { name: "6m",   start: 50_000_000.0,  end: 54_000_000.0,  default: 50_330_000.0,  span: 384_000.0 },
-    Band { name: "2m",   start: 144_000_000.0, end: 148_000_000.0, default: 144_190_000.0, span: 384_000.0 },
+    Band { name: "10m",  start: 28_000_000.0,  end: 29_700_000.0,  default: 28_850_000.0,  span: 5_016_000.0 },
+    Band { name: "6m",   start: 50_000_000.0,  end: 54_000_000.0,  default: 52_000_000.0,  span: 5_016_000.0 },
+    Band { name: "2m",   start: 144_000_000.0, end: 148_000_000.0, default: 146_000_000.0, span: 5_016_000.0 },
     Band { name: "WWV",  start: 4_990_000.0,   end: 15_010_000.0,  default: 10_000_000.0,  span: 192_000.0 },
 ];
 
@@ -162,6 +162,26 @@ pub fn ft_mode(freq: f64) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// The analog filter widths an RSP1A reports, as read by `--bench`.
+    const FILTERS: [f64; 8] = [
+        200_000.0, 300_000.0, 600_000.0, 1_536_000.0, 5_000_000.0, 6_000_000.0, 7_000_000.0,
+        8_000_000.0,
+    ];
+
+    /// What `radio::choose_bandwidth` will settle on for a span: the narrowest
+    /// filter that covers `cover` without exceeding the span, else the widest
+    /// that fits, else — when the span is under every filter — the narrowest
+    /// the tuner has, since the driver rounds up.
+    fn filter_for(span: f64, cover: f64) -> f64 {
+        FILTERS
+            .iter()
+            .filter(|f| **f <= span * 1.001)
+            .find(|f| **f >= cover)
+            .or_else(|| FILTERS.iter().filter(|f| **f <= span * 1.001).next_back())
+            .copied()
+            .unwrap_or(FILTERS[0])
+    }
+
     /// A band default must not park the receiver on a calling frequency.
     ///
     /// The obvious default is the calling frequency itself, and it is the
@@ -259,26 +279,51 @@ mod tests {
         }
     }
 
-    /// Bands narrow enough to fit are shown whole. The rest cannot be, at any
-    /// rate this receiver offers that also keeps FT8 working.
+    /// Every band is shown whole, which is the point of a per-band span.
     #[test]
-    fn bands_that_can_be_shown_whole_are() {
+    fn every_band_is_shown_whole() {
         for b in BANDS {
             if b.name == "WWV" {
                 continue;
             }
             let half = b.span / 2.0;
-            let fits = b.end - b.start <= b.span;
-            let covered = b.default - half <= b.start && b.default + half >= b.end;
-            if fits {
-                assert!(
-                    covered,
-                    "{} is {:.0} kHz inside a {:.0} kHz span but is not centred to show it",
-                    b.name,
-                    (b.end - b.start) / 1000.0,
-                    b.span / 1000.0
-                );
+            assert!(
+                b.default - half <= b.start && b.default + half >= b.end,
+                "{}: {:.3}-{:.3} MHz does not cover {:.3}-{:.3}",
+                b.name,
+                (b.default - half) / 1e6,
+                (b.default + half) / 1e6,
+                b.start / 1e6,
+                b.end / 1e6
+            );
+        }
+    }
+
+    /// The tuner's analog filters are 200, 300, 600, 1536 and 5000 kHz. The
+    /// driver will not choose one wider than the span, so a span must leave
+    /// room for a filter that covers the whole allocation — which is what a
+    /// 350 kHz band inside a 384 kHz span failed to do, taking the 300 kHz
+    /// filter and losing 25 kHz off each end.
+    ///
+    /// The exception is a span narrower than the narrowest filter: the four
+    /// 192 kHz bands get the 200 kHz filter, marginally wider than Nyquist,
+    /// which the receiver confirms and which covers them many times over.
+    #[test]
+    fn every_band_ends_up_behind_a_filter_that_covers_it() {
+        for b in BANDS {
+            if b.name == "WWV" {
+                continue;
             }
+            let width = b.end - b.start;
+            let chosen = filter_for(b.span, width);
+            assert!(
+                chosen >= width,
+                "{}: a {:.0} kHz span lands on the {:.0} kHz filter, which clips {:.0} kHz of band",
+                b.name,
+                b.span / 1000.0,
+                chosen / 1000.0,
+                width / 1000.0
+            );
         }
     }
 
@@ -286,13 +331,16 @@ mod tests {
     /// which is how the digital segment ended up off-screen.
     #[test]
     fn spans_are_rates_the_receiver_offers() {
-        const SUPPORTED: [f64; 8] = [
-            62_500.0, 96_000.0, 125_000.0, 192_000.0, 250_000.0, 384_000.0, 500_000.0,
+        // Measured from an RSP1A by `--bench`: fixed steps, then a
+        // continuous region from 2 MS/s up.
+        const STEPS: [f64; 9] = [
+            62_500.0, 96_000.0, 125_000.0, 192_000.0, 250_000.0, 384_000.0, 500_000.0, 768_000.0,
             1_000_000.0,
         ];
+        const CONTINUOUS: std::ops::RangeInclusive<f64> = 2_000_000.0..=10_660_000.0;
         for b in BANDS {
             assert!(
-                SUPPORTED.contains(&b.span),
+                STEPS.contains(&b.span) || CONTINUOUS.contains(&b.span),
                 "{} asks for {:.0} Hz, which the receiver does not offer",
                 b.name,
                 b.span
@@ -309,32 +357,30 @@ mod tests {
         }
     }
 
-    /// The digital segment must sit in the flat part of the span, not out
-    /// where the analog filter corner is — that rolloff is what shows on the
-    /// waterfall as the edges of the view falling away.
-    ///
-    /// This is about the markers, not the band edges. 20m at 384 kHz reaches
-    /// its band edges at 91% of Nyquist and there is no FT-safe rate this
-    /// receiver offers that would do better; what matters is that its digital
-    /// segment sits at 55%, where the response is flat. When something has to
-    /// be given up at the extremes it is the top of the phone segment.
+    /// The digital segment must sit in the flat part of the analog filter,
+    /// which is where the waterfall's edge rolloff comes from. Measuring it
+    /// against Nyquist is the wrong yardstick — on 2m the 5 MHz filter covers
+    /// essentially the whole 5.016 MS/s span, so a marker at 73% of Nyquist is
+    /// still nowhere near a skirt.
     #[test]
-    fn the_digital_segment_sits_in_the_flat_part_of_the_span() {
+    fn the_digital_segment_sits_in_the_flat_part_of_the_filter() {
         for b in BANDS {
             if b.name == "WWV" {
                 continue;
             }
+            let half = filter_for(b.span, b.end - b.start) / 2.0;
             for m in MARKERS {
                 if m.label == "WWV" || m.freq < b.start || m.freq > b.end {
                     continue;
                 }
-                let frac = (m.freq + 3_000.0 - b.default).abs() / (b.span / 2.0);
+                let frac = (m.freq + 3_000.0 - b.default).abs() / half;
                 assert!(
-                    frac <= 0.70,
-                    "{}: the {} marker sits at {:.0}% of Nyquist, in the filter skirt",
+                    frac <= 0.85,
+                    "{}: the {} marker sits at {:.0}% of the {:.0} kHz filter's edge",
                     b.name,
                     m.label,
-                    frac * 100.0
+                    frac * 100.0,
+                    half * 2.0 / 1000.0
                 );
             }
         }

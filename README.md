@@ -33,49 +33,65 @@ Options:
 
 ### Band spans
 
-Each band preset carries its own sample rate, applied by `b` / `B`, chosen so
-the digital segment is always well inside the view and the band is shown whole
-wherever that is possible.
+Each band preset carries its own sample rate, applied by `b` / `B`, sized so
+the whole allocation is in view *and* behind an analog filter wide enough not
+to clip its edges. All of it is verified against the hardware by `--bench`.
 
-| band | span | shown | | band | span | shown |
+| band | span | filter | | band | span | filter |
 | --- | --- | --- | --- | --- | --- | --- |
-| 160m | 384 kHz | whole band | | 15m | 384 kHz | digital + CW |
-| 80m | 384 kHz | digital + CW | | 12m | 192 kHz | whole band |
-| 60m | 192 kHz | whole band | | 10m | 384 kHz | digital segment |
-| 40m | 384 kHz | whole band | | 6m | 384 kHz | digital segment |
-| 30m | 192 kHz | whole band | | 2m | 384 kHz | digital segment |
-| 20m | 384 kHz | whole band | | 17m | 192 kHz | whole band |
+| 160m | 384 kHz | 300 kHz | | 15m | 768 kHz | 600 kHz |
+| 80m | 768 kHz | 600 kHz | | 12m | 192 kHz | 200 kHz |
+| 60m | 192 kHz | 200 kHz | | 10m | 5.016 MHz | 5 MHz |
+| 40m | 768 kHz | 600 kHz | | 6m | 5.016 MHz | 5 MHz |
+| 30m | 192 kHz | 200 kHz | | 2m | 5.016 MHz | 5 MHz |
+| 20m | 768 kHz | 600 kHz | | 17m | 192 kHz | 200 kHz |
 
-Three constraints pin those numbers, and the first is the one that bites.
+Three constraints pin those numbers.
 
-**Only rates the receiver actually offers.** The RSP1A gives 62.5, 96, 125,
-192, 250, 384, 500 and 1000 kS/s. Ask for anything else and the driver clamps
-silently — and a band centred for a width it never got can end up with its
-digital segment off the edge of the view, which means no waterfall and no
-decodes there at all.
+**Rates the receiver actually has.** The RSP1A offers 62.5, 96, 125, 192, 250,
+384, 500, 768 and 1000 kS/s as fixed steps, then anything from 2 to
+10.66 MS/s. Ask for something else and the driver clamps silently — and a band
+centred for a width it never got can put its digital segment outside the view,
+which means no decodes at all on that band.
 
-**Only rates that keep the audio clocks exact.** Of those, 96, 192 and 384 kHz
-divide by both 8 kHz and 12 kHz, so 384 kS/s is the widest span that leaves
-FT8 and FT4 working. Everything wider would force a retune back to 192 kHz the
-moment an FT mode was selected.
+**An exact audio clock.** Every span divides by 24 kHz, the LCM of the 8 kHz
+and 12 kHz audio rates, so FT8 and FT4 keep an exact divisor at full-band width
+instead of forcing a retune.
 
-**The digital segment before the band.** 384 kHz covers 160m, 40m and 20m end
-to end, and 192 kHz covers the four narrow bands. 80m, 15m, 10m, 6m and 2m are
-wider than any FT-safe rate this receiver has, so they are centred on their
-digital segments instead — on nearly every band the modes this decodes live in
-the bottom tens of kHz, so what gets cut is the top of the phone segment.
+**Room for the filter.** The tuner's analog filters are 200, 300, 600, 1536 and
+5000 kHz, and the driver will not pick one wider than the span. A 350 kHz band
+inside a 384 kHz span therefore gets the 300 kHz filter and loses 25 kHz off
+each end — this is what edge rolloff on the waterfall actually is. 768 kS/s is
+what buys the 600 kHz filter; 10m, 6m and 2m need the 5 MHz one and so run at
+5.016 MS/s, under the 6 MS/s point where the converter still gives 14 bits.
 
-The analog IF filter is chosen against the width that has to stay flat rather
-than against the span. These tuners offer a handful of discrete filter widths
-and the driver rounds a request to one of them; rounding down puts the corner
-*inside* the view, which is what makes the edges of the waterfall fall away.
-hfscan asks the driver what it offers and picks the narrowest that covers the
-segment without exceeding Nyquist, and says so in the message row when nothing
-can do both.
+The scouts walk their whole buffer once per candidate, so their cost tracks the
+sample rate; above 2 MS/s the rescan interval stretches in proportion, keeping
+their share of a core flat on the wide bands. `--rate` overrides for a run.
 
-`--rate` still overrides for a single run. The narrowband scouts walk their
-whole buffer once per candidate, so their cost tracks the sample rate; above
-2 MS/s the rescan interval stretches in proportion.
+### Measuring the receiver
+
+`--bench` characterises the hardware instead of starting the UI:
+
+```bash
+./target/release/hfscan --bench
+```
+
+It reports what the driver actually offers (sample rates, filter widths, gain
+elements and their ranges), requests every band preset in turn and checks the
+achieved rate and filter against what the plan assumed, then sweeps the gain
+and finds the knee — the setting where the noise floor stops being the
+receiver's own and starts following the band's. Past that point more gain buys
+intermodulation and lost headroom, not sensitivity.
+
+It is device-agnostic. An RSP1A expresses both its gain elements as *reduction*
+(a bigger number is less gain) while an RTL-SDR's tuner gain counts the usual
+way; the sweep reads the direction off the data rather than keeping a table of
+which is which.
+
+What it cannot do is give a noise figure or an MDS in absolute terms — both
+need a calibrated source. The floor is known relative to full scale, which is
+enough to find the knee and not enough to put a number in dBm on it.
 
 ## Keys
 

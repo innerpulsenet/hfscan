@@ -32,6 +32,7 @@ pub fn spawn(args: String, rate: f64, freq: f64) -> Result<Radio> {
     // Open the device on this thread so startup errors surface immediately.
     let dev = soapysdr::Device::new(args.as_str()).context("opening SDR device")?;
     dev.set_sample_rate(Rx, 0, rate).context("setting sample rate")?;
+    let _ = set_bandwidth(&dev, rate, &log_tx);
     dev.set_frequency(Rx, 0, freq, ()).context("setting frequency")?;
     // Hardware AGC on the RSP1A pumps on static and FT8 bursts; start
     // in manual gain and let the UI's hang AGC own the level.
@@ -126,6 +127,7 @@ fn run(
                     } else {
                         rate = r;
                         let _ = log_tx.try_send(format!("sample rate {:.0} Hz", r));
+                        let _ = set_bandwidth(&dev, r, &log_tx);
                     }
                     stream = dev.rx_stream::<Complex32>(&[0])?;
                     stream.activate(None)?;
@@ -180,4 +182,13 @@ fn run(
         }
         let _ = rate;
     }
+}
+
+/// Keep the tuner's analog IF no wider than the digitised span. Backends are
+/// allowed not to support this setting, so failure is deliberately harmless.
+fn set_bandwidth(dev: &soapysdr::Device, rate: f64, log_tx: &SyncSender<String>) -> Result<()> {
+    dev.set_bandwidth(Rx, 0, rate)?;
+    let actual = dev.bandwidth(Rx, 0).unwrap_or(rate);
+    let _ = log_tx.try_send(format!("analog bandwidth {:.0} Hz", actual));
+    Ok(())
 }

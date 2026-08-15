@@ -5,6 +5,48 @@ use rustfft::{Fft, FftPlanner};
 use std::f32::consts::PI;
 use std::sync::Arc;
 
+/// Analysis windows, and the trade they represent.
+///
+/// A window buys sidelobe suppression with main-lobe width. Sidelobes are
+/// leakage: a strong signal smeared across the bins around it, which raises
+/// the floor a weak neighbour has to stand out of. Main-lobe width is the
+/// opposite concern — a narrowband signal spread over more bins has a lower
+/// peak, and every detector here works from peak height over a local floor.
+///
+/// So the choice is not free in either direction, and which one wins depends
+/// on whether the weak signal you care about has a loud neighbour.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Window {
+    /// First sidelobe -31 dB, noise bandwidth 1.50 bins. Kept for the bench
+    /// that chose against it: the comparison is the justification for the
+    /// default, and it is worth being able to re-run rather than trust.
+    #[allow(dead_code)]
+    Hann,
+    /// Four-term Blackman-Harris: sidelobes -92 dB, noise bandwidth 2.00
+    /// bins. Sixty dB less leakage, at 1.25 dB of narrowband sensitivity.
+    BlackmanHarris,
+}
+
+impl Window {
+    fn coeffs(self, size: usize) -> Vec<f32> {
+        match self {
+            Window::Hann => (0..size)
+                .map(|i| 0.5 - 0.5 * (2.0 * PI * i as f32 / size as f32).cos())
+                .collect(),
+            Window::BlackmanHarris => {
+                const A: [f32; 4] = [0.358_75, 0.488_29, 0.141_28, 0.011_68];
+                (0..size)
+                    .map(|i| {
+                        let x = 2.0 * PI * i as f32 / size as f32;
+                        A[0] - A[1] * x.cos() + A[2] * (2.0 * x).cos()
+                            - A[3] * (3.0 * x).cos()
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
 /// Welch-style averaged periodogram, fftshifted so bin 0 is the lowest frequency.
 pub struct Spectrum {
     fft: Arc<dyn Fft<f32>>,
@@ -17,12 +59,13 @@ pub struct Spectrum {
 #[allow(dead_code)]
 impl Spectrum {
     pub fn new(size: usize) -> Self {
+        Self::with_window(size, Window::BlackmanHarris)
+    }
+
+    pub fn with_window(size: usize, win: Window) -> Self {
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(size);
-        // Hann window
-        let window: Vec<f32> = (0..size)
-            .map(|i| 0.5 - 0.5 * (2.0 * PI * i as f32 / size as f32).cos())
-            .collect();
+        let window = win.coeffs(size);
         Self {
             fft,
             window,
@@ -977,5 +1020,113 @@ mod frontend_cost {
             n as f64 / fs,
             el / (n as f64 / fs) * 100.0
         );
+    }
+}
+
+#[cfg(test)]
+mod window_bench {
+    use super::*;
+
+    fn noise(rng: &mut u32) -> f32 {
+        *rng ^= *rng << 13;
+        *rng ^= *rng >> 17;
+        *rng ^= *rng << 5;
+        (*rng as f32 / u32::MAX as f32) - 0.5
+    }
+
+    /// Peak height over the *local* floor, which is what `scout_peaks` works
+    /// from: the median of the surrounding bins, excluding the peak's own
+    /// skirts. Measuring against the whole spectrum's median instead misses
+    /// the entire effect — one strong signal cannot move the median of 8192
+    /// bins, but it can certainly raise the floor beside itself.
+    fn peak_over_floor(spec: &[f32], fs: f32, hz: f32) -> f32 {
+        const NEAR: isize = 3;
+        const CTX: isize = 40;
+        let n = spec.len() as isize;
+        let bin = fs / n as f32;
+        let centre = ((hz / bin) + n as f32 / 2.0).round() as isize;
+        let at = |i: isize| spec[i.clamp(0, n - 1) as usize];
+        let mut peak = f32::MIN;
+        for d in -NEAR..=NEAR {
+            peak = peak.max(at(centre + d));
+        }
+        let mut ctx: Vec<f32> = (-CTX..=CTX)
+            .filter(|d| d.abs() > NEAR)
+            .map(|d| at(centre + d))
+            .collect();
+        ctx.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        peak - ctx[ctx.len() / 2]
+    }
+
+    fn spectrum_of(iq: &[Complex32], win: Window, size: usize) -> Vec<f32> {
+        let mut s = Spectrum::with_window(size, win);
+        let mut out = Vec::new();
+        s.power_db(iq, &mut out);
+        out
+    }
+
+    /// Two competing effects, measured against each other: how far a weak
+    /// narrowband signal stands out of the floor on its own, and how far it
+    /// stands out with a strong station nearby leaking over it.
+    #[test]
+    #[ignore]
+    fn bench_window_tradeoff() {
+        let fs = 192_000.0f32;
+        let n = 8192;
+        let len = n * 8;
+        let weak_hz = 2_000.0f32;
+
+        println!("\n== a weak narrowband signal on its own ==");
+        println!("{:>10}{:>12}{:>12}", "level", "Hann", "Blackman-H");
+        for amp in [0.02f32, 0.01, 0.005] {
+            let mut rng = 0x9111_2222u32;
+            let iq: Vec<Complex32> = (0..len)
+                .map(|i| {
+                    let ph = 2.0 * PI * weak_hz * i as f32 / fs;
+                    Complex32::from_polar(amp, ph)
+                        + Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.01
+                })
+                .collect();
+            let h = peak_over_floor(&spectrum_of(&iq, Window::Hann, n), fs, weak_hz);
+            let b =
+                peak_over_floor(&spectrum_of(&iq, Window::BlackmanHarris, n), fs, weak_hz);
+            println!(
+                "{:>10}{:>12}{:>12}",
+                format!("{amp:.3}"),
+                format!("{h:.1} dB"),
+                format!("{b:.1} dB")
+            );
+        }
+
+        println!("\n== the same weak signal with a strong station nearby ==");
+        println!("(weak signal at 0.005; strong one 80 dB above it)");
+        println!("(under ~4 bins apart the two are not resolved at all, so");
+        println!(" those rows measure the strong signal, not the weak one)");
+        println!(
+            "{:>10}{:>10}{:>12}{:>12}",
+            "spacing", "bins", "Hann", "Blackman-H"
+        );
+        for sep in [25.0f32, 50.0, 100.0, 200.0, 500.0, 2_000.0] {
+            let mut rng = 0x9111_2222u32;
+            let iq: Vec<Complex32> = (0..len)
+                .map(|i| {
+                    let t = i as f32 / fs;
+                    let weak = Complex32::from_polar(0.005, 2.0 * PI * weak_hz * t);
+                    let strong =
+                        Complex32::from_polar(50.0, 2.0 * PI * (weak_hz + sep) * t);
+                    weak + strong + Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.01
+                })
+                .collect();
+            let h = peak_over_floor(&spectrum_of(&iq, Window::Hann, n), fs, weak_hz);
+            let b =
+                peak_over_floor(&spectrum_of(&iq, Window::BlackmanHarris, n), fs, weak_hz);
+            println!(
+                "{:>10}{:>10}{:>12}{:>12}",
+                format!("{sep:.0} Hz"),
+                format!("{:.1}", sep / (fs / n as f32)),
+                format!("{h:.1} dB"),
+                format!("{b:.1} dB")
+            );
+        }
     }
 }

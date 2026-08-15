@@ -129,6 +129,30 @@ impl Spectrum {
     }
 }
 
+/// Per-bin minimum-statistics noise estimate. Falls promptly when a quiet
+/// observation arrives but rises slowly enough that traffic cannot become its
+/// own reference level.
+pub struct NoiseFloor {
+    bins: Vec<f32>,
+}
+
+impl NoiseFloor {
+    pub fn new() -> Self { Self { bins: Vec::new() } }
+
+    pub fn update<'a>(&'a mut self, power_db: &[f32]) -> &'a [f32] {
+        if self.bins.len() != power_db.len() {
+            self.bins = power_db.to_vec();
+        } else {
+            for (floor, &x) in self.bins.iter_mut().zip(power_db) {
+                let a = if x < *floor { 0.25 } else { 0.002 };
+                *floor += a * (x - *floor);
+            }
+        }
+        &self.bins
+    }
+
+}
+
 /// Frequency-domain smooth. `taps` 1 = none, 3 = [1,2,1], 5 = [1,4,6,4,1].
 /// Local maxima are kept so carriers stay sharp while the floor calms down.
 pub fn smooth_bins(src: &[f32], taps: usize, out: &mut Vec<f32>) {
@@ -738,6 +762,7 @@ pub struct NoiseBlanker {
     window_blanked: usize,
     last_rate: usize,
     inhibited: bool,
+    trained: usize,
 }
 
 impl NoiseBlanker {
@@ -751,6 +776,7 @@ impl NoiseBlanker {
             window_blanked: 0,
             last_rate: 0,
             inhibited: false,
+            trained: 0,
         }
     }
 
@@ -773,16 +799,20 @@ impl NoiseBlanker {
         let threshold = [f32::INFINITY, 6.0, 5.0, 4.0][self.level as usize];
         for i in 0..iq.len() {
             let mag = iq[i].norm();
-            if self.window_seen == 0 && self.last_rate == 0 {
+            if self.trained == 0 {
                 self.background = mag.max(1e-6);
             }
             // Clamping keeps a crash from raising the reference used to
             // recognise the rest of that same crash.
-            let observed = mag.min((self.background * 2.5).max(1e-6));
+            let observed = if self.trained < self.fs as usize / 4 {
+                mag
+            } else {
+                mag.min((self.background * 2.5).max(1e-6))
+            };
             self.background += (observed - self.background) * a;
             let hot = self.level != 0
                 && !self.inhibited
-                && self.window_seen > (self.fs as usize / 20).max(32)
+                && self.trained >= (self.fs as usize / 4).max(32)
                 && mag > threshold * self.background.max(1e-6);
             if hot {
                 for back in 0..=2 {
@@ -803,6 +833,7 @@ impl NoiseBlanker {
                 self.tail -= 1;
             }
             self.window_seen += 1;
+            self.trained = self.trained.saturating_add(1);
             if self.window_seen >= self.fs as usize {
                 self.last_rate = self.window_blanked;
                 self.inhibited = self.window_blanked * 50 > self.window_seen;

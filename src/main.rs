@@ -467,6 +467,8 @@ struct App {
     band_gains: Vec<f64>,
 
     spectrum: Vec<f32>,
+    noise_tracker: dsp::NoiseFloor,
+    noise_floor: Vec<f32>,
     spec_work: Vec<f32>,
     smoothed: Vec<f32>,
     waterfall: VecDeque<Vec<f32>>,
@@ -661,6 +663,8 @@ impl App {
             band_idx: 0,
             band_gains: vec![36.0; bands::BANDS.len()],
             spectrum: Vec::new(),
+            noise_tracker: dsp::NoiseFloor::new(),
+            noise_floor: Vec::new(),
             spec_work: Vec::new(),
             smoothed: Vec::new(),
             waterfall: VecDeque::new(),
@@ -1208,6 +1212,7 @@ impl App {
         let block: &[Complex32] = &buf;
 
         spec.power_db(block, &mut self.spectrum);
+        self.noise_floor = self.noise_tracker.update(&self.spectrum).to_vec();
         smooth_bins(
             &self.spectrum,
             SMOOTH_BINS[self.smooth_idx],
@@ -1244,7 +1249,9 @@ impl App {
         let mut sorted = self.smoothed.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         if !sorted.is_empty() {
-            let med = sorted[sorted.len() / 2];
+            let mut floors = self.noise_floor.clone();
+            floors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let med = floors.get(floors.len() / 2).copied().unwrap_or(sorted[sorted.len() / 2]);
             let hi = sorted[sorted.len() * 999 / 1000];
             self.floor_db = 0.94 * self.floor_db + 0.06 * (med - 4.0);
             self.ceil_db = 0.90 * self.ceil_db + 0.10 * (hi + 8.0).max(med + 18.0);
@@ -1313,7 +1320,10 @@ impl App {
                     .iter()
                     .cloned()
                     .fold(f32::MIN, f32::max);
-                self.cursor_snr = peak - sorted[sorted.len() / 2];
+                let floor = self.noise_floor.get(lo..=hi.max(lo))
+                    .and_then(|v| v.iter().copied().reduce(f32::max))
+                    .unwrap_or(sorted[sorted.len() / 2]);
+                self.cursor_snr = peak - floor;
             }
         }
 
@@ -1869,7 +1879,7 @@ fn next_signal(app: &mut App, forward: bool) {
         next_cw(app, forward);
         return;
     }
-    let mut peaks = find_peaks(&app.smoothed, 0.0, app.rate);
+    let mut peaks = find_peaks(&app.smoothed, &app.noise_floor, 0.0, app.rate);
     if peaks.is_empty() {
         app.log("no signals above the noise floor".into());
         return;
@@ -1898,14 +1908,14 @@ fn next_signal(app: &mut App, forward: bool) {
 }
 
 fn refresh_psk_hits(app: &mut App) {
-    let mut peaks = scout_peaks(&app.smoothed, 0.0, app.rate);
+    let mut peaks = scout_peaks(&app.smoothed, &app.noise_floor, 0.0, app.rate);
     peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     peaks.truncate(24);
     app.psk_hits = psk31::scan_span(&app.scout_iq, app.rate, &peaks);
 }
 
 fn refresh_cw_hits(app: &mut App) {
-    let mut peaks = scout_peaks(&app.smoothed, 0.0, app.rate);
+    let mut peaks = scout_peaks(&app.smoothed, &app.noise_floor, 0.0, app.rate);
     peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     peaks.truncate(24);
     app.cw_hits = cw::scan_span(&app.scout_iq, app.rate, &peaks);
@@ -2474,7 +2484,7 @@ fn step_scan(app: &mut App) -> Option<bool> {
     let kind = app.scan.as_ref()?.kind;
     match kind {
         ScanKind::Psk31 => {
-            let peaks = find_peaks(&app.smoothed, 0.0, app.rate);
+            let peaks = find_peaks(&app.smoothed, &app.noise_floor, 0.0, app.rate);
             let hits = psk31::scan_span(&app.scout_iq, app.rate, &peaks);
             if let Some(s) = app.scan.as_mut() {
                 for h in hits {
@@ -2489,7 +2499,7 @@ fn step_scan(app: &mut App) -> Option<bool> {
             }
         }
         ScanKind::Cw => {
-            let peaks = find_peaks(&app.smoothed, 0.0, app.rate);
+            let peaks = find_peaks(&app.smoothed, &app.noise_floor, 0.0, app.rate);
             let hits = cw::scan_span(&app.scout_iq, app.rate, &peaks);
             if let Some(s) = app.scan.as_mut() {
                 for h in hits {
@@ -2504,7 +2514,7 @@ fn step_scan(app: &mut App) -> Option<bool> {
             }
         }
         ScanKind::Energy => {
-            let peaks = find_peaks(&app.smoothed, cur, app.rate);
+            let peaks = find_peaks(&app.smoothed, &app.noise_floor, cur, app.rate);
             let ids = identify::classify_span(&app.scout_iq, app.rate, &app.smoothed, app.center);
             if let Some(s) = app.scan.as_mut() {
                 for (f, snr) in peaks {
@@ -2635,8 +2645,8 @@ const SIGNAL_SNR_DB: f32 = 10.0;
 /// Segmenting on a threshold rather than picking local maxima matters: a
 /// broadcast FM carrier or an SSB signal is a wide plateau, not a spike, and a
 /// strict local-maximum test walks straight past it.
-fn find_peaks(spectrum: &[f32], center: f64, rate: f64) -> Vec<(f64, f32)> {
-    find_peaks_above(spectrum, center, rate, SIGNAL_SNR_DB)
+fn find_peaks(spectrum: &[f32], floor: &[f32], center: f64, rate: f64) -> Vec<(f64, f32)> {
+    find_peaks_above(spectrum, floor, center, rate, SIGNAL_SNR_DB)
 }
 
 /// Candidate frequencies for the narrowband scouts.
@@ -2653,17 +2663,17 @@ fn find_peaks(spectrum: &[f32], center: f64, rate: f64) -> Vec<(f64, f32)> {
 /// of their *own* neighbourhood. That is what a narrowband carrier looks like
 /// however weak it is, and the scout behind this mixes each candidate down
 /// and matches it, which is a far stronger test than any bin level.
-fn scout_peaks(spectrum: &[f32], center: f64, rate: f64) -> Vec<(f64, f32)> {
+fn scout_peaks(spectrum: &[f32], floor: &[f32], center: f64, rate: f64) -> Vec<(f64, f32)> {
     const NEAR: usize = 3; // local-max half-width
     const CTX: usize = 40; // neighbourhood the prominence is measured against
-    const PROMINENCE_DB: f32 = 4.0;
+    const PROMINENCE_DB: f32 = 2.75;
     let n = spectrum.len();
     if n < 4 * CTX {
         return Vec::new();
     }
     let dc = n / 2;
     let edge = (n / 50).max(CTX);
-    let mut out: Vec<(f64, f32)> = Vec::new();
+    let mut candidates: Vec<(f64, f32, f32)> = Vec::new();
     let mut ctx: Vec<f32> = Vec::with_capacity(2 * CTX + 1);
     for i in edge..n - edge {
         if i.abs_diff(dc) <= 2 {
@@ -2682,17 +2692,26 @@ fn scout_peaks(spectrum: &[f32], center: f64, rate: f64) -> Vec<(f64, f32)> {
         );
         ctx.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let local = ctx[ctx.len() / 2];
-        if v - local < PROMINENCE_DB {
+        let reference = floor.get(i).copied().unwrap_or(local).max(local - 3.0);
+        if v - reference < PROMINENCE_DB {
             continue;
         }
         let freq = center + (i as f64 - n as f64 / 2.0) * rate / n as f64;
-        out.push((freq, v - local));
+        candidates.push((freq, v - reference, v - local));
     }
-    out
+    // A lowered gate is useful when it adds a handful of historically-quiet
+    // bins. If it opens across the whole span, the floor has not settled (or
+    // the span is pure noise); retain the former 4 dB gate for that frame.
+    let crowded = candidates.len() > 64;
+    candidates.into_iter()
+        .filter(|(_, _, local_prom)| !crowded || *local_prom >= 4.0)
+        .map(|(freq, prom, _)| (freq, prom))
+        .collect()
 }
 
 fn find_peaks_above(
     spectrum: &[f32],
+    floor: &[f32],
     center: f64,
     rate: f64,
     snr_db: f32,
@@ -2704,12 +2723,12 @@ fn find_peaks_above(
     let mut sorted = spectrum.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let med = sorted[n / 2];
-    let thr = med + snr_db;
     // The LO leaks a spike at the centre of the span; it is not a signal.
     let dc = n / 2;
     let edge = (n / 50).max(2);
     let usable = |i: usize| {
-        i >= edge && i + edge < n && i.abs_diff(dc) > 2 && spectrum[i] >= thr
+        let reference = floor.get(i).copied().unwrap_or(med).max(med - 3.0);
+        i >= edge && i + edge < n && i.abs_diff(dc) > 2 && spectrum[i] >= reference + snr_db
     };
 
     let mut out = Vec::new();
@@ -2730,6 +2749,51 @@ fn find_peaks_above(
         out.push((freq, spectrum[best] - med));
     }
     out
+}
+
+#[cfg(test)]
+mod noise_floor_detection_tests {
+    use super::*;
+
+    fn old_scout_count(spectrum: &[f32]) -> usize {
+        let local = -80.0;
+        spectrum.iter().enumerate().filter(|(i, v)| **v >= local + 4.0 && i.abs_diff(spectrum.len() / 2) > 2).count()
+    }
+
+    fn measured_thresholds() -> (f32, f32) {
+        let n = 1024;
+        let bin = 300;
+        let mut floor = vec![-80.0; n];
+        // This bin has historically been quiet; current local QRM has raised
+        // the neighbourhood without erasing that information.
+        floor[bin] = -90.0;
+        let mut old_at = f32::INFINITY;
+        let mut new_at = f32::INFINITY;
+        for half_db in 0..=16 {
+            let snr = half_db as f32 * 0.5;
+            let mut spectrum = vec![-80.0; n];
+            spectrum[bin] += snr;
+            if old_scout_count(&spectrum) > 0 { old_at = old_at.min(snr); }
+            if !scout_peaks(&spectrum, &floor, 0.0, 48_000.0).is_empty() { new_at = new_at.min(snr); }
+        }
+        (old_at, new_at)
+    }
+
+    #[test]
+    fn tracked_floor_opens_the_candidate_gate_by_two_db_without_flat_noise_hits() {
+        let (old_at, new_at) = measured_thresholds();
+        assert!(old_at - new_at >= 2.0, "gate improved only {:.1} dB", old_at - new_at);
+        let noise = vec![-80.0; 1024];
+        assert_eq!(old_scout_count(&noise), 0);
+        assert!(scout_peaks(&noise, &noise, 0.0, 48_000.0).is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_tracked_floor_candidate_gate() {
+        let (old_at, new_at) = measured_thresholds();
+        println!("scout candidate threshold: old {old_at:.1} dB, tracked floor {new_at:.1} dB ({:.1} dB improvement)", old_at - new_at);
+    }
 }
 
 // ---------------------------------------------------------------- rendering
@@ -5973,7 +6037,7 @@ mod scout_cost {
         }
         println!(
             "  candidates: {} peaks",
-            scout_peaks(&app.smoothed, 0.0, app.rate).len()
+            scout_peaks(&app.smoothed, &app.noise_floor, 0.0, app.rate).len()
         );
     }
 }

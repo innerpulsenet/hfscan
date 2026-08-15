@@ -35,14 +35,52 @@ const BANDWIDTH: f32 = 400.0;
 const FFT_SIZE: usize = 4096;
 /// z² peak / median — a real BPSK carrier stands well above the floor.
 const PEAK_RATIO: f32 = 6.0;
-/// Differential-symbol concentration that counts as "this is BPSK".
-const BPSK_QUALITY: f32 = 0.76;
+/// Differential-symbol concentration that counts as "this is BPSK", on the
+/// calibrated scale below (0.76 raw, the value this gate always used).
+const BPSK_QUALITY: f32 = 0.34;
 /// Idle PSK31 is almost all reversals; a CW carrier is almost none.
 const REV_MIN: f32 = 0.22;
 /// Idle PSK31 is continuous reversals (1.0); a CW carrier is ~0.
 const REV_MAX: f32 = 1.0;
-/// Do not print varicode until the demod has actually locked.
-const PRINT_QUALITY: f32 = 0.50;
+/// Copy below this confidence is noise being read as varicode. The scanner
+/// applies its own, higher floor on top; this one only stops the decoder
+/// spotting and printing when there is demonstrably nothing there.
+const PRINT_QUALITY: f32 = 0.20;
+/// Mean |cos| of a uniformly random phase — what the raw differential-symbol
+/// concentration reads on pure noise.
+///
+/// This is the whole reason a bad PSK31 lock still filled the pane with text.
+/// The raw measure is `E|cos θ|`, and for noise θ is uniform, so it settles at
+/// 2/π = 0.64, not 0: every threshold below that (the old 0.50 print gate, the
+/// old 0.35 lock-drop) was one noise could never fail. Subtracting the noise
+/// floor and rescaling gives a number that means what it says — 0 is noise,
+/// 1 is a perfectly resolved constellation — and makes a threshold like "only
+/// show me copy above 40%" a statement about the signal rather than a
+/// statement about arithmetic.
+const NOISE_Q: f32 = 2.0 / PI;
+/// Symbols the confidence average settles over — about two seconds of copy,
+/// and the point at which its own sampling error stops being worth
+/// discounting. Matches the 0.03 smoothing it runs at once warmed up.
+const Q_WINDOW: usize = 64;
+
+/// Put a raw differential-symbol concentration on the 0 = noise, 1 = clean
+/// scale. Only ever applied to an *averaged* raw value: clamping individual
+/// symbols would throw away the below-average half and leave noise reading
+/// ~0.37 instead of 0.
+fn calibrate(raw: f32) -> f32 {
+    ((raw - NOISE_Q) / (1.0 - NOISE_Q)).clamp(0.0, 1.0)
+}
+
+/// Rough SNR in a 2500 Hz reference bandwidth for a calibrated confidence.
+///
+/// Differential detection sees a phase error of variance 1/γ for a symbol SNR
+/// of γ, so `E|cos| = exp(-1/2γ)` and the confidence inverts to a γ. PSK31
+/// occupies 31.25 Hz, so the reference-bandwidth figure is 10log10(γ) - 19 dB.
+fn snr_from_quality(q: f32) -> f32 {
+    let raw = NOISE_Q + q.clamp(0.0, 1.0) * (1.0 - NOISE_Q);
+    let gamma = -1.0 / (2.0 * raw.clamp(1e-3, 0.999).ln());
+    (10.0 * gamma.log10() - 19.0).clamp(-24.0, 20.0)
+}
 const SYM_HIST: usize = 80;
 const ENV_HIST: usize = 400;
 /// Audio rate `scan_span` decimates radio IQ down to.
@@ -79,7 +117,15 @@ pub struct Psk31Decoder {
     pending_zero: bool,
     text: String,
     symbols: u32,
-    quality: f32,
+    /// Uncalibrated differential-symbol concentration, averaged. Read it
+    /// through `conf()`; on its own it never drops below `NOISE_Q`.
+    q_raw: f32,
+    /// Symbols folded into `q_raw` since the lock changed, capped. The
+    /// average is bias-corrected over these, so a fresh lock reports what it
+    /// is actually seeing within a few symbols instead of climbing out of
+    /// zero for a second — a second in which the copy floor would be
+    /// swallowing the start of every transmission.
+    q_n: f32,
     reversals: f32,
     have_prev: bool,
     /// Low-pass after the search mix so the demod sees ~PSK31 bandwidth.
@@ -159,7 +205,8 @@ impl Psk31Decoder {
             pending_zero: false,
             text: String::new(),
             symbols: 0,
-            quality: 0.0,
+            q_raw: 0.0,
+            q_n: 0.0,
             reversals: 0.0,
             have_prev: false,
             lpf: Complex32::new(0.0, 0.0),
@@ -182,6 +229,20 @@ impl Psk31Decoder {
             #[cfg(test)]
             captured_bits: Vec::new(),
         }
+    }
+
+    /// Copy confidence, 0 = noise and 1 = a perfectly resolved constellation.
+    ///
+    /// Discounted by how young the average is. A mean of |cos| over `n`
+    /// symbols carries a standard error of about 0.85/√n on this scale, so an
+    /// average four symbols old routinely reads 40% on pure noise — and a
+    /// threshold is only worth anything if noise cannot walk over it. The
+    /// discount is measured against the settled window (64 symbols) so it
+    /// falls to nothing once the estimate has earned its number, rather than
+    /// taxing every reading forever.
+    fn conf(&self) -> f32 {
+        let young = 0.85 * (1.0 / self.q_n.max(1.0).sqrt() - 1.0 / (Q_WINDOW as f32).sqrt());
+        (calibrate(self.q_raw) - young.max(0.0)).clamp(0.0, 1.0)
     }
 
     fn mix(&mut self, s: Complex32) -> Complex32 {
@@ -216,6 +277,11 @@ impl Psk31Decoder {
             self.energy.iter_mut().for_each(|e| *e = 0.0);
             self.word.clear();
             self.hear = Hear::Idle;
+            // Confidence describes the carrier being demodulated, and this is
+            // a different carrier. Carrying the old number over would let a
+            // good lock vouch for whatever the search jumped to next.
+            self.q_raw = 0.0;
+            self.q_n = 0.0;
         }
     }
 
@@ -276,6 +342,17 @@ impl Psk31Decoder {
             let hz = refine_hz(slice, self.fs, hz, self.sps);
             if let Some((q, _)) = confirm_psk(slice, self.fs, hz, self.sps) {
                 if hits.iter().any(|h: &PskHit| (h.offset_hz - hz).abs() < 12.0) {
+                    continue;
+                }
+                // Last and strictest: is it keying at 31.25 baud? Checked once
+                // per surviving candidate rather than inside `refine_hz`,
+                // which evaluates the cheap confirmations seven times over.
+                //
+                // Given the whole buffer rather than the FFT frame the search
+                // used: resolving a 31.25 Hz line apart from a 45.45 Hz one
+                // takes a second of envelope, and half a second of it reads a
+                // copyable signal as unkeyed.
+                if keys_at_other_baud(&self.search_buf, self.fs, hz) {
                     continue;
                 }
                 hits.push(PskHit {
@@ -347,7 +424,8 @@ impl Psk31Decoder {
         self.pending_zero = false;
         self.word.clear();
         self.hear = Hear::Idle;
-        self.quality = 0.0;
+        self.q_raw = 0.0;
+        self.q_n = 0.0;
         self.reversals = 0.0;
         self.sym_hist.clear();
         self.env_hist.clear();
@@ -376,9 +454,13 @@ impl Psk31Decoder {
         let bit = derot.re >= 0.0;
 
         // Confidence: how close the symbol sits to the real axis after removing
-        // the modulation. 1.0 is a clean lock, 0.0 is noise.
+        // the modulation. Averaged raw, then calibrated on read — a single
+        // symbol says almost nothing, and clamping one is what would bias the
+        // average (see `calibrate`).
         let q = derot.re.abs() / derot.norm().max(1e-12);
-        self.quality = 0.97 * self.quality + 0.03 * q;
+        let a = 0.03f32.max(1.0 / (self.q_n + 1.0));
+        self.q_raw += a * (q - self.q_raw);
+        self.q_n = (self.q_n + 1.0).min(Q_WINDOW as f32);
         self.reversals = 0.97 * self.reversals + 0.03 * if bit { 0.0 } else { 1.0 };
 
         // Strip the BPSK modulation, then nudge the AFC toward the leftover
@@ -395,7 +477,7 @@ impl Psk31Decoder {
 
         // Drop a stale lock if the demod has been garbage for a while.
         // Identification (vs CW / cross-terms) is search's job.
-        if self.locked && self.quality < 0.35 && self.symbols > 120 {
+        if self.locked && self.conf() < 0.10 && self.symbols > 120 {
             self.locked = false;
         }
 
@@ -418,7 +500,7 @@ impl Psk31Decoder {
             // "00" terminates a character.
             if !self.code.is_empty() {
                 if let Some(c) = self.varicode.get(self.code.as_str()).copied() {
-                    if self.locked && self.quality >= PRINT_QUALITY {
+                    if self.locked && self.conf() >= PRINT_QUALITY {
                         self.text.push(c);
                         self.on_char(c);
                     }
@@ -501,7 +583,7 @@ impl Psk31Decoder {
             return;
         }
         self.last_spot = call.clone();
-        let snr = (self.quality * 40.0 - 18.0).clamp(-20.0, 20.0);
+        let snr = snr_from_quality(self.conf());
         self.spots.push(FtMessage {
             stamp: utc_hhmmss(),
             snr_db: snr,
@@ -613,6 +695,136 @@ fn dc_focus(buf: &[Complex32], fs: f32, hz: f32) -> f32 {
     ((raw - baseline) / (1.0 - baseline).max(1e-6)).clamp(0.0, 1.0)
 }
 
+/// The rate at which the candidate is keying, and how far that line stands
+/// out of its own envelope spectrum.
+///
+/// This is the one feature that is *definitionally* PSK31 rather than merely
+/// consistent with it. Everything else `confirm_psk` measures — energy at DC,
+/// symbols on the real axis, a plausible reversal rate — a keyed carrier can
+/// satisfy, which is precisely how an RTTY mark tone was being confirmed as
+/// PSK31 and handed to the demodulator: RTTY idles on mark, so its mark tone
+/// alone is a carrier switching on and off, and switching on and off is what
+/// a BPSK detector reads as symbols.
+///
+/// A signal that carries information has to change state, and the rate it
+/// changes at is the mode. PSK31's raised-cosine pulses take the envelope to
+/// zero at every phase reversal, putting a line at 31.25 Hz; RTTY at 45.45
+/// baud puts one at 45.45 (or 22.7 for the alternating `RY` pattern); an
+/// unkeyed carrier has none at all.
+///
+/// Returns (strongest line Hz, its peak/median, the same ratio measured at
+/// 31.25 Hz) — the caller needs both the winner and PSK31's own line, because
+/// "there is a line at 31.25" and "nothing else is louder" are different
+/// claims and a keyed carrier can accidentally satisfy the first.
+pub(crate) fn baud_line(buf: &[Complex32], fs: f32, hz: f32) -> (f32, f32, f32) {
+    // Two seconds is sixty PSK31 symbols and ninety RTTY bits — enough for a
+    // clock line to be a line rather than a smear.
+    let n_win = buf.len().min((fs * 2.0) as usize);
+    if n_win < (fs * 0.5) as usize {
+        return (0.0, 0.0, 0.0);
+    }
+    let start = buf.len() - n_win;
+    // Channel filter first: the envelope has to be this signal's keying and
+    // not a neighbour's leaking through.
+    // The same ~60 Hz channel filter the demodulator runs. Narrower raises
+    // PSK31's own line, but it raises every other mode's leakage at 31.25 Hz
+    // by more — measured, a 35 Hz six-pole filter improves the absolute
+    // reading and halves the separation, which is the wrong trade for a test
+    // whose entire job is telling the modes apart.
+    let a = 1.0 - (-2.0 * PI * 60.0 / fs).exp();
+    let mut lp = [Complex32::new(0.0, 0.0); 3];
+    let dec = (fs / 500.0).round().max(1.0) as usize;
+    let mut env: Vec<f32> = Vec::with_capacity(n_win / dec + 1);
+    let mut osc = Rotator::new(-2.0 * PI * hz / fs);
+    let mut acc = 0.0f32;
+    let mut k = 0usize;
+    for i in 0..n_win {
+        let mut m = buf[start + i] * osc.next();
+        for z in lp.iter_mut() {
+            *z += (m - *z) * a;
+            m = *z;
+        }
+        acc += m.norm();
+        k += 1;
+        if k == dec {
+            env.push(acc / dec as f32);
+            acc = 0.0;
+            k = 0;
+        }
+    }
+    let n = env.len();
+    if n < 64 {
+        return (0.0, 0.0, 0.0);
+    }
+    let env_fs = fs / dec as f32;
+    let mean = env.iter().sum::<f32>() / n as f32;
+    // Hann against the mean: an unwindowed rectangle smears a strong line
+    // across the whole band and every candidate then looks keyed.
+    let win: Vec<f32> = env
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let w = 0.5 - 0.5 * (2.0 * PI * i as f32 / n as f32).cos();
+            (e - mean) * w
+        })
+        .collect();
+    // 15–70 Hz covers PSK31's 31.25, RTTY's 22.7 and 45.45, and the 75 baud
+    // and 100 baud lines that would say "not PSK31" just as clearly.
+    // A second of envelope resolves ~1 Hz, so half-hertz steps sample the
+    // Hann main lobe without paying for detail the window cannot deliver.
+    let line_at = |f: f32| -> f32 {
+        let mut re = 0.0f32;
+        let mut im = 0.0f32;
+        let w = -2.0 * PI * f / env_fs;
+        for (i, &v) in win.iter().enumerate() {
+            let (s, c) = (w * i as f32).sin_cos();
+            re += v * c;
+            im += v * s;
+        }
+        (re * re + im * im).sqrt()
+    };
+    let mut best = (0.0f32, 0.0f32);
+    let mut mags: Vec<f32> = Vec::with_capacity(111);
+    let mut f = 15.0f32;
+    while f <= 70.0 {
+        let mag = line_at(f);
+        mags.push(mag);
+        if mag > best.1 {
+            best = (f, mag);
+        }
+        f += 0.5;
+    }
+    mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med = mags[mags.len() / 2].max(1e-20);
+    (best.0, best.1 / med, line_at(BAUD) / med)
+}
+
+/// Reject a candidate whose envelope says it is keying at some *other* rate.
+///
+/// Framed as a veto rather than a requirement, deliberately. Requiring a
+/// strong 31.25 Hz line would be the stronger statement, but the line's
+/// absolute level depends on how the audio reached here — the span scout's
+/// decimation costs about 4 dB against the decoder's own filtered baseband —
+/// and a threshold tuned on one path silently stops identifying real signals
+/// on the other. What survives that difference is the *comparison*: when a
+/// signal is keying at 17 or 20 or 45.5 Hz, that line towers over 31.25, and
+/// no genuine PSK31 signal does that.
+///
+/// Measured over one second, PSK31 at 10 dB reads 5.6 at 31.25 Hz through the
+/// decoder and 3.2 through the span scout, with nothing else louder. An RTTY
+/// mark tone reads 2.0 there against 12.3 at 17 Hz; mid-shift, 0.1 against
+/// 5.2 at 45.5 Hz; the RY pattern 1.1 against 25.2; keyed CW 2.4 against 7.9.
+/// A three-to-one margin sits in the gap with room on both sides.
+fn keys_at_other_baud(buf: &[Complex32], fs: f32, hz: f32) -> bool {
+    let (_, peak, at_baud) = baud_line(buf, fs, hz);
+    // Too little audio to have measured anything; the other confirmations
+    // stand on their own rather than being vetoed by a non-measurement.
+    if peak <= 0.0 {
+        return false;
+    }
+    at_baud < 3.0 && peak > 3.0 * at_baud
+}
+
 fn env_notch(buf: &[Complex32], fs: f32, hz: f32, sps: usize) -> f32 {
     if sps == 0 {
         return 0.0;
@@ -661,6 +873,12 @@ fn env_notch(buf: &[Complex32], fs: f32, hz: f32, sps: usize) -> f32 {
 
 /// Mix `buf` by `hz` and measure BPSK quality plus phase-reversal rate over
 /// a handful of symbols. Used to tell PSK31 from a CW carrier or noise.
+///
+/// The quality returned is calibrated (0 = noise, 1 = clean), so it can be
+/// read against the same scale as the demodulator's own confidence. The
+/// comparisons that pick the best clock phase stay on the raw value: the
+/// calibration floors at zero, and everything about a noise candidate is
+/// below that floor.
 fn score_bpsk(buf: &[Complex32], fs: f32, hz: f32, sps: usize) -> (f32, f32) {
     if buf.len() < sps * 8 {
         return (0.0, 0.0);
@@ -721,7 +939,7 @@ fn score_bpsk(buf: &[Complex32], fs: f32, hz: f32, sps: usize) -> (f32, f32) {
             }
         }
     }
-    best
+    (calibrate(best.0), best.1)
 }
 
 fn utc_hhmmss() -> String {
@@ -811,7 +1029,7 @@ impl Decoder for Psk31Decoder {
             env,
             lock_hz: self.lock_hz(),
             tune_err_hz: self.afc * BAUD / (2.0 * PI),
-            quality: self.quality,
+            quality: self.conf(),
             reversals: self.reversals,
             locked: self.locked,
             hits: self.hits.clone(),
@@ -820,8 +1038,13 @@ impl Decoder for Psk31Decoder {
 
     fn process(&mut self, samples: &[Complex32]) -> String {
         self.search_buf.extend_from_slice(samples);
+        // Trim to the window rather than back to one FFT frame. Draining to
+        // FFT_SIZE made the buffer saw between one frame and two, so half the
+        // searches saw only half a second — fine for the FFT, which reads the
+        // last frame either way, but not for the baud-rate confirmation,
+        // which needs a full second to tell 31.25 Hz from 45.45 Hz.
         if self.search_buf.len() > FFT_SIZE * 2 {
-            let excess = self.search_buf.len() - FFT_SIZE;
+            let excess = self.search_buf.len() - FFT_SIZE * 2;
             self.search_buf.drain(..excess);
         }
         self.since_search += samples.len();
@@ -905,13 +1128,22 @@ impl Decoder for Psk31Decoder {
         let hz = self.lock_hz();
         let n = self.hits.len();
         let more = if n > 1 { format!(" +{}", n - 1) } else { String::new() };
+        let q = self.conf() * 100.0;
         if self.locked {
-            format!("lock {hz:+.1}Hz q={:.0}%{more}", self.quality * 100.0)
+            format!("lock {hz:+.1}Hz q={q:.0}%{more}")
         } else if self.lock_score > 0.0 {
-            format!("near {hz:+.1}Hz q={:.0}%", self.quality * 100.0)
+            format!("near {hz:+.1}Hz q={q:.0}%")
         } else {
-            format!("search q={:.0}%", self.quality * 100.0)
+            format!("search q={q:.0}%")
         }
+    }
+
+    fn confidence(&self) -> Option<f32> {
+        Some(self.conf())
+    }
+
+    fn speed(&self) -> Option<String> {
+        Some("31bd".into())
     }
 
     fn reset(&mut self) {
@@ -942,6 +1174,9 @@ pub fn scan_span(iq: &[Complex32], fs: f64, peaks: &[(f64, f32)]) -> Vec<PskHit>
         if let Some((q, _)) = confirm_psk(&audio, SCAN_AUDIO, hz, sps) {
             if out.iter().any(|h: &PskHit| (h.offset_hz - (off as f32 + hz)).abs() < 30.0)
             {
+                continue;
+            }
+            if keys_at_other_baud(&audio, SCAN_AUDIO, hz) {
                 continue;
             }
             out.push(PskHit {

@@ -1761,3 +1761,361 @@ fn ft8_traffic_does_not_frame_as_rtty() {
     let letters = out.chars().filter(|c| !c.is_whitespace()).count();
     assert!(letters <= 4, "FT8 traffic framed as {letters} chars of RTTY: {out:?}");
 }
+
+/// What the copy floor is actually made of.
+///
+/// The floor is only worth having if the number behind it separates the two
+/// cases: a signal being copied, and a demodulator chewing on band noise.
+/// This prints both so the default floor can be set from measurements
+/// instead of taste.
+#[test]
+#[ignore]
+fn bench_psk31_confidence() {
+    let msg = "CQ CQ DE W1AW W1AW PSE K";
+    println!("\n== confidence on signal, by SNR (in 31 Hz) ==");
+    for db in [40, 30, 20, 15, 10, 6, 3, 0] {
+        let sig = gen_psk31_snr(msg, 0.0, psk_scale_for_snr(db as f32));
+        let mut d = psk31::Psk31Decoder::new(FS);
+        let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+        chain.set_offset(d.offset_shift());
+        let mut audio = Vec::new();
+        let mut out = String::new();
+        let mut worst = 1.0f32;
+        for chunk in sig.chunks(4096) {
+            chain.process(chunk, &mut audio);
+            out.push_str(&d.process(&audio));
+            if d.locked() {
+                worst = worst.min(d.confidence().unwrap_or(0.0));
+            }
+        }
+        println!(
+            "  {db:>2} dB  conf {:>4}  (min while locked {:>4})  copy {:>4}",
+            format!("{:.0}%", d.confidence().unwrap_or(0.0) * 100.0),
+            format!("{:.0}%", worst * 100.0),
+            format!("{:.0}%", accuracy(msg, out.trim()) * 100.0),
+        );
+    }
+
+    println!("\n== confidence on noise alone ==");
+    for seed in [0x1234_5678u32, 0xdead_beef, 0x0bad_f00d] {
+        let mut rng = seed;
+        let sig: Vec<Complex32> = (0..(FS as usize * 20))
+            .map(|_| Complex32::new(noise(&mut rng), noise(&mut rng)))
+            .collect();
+        let mut d = psk31::Psk31Decoder::new(FS);
+        let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+        chain.set_offset(d.offset_shift());
+        let mut audio = Vec::new();
+        let mut out = String::new();
+        let mut peak = 0.0f32;
+        for chunk in sig.chunks(4096) {
+            chain.process(chunk, &mut audio);
+            out.push_str(&d.process(&audio));
+            peak = peak.max(d.confidence().unwrap_or(0.0));
+        }
+        println!(
+            "  seed {seed:#010x}  peak conf {:>4}  printed {} chars: {:?}",
+            format!("{:.0}%", peak * 100.0),
+            out.len(),
+            out.chars().take(40).collect::<String>(),
+        );
+    }
+}
+
+/// The copy floor rests on one claim: confidence separates a signal being
+/// copied from a demodulator chewing on band noise. `bench_psk31_confidence`
+/// prints the whole curve; this pins the two ends of it, either side of the
+/// scanner's default 40% floor.
+#[test]
+fn psk31_confidence_separates_copy_from_noise() {
+    let msg = "CQ CQ DE W1AW W1AW PSE K";
+    let sig = gen_psk31_snr(msg, 0.0, psk_scale_for_snr(10.0));
+    let mut d = psk31::Psk31Decoder::new(FS);
+    let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+    chain.set_offset(d.offset_shift());
+    let mut audio = Vec::new();
+    let mut out = String::new();
+    // The floor is applied from the first character, so what matters is the
+    // worst reading while the decoder is copying — not where it ends up.
+    let mut worst = 1.0f32;
+    for chunk in sig.chunks(4096) {
+        chain.process(chunk, &mut audio);
+        out.push_str(&d.process(&audio));
+        if !out.trim().is_empty() {
+            worst = worst.min(d.confidence().unwrap_or(0.0));
+        }
+    }
+    assert!(
+        worst > 0.45,
+        "a 10 dB signal copied at {:.0}% accuracy dropped to {:.0}% confidence \
+         while it was copying",
+        accuracy(msg, out.trim()) * 100.0,
+        worst * 100.0
+    );
+
+    // Noise must not merely score lower — it must stay under the floor for
+    // the whole run, because the floor is applied moment by moment.
+    for seed in [0x1234_5678u32, 0xdead_beef, 0x0bad_f00d] {
+        let mut rng = seed;
+        let sig: Vec<Complex32> = (0..(FS as usize * 20))
+            .map(|_| Complex32::new(noise(&mut rng), noise(&mut rng)))
+            .collect();
+        let mut d = psk31::Psk31Decoder::new(FS);
+        let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+        chain.set_offset(d.offset_shift());
+        let mut audio = Vec::new();
+        let mut peak = 0.0f32;
+        for chunk in sig.chunks(4096) {
+            chain.process(chunk, &mut audio);
+            let _ = d.process(&audio);
+            peak = peak.max(d.confidence().unwrap_or(0.0));
+        }
+        assert!(
+            peak < 0.40,
+            "noise (seed {seed:#010x}) reached {:.0}% confidence — the default floor would let it print",
+            peak * 100.0
+        );
+    }
+}
+
+/// The copy floor is one threshold across every mode, so CW and RTTY have to
+/// read on the same scale PSK31 was calibrated to: signal well above the
+/// floor, noise well below it, and — because the floor is applied from the
+/// first character — a metric that gets there without a long warm-up.
+#[test]
+#[ignore]
+fn bench_cw_rtty_confidence() {
+    let msg = "CQ CQ DE W1AW K";
+    println!("\n== CW confidence ==");
+    for scale in [0.01f32, 0.05, 0.15, 0.3, 0.6] {
+        let sig = gen_cw(msg, 20.0, scale);
+        let mut d = cw::CwDecoder::new(FS);
+        let mut out = String::new();
+        let mut first = None;
+        for chunk in sig.chunks(4096) {
+            out.push_str(&d.process(chunk));
+            if first.is_none() && !out.trim().is_empty() {
+                first = d.confidence();
+            }
+        }
+        println!(
+            "  noise x{scale:<5} conf {:>4}  at first copy {:>4}  {:?}",
+            format!("{:.0}%", d.confidence().unwrap_or(0.0) * 100.0),
+            format!("{:.0}%", first.unwrap_or(0.0) * 100.0),
+            out.trim().chars().take(28).collect::<String>(),
+        );
+    }
+    for seed in [0x1234_5678u32, 0xdead_beef] {
+        let mut rng = seed;
+        let sig: Vec<Complex32> = (0..(FS as usize * 20))
+            .map(|_| Complex32::new(noise(&mut rng), noise(&mut rng)))
+            .collect();
+        let mut d = cw::CwDecoder::new(FS);
+        let mut peak = 0.0f32;
+        let mut out = String::new();
+        for chunk in sig.chunks(4096) {
+            out.push_str(&d.process(chunk));
+            peak = peak.max(d.confidence().unwrap_or(0.0));
+        }
+        println!(
+            "  noise only     peak {:>4}  printed {} chars",
+            format!("{:.0}%", peak * 100.0),
+            out.trim().len()
+        );
+    }
+
+    println!("\n== RTTY confidence ==");
+    for scale in [0.03f32, 0.1, 0.3, 0.6] {
+        let sig = gen_rtty_snr("CQ CQ DE W1AW K ", 45.45, 170.0, scale);
+        let mut d = rtty::RttyDecoder::new(FS);
+        let mut out = String::new();
+        let mut first = None;
+        for chunk in sig.chunks(4096) {
+            out.push_str(&d.process(chunk));
+            if first.is_none() && !out.trim().is_empty() {
+                first = d.confidence();
+            }
+        }
+        println!(
+            "  noise x{scale:<5} conf {:>4}  at first copy {:>4}  {:?}",
+            format!("{:.0}%", d.confidence().unwrap_or(0.0) * 100.0),
+            format!("{:.0}%", first.unwrap_or(0.0) * 100.0),
+            out.trim().chars().take(28).collect::<String>(),
+        );
+    }
+    for seed in [0x1234_5678u32, 0xdead_beef] {
+        let mut rng = seed;
+        let sig: Vec<Complex32> = (0..(FS as usize * 20))
+            .map(|_| Complex32::new(noise(&mut rng), noise(&mut rng)))
+            .collect();
+        let mut d = rtty::RttyDecoder::new(FS);
+        let mut peak = 0.0f32;
+        let mut out = String::new();
+        for chunk in sig.chunks(4096) {
+            out.push_str(&d.process(chunk));
+            peak = peak.max(d.confidence().unwrap_or(0.0));
+        }
+        println!(
+            "  noise only     peak {:>4}  printed {} chars",
+            format!("{:.0}%", peak * 100.0),
+            out.trim().len()
+        );
+    }
+}
+
+/// The floor is applied from the first character, so every mode has to be
+/// confident *by* the first character — a metric that only settles after a
+/// few seconds would silently eat the start of every transmission, which is
+/// where the callsigns are. `bench_cw_rtty_confidence` prints the levels.
+#[test]
+fn confidence_is_ready_by_the_first_character() {
+    /// The scanner's default copy floor (`main::COPY_FLOOR`).
+    const FLOOR: f32 = 0.40;
+
+    let msg = "CQ CQ DE W1AW K";
+    let cases: Vec<(&str, Box<dyn Decoder>, Vec<Complex32>)> = vec![
+        (
+            "CW",
+            Box::new(cw::CwDecoder::new(FS)),
+            gen_cw(msg, 20.0, 0.15),
+        ),
+        (
+            "RTTY",
+            Box::new(rtty::RttyDecoder::new(FS)),
+            gen_rtty_snr("CQ CQ DE W1AW K ", 45.45, 170.0, 0.1),
+        ),
+    ];
+    for (name, mut d, sig) in cases {
+        let mut out = String::new();
+        let mut at_first = None;
+        for chunk in sig.chunks(4096) {
+            out.push_str(&d.process(chunk));
+            if at_first.is_none() && !out.trim().is_empty() {
+                // None is "no opinion", which the scanner passes through.
+                at_first = Some(d.confidence().unwrap_or(1.0));
+            }
+        }
+        assert!(
+            out.contains("W1AW"),
+            "{name}: expected copy to test against, got {out:?}"
+        );
+        let at_first = at_first.unwrap_or(0.0);
+        assert!(
+            at_first >= FLOOR,
+            "{name} reported {:.0}% when its first characters arrived — the \
+             default {:.0}% floor would have dropped them",
+            at_first * 100.0,
+            FLOOR * 100.0
+        );
+    }
+}
+
+/// RTTY at an arbitrary sample rate, for span-level tests.
+///
+/// Realistic in the way that matters for identification: the station idles on
+/// mark, so the space tone is present only inside characters and is far weaker
+/// than mark in an averaged spectrum.
+pub(crate) fn gen_rtty_at(
+    text: &str,
+    fs: f64,
+    offset_hz: f64,
+    shift: f32,
+    snr_scale: f32,
+    secs: f64,
+) -> Vec<Complex32> {
+    let sps = (fs as f32 / 45.45) as usize;
+    let mut bits: Vec<bool> = vec![true; 60];
+    let mut figs_state = false;
+    for c in text.chars() {
+        let Some((code, figs)) = ita2_code(c) else { continue };
+        if figs != figs_state && c != ' ' {
+            let sc = if figs { 0x1Bu8 } else { 0x1F };
+            bits.push(false);
+            for b in 0..5 {
+                bits.push(sc & (1 << b) != 0);
+            }
+            bits.push(true);
+            bits.push(true);
+            figs_state = figs;
+        }
+        bits.push(false);
+        for b in 0..5 {
+            bits.push(code & (1 << b) != 0);
+        }
+        bits.push(true);
+        bits.push(true);
+    }
+    bits.extend(std::iter::repeat_n(true, 60));
+
+    let mut rng = 0x5eed_9001u32;
+    let want = (fs * secs) as usize;
+    let mut out = Vec::with_capacity(want);
+    let mut phase = 0.0f32;
+    let mut i = 0usize;
+    while out.len() < want {
+        let mark = bits[i % bits.len()];
+        let f = offset_hz as f32 + if mark { shift / 2.0 } else { -shift / 2.0 };
+        for _ in 0..sps {
+            phase += 2.0 * PI * f / fs as f32;
+            out.push(
+                Complex32::from_polar(1.0, phase)
+                    + Complex32::new(noise(&mut rng), noise(&mut rng)) * snr_scale,
+            );
+        }
+        i += 1;
+    }
+    out.truncate(want);
+    out
+}
+
+/// Does the keying rate actually separate the modes? Everything else the
+/// PSK31 confirmation measures, a keyed carrier can fake.
+#[test]
+#[ignore]
+fn bench_baud_line() {
+    let show = |name: &str, sig: &[Complex32], hz: f32| {
+        let mut out = format!("  {name:<34}");
+        for secs in [1.0f32, 1.6, 2.0] {
+            let n = (FS as f32 * secs) as usize;
+            let cut = &sig[sig.len().saturating_sub(n)..];
+            let (f, prom, at) = psk31::baud_line(cut, FS as f32, hz);
+            out.push_str(&format!("  {secs:.1}s: {f:>5.1}Hz x{prom:>5.1} (31.25: x{at:>5.1})"));
+        }
+        println!("{out}");
+    };
+    println!("\n== PSK31 (expect ~31.25 Hz) ==");
+    for db in [30.0f32, 20.0, 15.0, 10.0, 6.0] {
+        let sig = gen_psk31_snr("CQ CQ DE W1AW W1AW PSE K", 0.0, psk_scale_for_snr(db));
+        show(&format!("psk31 {db:.0} dB"), &sig, 0.0);
+    }
+    let idle = gen_psk31_snr("", 0.0, psk_scale_for_snr(20.0));
+    if idle.len() > 8000 {
+        show("psk31 idle", &idle, 0.0);
+    }
+
+    println!("\n== RTTY 45.45 baud (expect ~45.5 or ~22.7 Hz) ==");
+    let rtty = gen_rtty_at("CQ CQ DE W1AW W1AW K ", FS, 0.0, 170.0, 0.03, 4.0);
+    show("rtty, mixed to the mark tone", &rtty, 85.0);
+    show("rtty, mixed to mid-shift", &rtty, 0.0);
+    show("rtty, mixed to the space tone", &rtty, -85.0);
+    let ry = gen_rtty_at("RYRYRYRYRYRYRYRY ", FS, 0.0, 170.0, 0.03, 4.0);
+    show("rtty RY test pattern, mark", &ry, 85.0);
+
+    println!("\n== things with no data on them ==");
+    let mut phase = 0.0f32;
+    let carrier: Vec<Complex32> = (0..(FS as usize * 4))
+        .map(|_| {
+            phase += 2.0 * PI * 20.0 / FS as f32;
+            Complex32::from_polar(1.0, phase)
+        })
+        .collect();
+    show("unkeyed carrier", &carrier, 20.0);
+    let mut rng = 0x1234_5678u32;
+    let n: Vec<Complex32> = (0..(FS as usize * 4))
+        .map(|_| Complex32::new(noise(&mut rng), noise(&mut rng)))
+        .collect();
+    show("noise", &n, 0.0);
+    let cw = gen_cw("CQ CQ DE W1AW K", 20.0, 0.03);
+    show("cw 20 wpm", &cw, CW_TONE);
+}
+

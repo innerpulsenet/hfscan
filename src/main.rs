@@ -156,6 +156,13 @@ const AUTO_FLUSH_SECS: f64 = 2.0;
 /// station is not silent for the minute it takes to fill a screen line.
 const AUTO_LINE: usize = 48;
 
+/// Confidence a decoder must have in what it is saying before the copy is
+/// printed at all. Measured, not chosen: PSK31 on band noise peaks around
+/// 25% and a signal 10 dB out of the noise — copied at 92% accuracy — sits
+/// at 53%, so the floor goes in the gap. See
+/// `decoders::tests::psk31_confidence_separates_copy_from_noise`.
+const COPY_FLOOR: f32 = 0.40;
+
 /// Longest transcript the auto pane keeps. Rows are fixed-height, so this is
 /// also how far back the pane can be scrolled.
 const DECODE_LOG_MAX: usize = 800;
@@ -191,6 +198,9 @@ struct SignalRow {
     mode: &'static str,
     /// Rolling copy, oldest trimmed off the front. Already sanitised.
     copy: String,
+    /// Signal and speed as of the newest copy — see `DecodeEntry`.
+    signal: String,
+    speed: String,
     /// When copy last arrived — decides live versus silent, and the order.
     last_copy: Instant,
 }
@@ -234,6 +244,12 @@ struct DecodeEntry {
     dial_hz: f64,
     kind: identify::Kind,
     mode: &'static str,
+    /// How well the signal was being copied when the line was emitted — a
+    /// confidence percentage for the continuous modes, the reported SNR for
+    /// FT8/FT4. Empty for the scanner's own remarks.
+    signal: String,
+    /// Sending speed at the same moment: `18wpm`, `45bd`.
+    speed: String,
     /// Already sanitised: printable, no control characters, no newlines.
     text: String,
 }
@@ -290,7 +306,14 @@ struct AutoSlot {
 }
 
 impl AutoSlot {
-    fn new(kind: identify::Kind, dial_hz: f64, center: f64, rate: f64, pinned: bool) -> Option<Self> {
+    fn new(
+        kind: identify::Kind,
+        dial_hz: f64,
+        center: f64,
+        rate: f64,
+        pinned: bool,
+        shift_hz: Option<f32>,
+    ) -> Option<Self> {
         let mode = match kind {
             identify::Kind::Cw => Mode::Cw,
             identify::Kind::Rtty => Mode::Rtty,
@@ -300,7 +323,11 @@ impl AutoSlot {
             _ => return None,
         };
         let mut chain = DecodeChain::new(rate, 400.0, mode.audio_rate());
-        let decoder = mode.make(chain.fs_out())?;
+        let mut decoder = mode.make(chain.fs_out())?;
+        // Before the bandwidth is read: for RTTY the shift *is* the bandwidth.
+        if let Some(hz) = shift_hz {
+            decoder.set_shift(hz);
+        }
         chain.set_bandwidth(decoder.bandwidth());
         chain.set_offset(dial_hz - center + decoder.offset_shift());
         let now = Instant::now();
@@ -610,6 +637,12 @@ struct App {
     show_help: bool,
     squelch: bool,
     squelch_db: f32,
+    /// Copy from a decoder less confident than this is dropped rather than
+    /// printed. The squelch above gates on how loud the passband is, which
+    /// says nothing about whether the demodulator is resolving it — a PSK31
+    /// signal can be 20 dB out of the noise and still be unreadable if the
+    /// lock is on its sideband. See `Decoder::confidence`.
+    copy_floor: f32,
     cursor_snr: f32,
 
     /// Recent radio IQ used by the span scout and the signature classifier.
@@ -653,6 +686,9 @@ struct LabelTrack {
     snr_db: f32,
     kind: identify::Kind,
     score: f32,
+    /// Carried through the hold so a slot built from a held label still gets
+    /// the shift the classifier measured.
+    shift_hz: Option<f32>,
     first: Instant,
     last_seen: Instant,
     pending_kind: identify::Kind,
@@ -667,6 +703,7 @@ impl LabelTrack {
             snr_db: id.snr_db,
             kind: id.kind,
             score: id.score,
+            shift_hz: id.shift_hz,
             first: now,
             last_seen: now,
             pending_kind: id.kind,
@@ -681,6 +718,7 @@ impl LabelTrack {
             snr_db: self.snr_db,
             kind: self.kind,
             score: self.score,
+            shift_hz: self.shift_hz,
         }
     }
 
@@ -807,6 +845,7 @@ impl App {
             show_help: false,
             squelch: true,
             squelch_db: 12.0,
+            copy_floor: COPY_FLOOR,
             cursor_snr: 0.0,
             scout_iq: Vec::new(),
             psk_hits: Vec::new(),
@@ -1067,6 +1106,8 @@ impl App {
             kind,
             mode,
             copy: String::new(),
+            signal: String::new(),
+            speed: String::new(),
             last_copy: Instant::now(),
         });
         self.rows.len() - 1
@@ -1107,6 +1148,8 @@ impl App {
             dial_hz: 0.0,
             kind: identify::Kind::Unknown,
             mode: "",
+            signal: String::new(),
+            speed: String::new(),
             text: sanitize(&text),
         });
         while self.decode_log.len() > DECODE_LOG_MAX {
@@ -1143,9 +1186,11 @@ impl App {
         // (message, dial, mode) — spotting needs `&self.reporter`, so it
         // cannot happen while `self.auto` is mutably borrowed.
         let mut spots: Vec<(FtMessage, f64, &'static str)> = Vec::new();
-        // (dial, kind, mode, copy) for the held rows, applied after the loop
-        // for the same borrow reason.
-        let mut copies: Vec<(f64, identify::Kind, &'static str, String)> = Vec::new();
+        // (dial, kind, mode, signal, speed, copy) for the held rows, applied
+        // after the loop for the same borrow reason.
+        let mut copies: Vec<(f64, identify::Kind, &'static str, String, String, String)> =
+            Vec::new();
+        let floor = self.copy_floor;
 
         for slot in &mut self.auto {
             slot.chain.process(block, &mut slot.audio);
@@ -1154,11 +1199,20 @@ impl App {
             }
             let text = slot.decoder.process(&slot.audio);
             let (dial_hz, kind, mode) = (slot.dial_hz, slot.kind, slot.decoder.name());
-            let row = |text: String| DecodeEntry {
+            let conf = slot.decoder.confidence();
+            let speed = slot.decoder.speed().unwrap_or_default();
+            let signal = conf.map(|c| format!("{:.0}%", c * 100.0)).unwrap_or_default();
+            // The decoder keeps running either way — it has to, or it would
+            // never find the lock that lifts it back over the floor. Only what
+            // it says while it is below the floor is thrown away.
+            let readable = conf.is_none_or(|c| c >= floor);
+            let row = |signal: &str, text: String| DecodeEntry {
                 stamp: stamp.clone(),
                 dial_hz,
                 kind,
                 mode,
+                signal: signal.to_string(),
+                speed: speed.clone(),
                 text: sanitize(&text),
             };
 
@@ -1168,21 +1222,45 @@ impl App {
                 for m in slot.decoder.take_messages() {
                     // The held row reads as a stream of recent traffic on
                     // this calling frequency; the log keeps the full detail.
-                    copies.push((dial_hz, kind, mode, format!("  {}  ", m.text)));
-                    lines.push(row(m.format()));
+                    // FT8 carries its own per-message SNR, which is a better
+                    // signal column than any running average of the slot.
+                    let sig = format!("{:+.0}dB", m.snr_db);
+                    copies.push((
+                        dial_hz,
+                        kind,
+                        mode,
+                        sig.clone(),
+                        String::new(),
+                        format!("  {}  ", m.text),
+                    ));
+                    // The stamp and frequency are already columns of their
+                    // own here, so the line keeps only what they do not say.
+                    lines.push(row(&sig, format!("{:+.1}s  {}", m.dt_sec, m.text)));
                     spots.push((m, slot.dial_hz, slot.decoder.name()));
                 }
             } else {
                 for m in slot.decoder.take_messages() {
-                    spots.push((m, slot.dial_hz, slot.decoder.name()));
+                    // A callsign scraped out of noise is worse on pskreporter
+                    // than it is on screen: it is wrong on someone else's map.
+                    if readable {
+                        spots.push((m, slot.dial_hz, slot.decoder.name()));
+                    }
                 }
+                let text = if readable { text } else { String::new() };
                 if text.is_empty() {
                     slot.quiet += slot.audio.len();
                 } else {
                     // Held rows take characters the moment they arrive, so a
                     // slow CW station builds up copy in place instead of
                     // waiting on a full line to be flushed to the log.
-                    copies.push((dial_hz, kind, mode, text.clone()));
+                    copies.push((
+                        dial_hz,
+                        kind,
+                        mode,
+                        signal.clone(),
+                        speed.clone(),
+                        text.clone(),
+                    ));
                     slot.partial.push_str(&text);
                     slot.quiet = 0;
                 }
@@ -1193,7 +1271,7 @@ impl App {
                     let line: String = slot.partial.drain(..=i).collect();
                     let line = line.trim_end().to_string();
                     if !line.is_empty() {
-                        lines.push(row(line));
+                        lines.push(row(&signal, line));
                     }
                 }
                 let idle = slot.quiet as f64 >= AUTO_FLUSH_SECS * slot.chain.fs_out();
@@ -1206,14 +1284,16 @@ impl App {
                         .nth(AUTO_LINE * 2)
                         .map_or(slot.partial.len(), |(i, _)| i);
                     let line: String = slot.partial.drain(..take).collect();
-                    lines.push(row(line.trim_end().to_string()));
+                    lines.push(row(&signal, line.trim_end().to_string()));
                 }
             }
         }
 
-        for (dial_hz, kind, mode, text) in copies {
+        for (dial_hz, kind, mode, signal, speed, text) in copies {
             let text = sanitize(&text);
             let i = self.row_for(dial_hz, kind, mode);
+            self.rows[i].signal = signal;
+            self.rows[i].speed = speed;
             self.rows[i].push_copy(&text);
         }
         self.sort_rows();
@@ -1267,7 +1347,8 @@ impl App {
         }
         let now = Instant::now();
         let half = self.rate * 0.45;
-        let mut wanted: Vec<(identify::Kind, f64, bool)> = Vec::new();
+        // (kind, dial, pinned, measured FSK shift)
+        let mut wanted: Vec<(identify::Kind, f64, bool, Option<f32>)> = Vec::new();
 
         for m in bands::MARKERS {
             let kind = match m.label {
@@ -1277,7 +1358,7 @@ impl App {
             };
             // The decoder needs the whole 200–3000 Hz passband inside the span.
             if (m.freq - self.center).abs() < half - 3200.0 {
-                wanted.push((kind, m.freq, true));
+                wanted.push((kind, m.freq, true, None));
             }
         }
 
@@ -1299,10 +1380,15 @@ impl App {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         for id in found {
-            wanted.push((id.kind, self.center + id.offset_hz as f64, false));
+            wanted.push((
+                id.kind,
+                self.center + id.offset_hz as f64,
+                false,
+                id.shift_hz,
+            ));
         }
 
-        for (kind, dial, pinned) in wanted {
+        for (kind, dial, pinned, shift) in wanted {
             if let Some(s) = self.auto.iter_mut().find(|s| s.same_signal(kind, dial)) {
                 s.last_seen = now;
                 continue;
@@ -1310,7 +1396,7 @@ impl App {
             if self.auto.len() >= MAX_AUTO_SLOTS {
                 continue;
             }
-            if let Some(slot) = AutoSlot::new(kind, dial, self.center, self.rate, pinned) {
+            if let Some(slot) = AutoSlot::new(kind, dial, self.center, self.rate, pinned, shift) {
                 self.auto.push(slot);
             }
         }
@@ -1536,8 +1622,16 @@ impl App {
             // Feeding noise to a decoder just fills the pane with junk - but
             // slot-based modes must keep capturing regardless.
             let open = !self.squelch || !gated || self.cursor_snr >= self.squelch_db;
+            let floor = self.copy_floor;
             if let Some(d) = &mut self.decoder {
                 let new = if open { d.process(out) } else { String::new() };
+                // Same floor the auto pane applies: the decoder keeps hunting,
+                // but text it has no confidence in never reaches the pane.
+                let new = if d.confidence().is_none_or(|c| c >= floor) {
+                    new
+                } else {
+                    String::new()
+                };
                 if !new.is_empty() {
                     // Never let raw demodulator bytes reach the terminal.
                     self.text.push_str(&sanitize_text(&new));
@@ -1551,7 +1645,15 @@ impl App {
                         self.text = self.text[cut..].to_string();
                     }
                 }
-                let msgs = d.take_messages();
+                // A spot is someone else's map entry; the floor applies to it
+                // at least as strictly as it does to the pane.
+                let msgs = match d.confidence() {
+                    Some(c) if c < floor => {
+                        d.take_messages();
+                        Vec::new()
+                    }
+                    _ => d.take_messages(),
+                };
                 if let Some(r) = &self.reporter {
                     let dial = self.tuned_freq();
                     for m in &msgs {
@@ -2018,6 +2120,16 @@ fn run_app<B: Backend>(
                     }
                     KeyCode::Char(',') => app.squelch_db = (app.squelch_db - 1.0).max(0.0),
                     KeyCode::Char('.') => app.squelch_db = (app.squelch_db + 1.0).min(40.0),
+                    KeyCode::Char('<') | KeyCode::Char('>') => {
+                        let step = if matches!(k.code, KeyCode::Char('>')) { 0.05 } else { -0.05 };
+                        app.copy_floor = (app.copy_floor + step).clamp(0.0, 0.95);
+                        let msg = if app.copy_floor <= 0.0 {
+                            "copy floor off — everything the decoders say is printed".to_string()
+                        } else {
+                            format!("copy floor {:.0}%", app.copy_floor * 100.0)
+                        };
+                        app.log(msg);
+                    }
                     KeyCode::Char('s') => {
                         if app.scan.is_some() {
                             app.scan = None;
@@ -2204,7 +2316,7 @@ fn refresh_cw_hits(app: &mut App) {
 /// is a perfectly copyable 10 dB in its own bandwidth reads as about 8 dB
 /// there and is never even offered for classification — measured: the whole
 /// auto path worked at 15 dB and saw nothing at 10, while the decoder itself
-/// copies at 10 dB and `scan_span` confirms it with quality 0.89.
+/// copies at 10 dB and `scan_span` confirms it with quality 0.70.
 ///
 /// The mode-specific scouts do not have that problem, because they mix each
 /// candidate down to baseband and match it there rather than reading a
@@ -2227,7 +2339,9 @@ fn scout_idents(app: &App) -> Vec<identify::Ident> {
     };
     let mut out = Vec::new();
     for h in &app.psk_hits {
-        if h.quality < 0.75 {
+        // 0.31 calibrated is the 0.76 raw concentration this gate has always
+        // wanted; see `psk31::calibrate`.
+        if h.quality < 0.31 {
             continue;
         }
         out.push(identify::Ident {
@@ -2236,6 +2350,7 @@ fn scout_idents(app: &App) -> Vec<identify::Ident> {
             snr_db: snr_at(h.offset_hz),
             kind: identify::Kind::Psk31,
             score: h.quality,
+            shift_hz: None,
         });
     }
     for h in &app.cw_hits {
@@ -2248,6 +2363,7 @@ fn scout_idents(app: &App) -> Vec<identify::Ident> {
             snr_db: snr_at(h.offset_hz),
             kind: identify::Kind::Cw,
             score: h.quality,
+            shift_hz: None,
         });
     }
     out
@@ -2261,9 +2377,15 @@ fn refresh_idents(app: &mut App) {
     // The classifier wins where it has an opinion; the scouts only add what
     // it never saw, so this cannot override a considered classification.
     for s in scout_idents(app) {
+        // "Never saw" means neither a classification nearby nor one whose
+        // signal already reaches this far. Without the second test a scout
+        // PSK31 hit on an RTTY mark tone's sideband — 180 Hz out, past the
+        // flat proximity check — reappears as its own ident and its own
+        // decoder, which is the whole misidentification arriving by the back
+        // door after the classifier correctly rejected it.
         let known = raw
             .iter()
-            .any(|r| (r.offset_hz - s.offset_hz).abs() < 120.0);
+            .any(|r| (r.offset_hz - s.offset_hz).abs() < 120.0 || r.covers(s.offset_hz));
         if !known {
             raw.push(s);
         }
@@ -2301,6 +2423,9 @@ fn apply_idents(app: &mut App, raw: Vec<identify::Ident>) {
             }
             t.snr_db = 0.6 * t.snr_db + 0.4 * id.snr_db;
             t.score = t.score.max(id.score);
+            // A measured shift replaces a held one; a classify that did not
+            // measure one leaves the last measurement standing.
+            t.shift_hz = id.shift_hz.or(t.shift_hz);
             t.last_seen = now;
             if id.kind == t.kind {
                 t.pending_hits = 0;
@@ -4345,7 +4470,11 @@ fn transcript_lines(app: &App, width: usize, rows: usize, ft: bool) -> Vec<Line<
 
 fn draw_decode(f: &mut Frame, area: Rect, app: &App) {
     let extra = match (app.mode, app.decoder.as_ref()) {
-        (Mode::Psk31, Some(d)) if d.locked() => format!("  lock {:+.1} Hz", d.lock_hz()),
+        (Mode::Psk31, Some(d)) if d.locked() => format!(
+            "  lock {:+.1} Hz  sig {:.0}%",
+            d.lock_hz(),
+            d.confidence().unwrap_or(0.0) * 100.0
+        ),
         (Mode::Psk31, _) => "  searching".into(),
         (Mode::Auto, _) if app.auto.is_empty() => "  listening for signals".into(),
         (Mode::Auto, _) => {
@@ -4377,6 +4506,20 @@ fn draw_decode(f: &mut Frame, area: Rect, app: &App) {
             }
             AutoView::Rows => format!(" decode: AUTO{extra} "),
             AutoView::Log => format!(" decode: AUTO — log{extra} "),
+        };
+    }
+    // The floor is why copy is missing when it is missing, so it says so on
+    // the border rather than only in the help — and says how many decoders it
+    // is currently holding back, so a quiet pane is never a mystery.
+    if app.copy_floor > 0.0 && app.mode != Mode::Off {
+        let muted = app
+            .auto
+            .iter()
+            .filter(|s| s.decoder.confidence().is_some_and(|c| c < app.copy_floor))
+            .count();
+        title = match muted {
+            0 => format!("{title}— sig ≥{:.0}% ", app.copy_floor * 100.0),
+            n => format!("{title}— sig ≥{:.0}%, {n} below ", app.copy_floor * 100.0),
         };
     }
     if app.msg_scroll > 0 {
@@ -4442,14 +4585,17 @@ fn signal_rows_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     if app.rows.is_empty() {
         return vec![Line::from(Span::styled(
-            "  age    kHz  mode  copy — nothing heard yet",
+            "  age    kHz  mode    sig  speed  copy — nothing heard yet",
             dim,
         ))];
     }
 
     // age (4) + gap, freq (9) + gap, mode (4) + two gaps before the copy.
     const HEAD: usize = 5 + 10 + 6;
-    let copy_width = width.saturating_sub(HEAD).max(8);
+    // signal (5) + gap, speed (5) + two gaps, dropped first on a narrow pane.
+    let show_meta = width >= HEAD + 13 + 24;
+    let head = HEAD + if show_meta { 13 } else { 0 };
+    let copy_width = width.saturating_sub(head).max(8);
 
     app.rows
         .iter()
@@ -4472,13 +4618,20 @@ fn signal_rows_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
                 Style::default().fg(if live { Color::Gray } else { Color::DarkGray }),
             ));
             spans.push(Span::styled(
-                format!("{:<4}  ", r.mode),
+                format!("{:<5} ", col_left(r.mode, 5)),
                 Style::default().fg(if live {
                     Color::Rgb(cr, cg, cb)
                 } else {
                     Color::DarkGray
                 }),
             ));
+            if show_meta {
+                spans.push(Span::styled(
+                    format!("{} ", col(&r.signal, 5)),
+                    signal_style(&r.signal, live),
+                ));
+                spans.push(Span::styled(format!("{}  ", col(&r.speed, 5)), dim));
+            }
 
             // The tail, so the newest copy is always on screen. A leading
             // ellipsis marks that there is more behind it.
@@ -4504,6 +4657,44 @@ fn signal_rows_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Right-align `s` in exactly `w` cells, truncating rather than letting a
+/// long value push every column after it out of place.
+///
+/// Everything in these columns is formatted from decoder state — a speed
+/// estimate is a float, and a float can print as `inf` or as five digits when
+/// the estimator is looking at noise. The pane's whole layout rests on each
+/// entry being exactly one row of known width, so the width is enforced here
+/// rather than assumed.
+fn col(s: &str, w: usize) -> String {
+    let n = s.chars().count();
+    if n >= w {
+        s.chars().take(w).collect()
+    } else {
+        format!("{}{s}", " ".repeat(w - n))
+    }
+}
+
+/// `col`, left-aligned. Used for the mode column, whose widest label —
+/// `PSK31` — is exactly as wide as the column and used to overrun it.
+fn col_left(s: &str, w: usize) -> String {
+    s.chars().take(w).collect()
+}
+
+/// Colour a signal column by what it says: a confidence percentage reads
+/// green when the copy is solid and amber when it is marginal, an FT8 SNR
+/// stays neutral (it is a report, not a warning).
+fn signal_style(signal: &str, live: bool) -> Style {
+    if !live {
+        return Style::default().fg(Color::DarkGray);
+    }
+    match signal.strip_suffix('%').and_then(|s| s.parse::<f32>().ok()) {
+        Some(pct) if pct >= 70.0 => Style::default().fg(Color::Green),
+        Some(pct) if pct >= 50.0 => Style::default().fg(Color::Yellow),
+        Some(_) => Style::default().fg(Color::Rgb(200, 120, 60)),
+        None => Style::default().fg(Color::Gray),
+    }
+}
+
 /// The automatic transcript as fixed columns: time, frequency, mode, copy.
 ///
 /// Every entry is exactly one row, truncated rather than wrapped, so the
@@ -4523,14 +4714,19 @@ fn decode_log_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
     let show_time = width >= 46;
     // time (8) + gap, freq (9) + gap, mode (4) + two gaps before the copy.
     let head = if show_time { 9 + 10 + 6 } else { 10 + 6 };
+    // signal (5) + gap, speed (5) + two gaps. The copy is what the pane is
+    // for, so the columns describing it go before it is squeezed.
+    let show_meta = width >= head + 13 + 24;
+    let head = head + if show_meta { 13 } else { 0 };
     let copy_width = width.saturating_sub(head).max(8);
 
     let dim = Style::default().fg(Color::DarkGray);
     if total == 0 {
-        let hint = if show_time {
-            "  time      kHz  mode  copy"
-        } else {
-            "       kHz  mode  copy"
+        let hint = match (show_time, show_meta) {
+            (true, true) => "  time      kHz  mode    sig  speed  copy",
+            (true, false) => "  time      kHz  mode  copy",
+            (false, true) => "       kHz  mode    sig  speed  copy",
+            (false, false) => "       kHz  mode  copy",
         };
         return vec![Line::from(Span::styled(hint, dim))];
     }
@@ -4550,13 +4746,20 @@ fn decode_log_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
                     Style::default().fg(Color::Gray),
                 ));
                 spans.push(Span::styled(
-                    format!("{:<4}  ", e.mode),
+                    format!("{:<5} ", col_left(e.mode, 5)),
                     Style::default().fg(Color::Rgb(r, g, b)),
                 ));
+                if show_meta {
+                    spans.push(Span::styled(
+                        format!("{} ", col(&e.signal, 5)),
+                        signal_style(&e.signal, true),
+                    ));
+                    spans.push(Span::styled(format!("{}  ", col(&e.speed, 5)), dim));
+                }
             } else {
                 // The scanner's own remarks keep the copy column aligned but
                 // leave the frequency and mode columns empty.
-                spans.push(Span::raw(" ".repeat(16)));
+                spans.push(Span::raw(" ".repeat(if show_meta { 29 } else { 16 })));
             }
             let mut copy: String = e.text.chars().take(copy_width).collect();
             if e.text.chars().count() > copy_width && copy_width > 1 {
@@ -5308,6 +5511,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  j           impulse blanker (off / gentle / normal / aggressive)"),
         Line::from("  l           RX bandpass (auto / 80 / 200 / 500 / 1.5k / 3k)"),
         Line::from("  k           squelch on/off  , / .   squelch threshold"),
+        Line::from("  < / >       copy floor: hide decodes the decoder itself is"),
+        Line::from("              not confident in (the sig column, 0 = noise)"),
         Line::from("  t           toggle bias-T (external preamp power)"),
         Line::from("  o           station settings (callsign, grid, spotting)"),
         Line::from("  x           clear the decode pane"),
@@ -5377,6 +5582,7 @@ mod tests {
             snr_db,
             kind,
             score: 0.8,
+            shift_hz: None,
         }
     }
 
@@ -5488,6 +5694,8 @@ mod tests {
             dial_hz: 7_033_250.0,
             kind: identify::Kind::Cw,
             mode: "CW",
+            signal: "82%".into(),
+            speed: "18wpm".into(),
             text: "CQ DE W1AW".into(),
         });
         let rect = ratatui::layout::Rect::new(0, 0, 80, 4);
@@ -5685,6 +5893,7 @@ mod tests {
             snr_db: 14.0,
             kind: super::identify::Kind::Cw,
             score: 0.8,
+            shift_hz: None,
         };
         super::apply_idents(&mut app, vec![hit]);
         assert_eq!(app.tracks.len(), 1);
@@ -5705,6 +5914,7 @@ mod tests {
             snr_db: 14.0,
             kind: super::identify::Kind::Cw,
             score: 0.8,
+            shift_hz: None,
         }];
         super::merge_heard(&mut app);
         assert_eq!(app.heard.len(), 1);
@@ -5865,6 +6075,8 @@ mod tests {
                 dial_hz: 14_070_000.0 + i as f64,
                 kind: identify::Kind::Psk31,
                 mode: "PSK",
+                signal: super::sanitize(junk),
+                speed: super::sanitize(junk),
                 text: super::sanitize(junk),
             });
         }
@@ -5874,6 +6086,8 @@ mod tests {
             dial_hz: 14_074_000.0,
             kind: identify::Kind::Cw,
             mode: "CW",
+            signal: "9".repeat(40),
+            speed: "9".repeat(40),
             text: "X".repeat(500),
         });
         // The same, held in rows: what a decoder chewing on noise builds up.
@@ -5911,12 +6125,66 @@ mod tests {
         }
     }
 
+    /// Every column the auto log draws is fixed-width, including the two
+    /// describing the signal — a decoder's own numbers must never be able to
+    /// shift the copy column out from under the line above it.
+    #[test]
+    fn decode_columns_line_up_across_modes() {
+        let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
+        app.auto_view = super::AutoView::Log;
+        for (f, k, m, sig, speed, text) in [
+            (14_070_150.0, identify::Kind::Psk31, "PSK31", "78%", "31bd", "CQ DE W1AW K"),
+            (14_074_000.0, identify::Kind::Ft8, "FT8", "-12dB", "", "+0.2s  CQ K1ABC FN42"),
+            (14_035_000.0, identify::Kind::Cw, "CW", "91%", "22wpm", "TEST DE W2XYZ"),
+            // A speed estimate off the rails, which is what a decoder hands
+            // back when it is timing noise.
+            (14_083_000.0, identify::Kind::Rtty, "RTTY", "100000%", "inf wpm", "RYRY DE VK3"),
+        ] {
+            app.decode_log.push_back(super::DecodeEntry {
+                stamp: "12:34:56".into(),
+                dial_hz: f,
+                kind: k,
+                mode: m,
+                signal: sig.into(),
+                speed: speed.into(),
+                text: text.into(),
+            });
+        }
+        // The scanner's own remarks pad the same columns rather than filling
+        // them, and must land in the copy column too.
+        app.push_decode_note("auto: 4 decoder(s) running".into());
+
+        let rect = ratatui::layout::Rect::new(0, 0, 96, 6);
+        let lines = super::decode_log_lines(&app, rect);
+        // The copy is the last span of each line, so everything before it is
+        // the columns — and that has to come to the same width every time.
+        let heads: Vec<usize> = lines
+            .iter()
+            .map(|l| {
+                let whole: String = l.spans.iter().map(|s| s.content.to_string()).collect();
+                assert!(whole.chars().count() <= 96, "line overruns the pane: {whole:?}");
+                l.spans
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .map(|s| s.content.chars().count())
+                    .sum()
+            })
+            .collect();
+        assert!(
+            heads.windows(2).all(|w| w[0] == w[1]),
+            "the copy column starts at different offsets: {heads:?}"
+        );
+    }
+
     fn row(app: &mut App, freq: f64, kind: identify::Kind, copy: &str, ago_secs: u64) {
         app.rows.push(super::SignalRow {
             dial_hz: freq,
             kind,
             mode: kind.label(),
             copy: copy.into(),
+            signal: "70%".into(),
+            speed: "20wpm".into(),
             last_copy: super::Instant::now() - Duration::from_secs(ago_secs),
         });
     }
@@ -6046,6 +6314,8 @@ mod tests {
                 dial_hz: 14_070_000.0,
                 kind: identify::Kind::Cw,
                 mode: "CW",
+                signal: "70%".into(),
+                speed: "20wpm".into(),
                 text: format!("line {i}"),
             });
         }
@@ -6165,6 +6435,84 @@ mod psk_auto_tests {
         let in_bw = n_total * (31.25 / fs as f32).sqrt();
         let scale = 10f32.powf(-db / 20.0) / in_bw;
         decoders::tests::gen_psk31_at("CQ CQ DE W1AW W1AW K ", fs, offset, scale, secs)
+    }
+
+
+    fn rtty_span(offset: f64, db: f32, shift: f32, fs: f64, secs: f64) -> Vec<Complex32> {
+        // Same SNR convention as `psk_span`, referenced to the RTTY shift.
+        let n_total = (1.0f32 / 6.0).sqrt();
+        let in_bw = n_total * (shift / fs as f32).sqrt();
+        let scale = 10f32.powf(-db / 20.0) / in_bw;
+        decoders::tests::gen_rtty_at("CQ CQ DE W1AW W1AW K ", fs, offset, shift, scale, secs)
+    }
+
+    /// The reported failure, end to end: RTTY on the band, labelled PSK31,
+    /// with a PSK31 decoder attached filling the pane with nonsense.
+    ///
+    /// Checked through the whole auto path rather than at the classifier,
+    /// because the classifier was only one of the two routes to a PSK31 slot
+    /// — the span scout raises its own idents and reached the same wrong
+    /// answer independently.
+    #[test]
+    fn rtty_does_not_become_a_psk31_decoder() {
+        let fs = 192_000.0f64;
+        let iq = rtty_span(1_500.0, 20.0, 170.0, fs, 14.0);
+        let mut app = App::new(7_045_000.0, fs, Mode::Auto);
+        app.agc = AgcMode::Off;
+        run_auto(&mut app, &iq, fs);
+
+        let rtty: String = app
+            .rows
+            .iter()
+            .filter(|r| r.kind == identify::Kind::Rtty)
+            .map(|r| r.copy.clone())
+            .collect();
+        assert!(
+            rtty.contains("W1AW"),
+            "the RTTY signal did not reach the pane as RTTY: {rtty:?} (slots {:?})",
+            app.auto.iter().map(|s| s.kind.label()).collect::<Vec<_>>()
+        );
+        // A stray slot that finds nothing is tolerable; a pane of invented
+        // varicode is the bug. The copy floor keeps the two apart.
+        let junk: String = app
+            .rows
+            .iter()
+            .filter(|r| r.kind == identify::Kind::Psk31)
+            .flat_map(|r| r.copy.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            junk.chars().count() < 8,
+            "RTTY was decoded as PSK31: {junk:?}"
+        );
+    }
+
+    /// The same across the shifts in amateur use. Slow — every case is a full
+    /// fourteen seconds of span audio through the whole auto path.
+    #[test]
+    #[ignore]
+    fn bench_rtty_shifts_in_auto_mode() {
+        let fs = 192_000.0f64;
+        for (shift, db) in [(170.0f32, 20.0f32), (170.0, 10.0), (425.0, 20.0), (850.0, 20.0)] {
+            let iq = rtty_span(1_500.0, db, shift, fs, 14.0);
+            let mut app = App::new(7_045_000.0, fs, Mode::Auto);
+            app.agc = AgcMode::Off;
+            run_auto(&mut app, &iq, fs);
+            println!(
+                "\n== {shift:.0} Hz shift, {db:.0} dB ==\n  idents: {:?}\n  slots: {:?}",
+                app.idents
+                    .iter()
+                    .map(|i| format!("{} @{:+.0} {:.2}", i.kind.label(), i.offset_hz, i.score))
+                    .collect::<Vec<_>>(),
+                app.auto
+                    .iter()
+                    .map(|s| format!("{} @{:+.0}", s.kind.label(), s.dial_hz - 7_045_000.0))
+                    .collect::<Vec<_>>(),
+            );
+            for r in &app.rows {
+                println!("  row {:<5} {:?}", r.mode, r.copy.chars().take(60).collect::<String>());
+            }
+        }
     }
 
     /// The whole reason a PSK31 signal on the band reaches the screen: the

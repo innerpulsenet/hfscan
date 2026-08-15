@@ -66,6 +66,7 @@ switches the radio to 192 kHz automatically if the current rate will not do.
 | `e` | spectrum smoothing: light / medium / heavy |
 | `l` | RX bandpass: auto (mode default) / 80 / 200 / 500 / 1500 / 3000 Hz |
 | `k` | squelch on/off; `,` / `.` adjust the threshold |
+| `<` / `>` | copy floor: hide decodes the decoder itself is not confident in |
 | `t` | toggle the bias-T (external preamp power) |
 | `o` | station settings: your callsign and grid locator |
 | `x` | clear the decode pane |
@@ -157,6 +158,34 @@ chip fades, and shows the latest status message. Band scan (`s`) prints
 the same tags next to each hit. Park the cursor on a chip and press `d`
 to copy it.
 
+The order the tests run in matters as much as the tests themselves, because
+the first one to confirm wins. FSK goes first: a signal alternating between
+two tones cannot be anything else, whereas "looks like BPSK" and "looks like
+keyed CW" are both things a *single* RTTY tone satisfies. RTTY idles on mark
+and returns to mark between characters, so its mark tone is a carrier keying
+on and off — and a BPSK detector reads keying on and off as symbols. With the
+PSK31 probe running first, ordinary RTTY was labelled PSK31 and handed a
+decoder, which is where the nonsense in the pane came from.
+
+Two tones are detected from the *instantaneous frequency*, not from two peaks
+in an averaged spectrum. The peak-pair test needs the weaker tone within about
+6 dB of the stronger, which mostly-mark traffic never delivers; instantaneous
+frequency is bimodal whatever the duty cycle between the tones. That also
+measures the shift, so the 425 and 850 Hz shifts in amateur use are decoded at
+the shift they are actually sent on instead of framed as if they were 170 Hz.
+
+Backing that up, the PSK31 confirmation now checks *the rate the signal keys
+at*. Energy at DC, symbols on the real axis and a plausible reversal rate are
+all things a keyed carrier satisfies; keying 31.25 times a second is what
+PSK31 **is**. The envelope's clock line sits at 31.25 Hz for PSK31, 45.45 (or
+22.7) for RTTY, 15–25 for hand-sent CW, and nowhere for an unkeyed carrier —
+so a candidate whose line is clearly somewhere else is rejected however BPSK
+it looks. It is framed as a veto rather than a requirement on purpose: the
+line's absolute level depends on how the audio arrived (the span scout's
+decimation costs about 4 dB against the decoder's own filtered baseband), and
+a level threshold tuned on one path quietly stops identifying real signals on
+the other. The comparison survives that difference; the level does not.
+
 ### The decoders
 
 - **CW** — envelope detection with hysteresis and a peak/noise-floor tracker.
@@ -171,9 +200,12 @@ to copy it.
   with absolute RF, lock offset, a ±20 Hz centre-frequency meter, WPM,
   and the tones in the passband. `u` / `i` trim the lock 2 Hz; `g`
   centres the cursor on it.
-- **RTTY** — FM discriminator, start-bit clock recovery, 45.45 baud / 170 Hz
-  shift, ITA2 with LTRS/FIGS shifts. Reports the percentage of correctly framed
-  characters, which is a good tuning indicator.
+- **RTTY** — FM discriminator, start-bit clock recovery, 45.45 baud, ITA2 with
+  LTRS/FIGS shifts. Reports the percentage of correctly framed characters,
+  which is a good tuning indicator. The shift defaults to 170 Hz; in auto mode
+  the classifier measures it and the slot is built with it, snapped to the
+  nearest standard (170 / 425 / 850) so a noisy measurement cannot detune the
+  matched filters.
 - **PSK31** — differential BPSK, so no carrier recovery loop is needed. The
   decoder identifies a nearby PSK31 signal (within ~180 Hz of the cursor) by
   squaring the baseband — that wipes the modulation and leaves a tone at
@@ -276,6 +308,28 @@ in once a callsign is set — without one, nothing is transmitted.
 
 A squelch gates the streaming decoders on the SNR measured in the cursor's
 passband — without it, decoders cheerfully turn noise into text.
+
+### The copy floor
+
+Every continuous-mode decoder reports how much of what it is emitting is real
+copy rather than noise read as characters, on a scale where **0 is band noise
+and 1 is every symbol resolved cleanly**. It is the `sig` column in the decode
+pane, next to the sending speed (`31bd`, `18wpm`), and it is what `<` / `>`
+threshold: copy from a decoder below the floor is dropped instead of printed,
+and is not spotted to pskreporter either. The pane border shows the current
+floor and how many decoders it is holding back, so a quiet pane is never a
+mystery. FT8 and FT4 decide per transmission and report their own SNR in that
+column instead.
+
+The scale is calibrated per mode rather than merely trending the right way,
+because a single threshold has to mean the same thing everywhere. PSK31 is the
+instructive case: its raw measure is the mean of |cos θ| over differential
+symbols, and for noise θ is uniform, so it settles at 2/π = 0.64 — *not* zero.
+Every threshold below that was one noise could never fail, which is why a bad
+lock used to fill the pane with plausible-looking varicode. Subtracting the
+noise floor and rescaling puts band noise at 0.18–0.25 and a signal 10 dB out
+of the noise — copied at 92% accuracy — at 0.53, so the default floor of 40%
+sits in the gap. `decoders::tests::bench_psk31_confidence` prints the curve.
 
 ### Tuning tips
 

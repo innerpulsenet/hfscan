@@ -361,6 +361,48 @@ impl Decoder for RttyDecoder {
         )
     }
 
+    /// Snap to the nearest shift in amateur use rather than to whatever the
+    /// histogram measured: the standard shifts are 170, 425 and 850 Hz, and a
+    /// demodulator run at the measured 431 Hz would put its matched filters
+    /// slightly off both tones for no reason. Anything not near a standard
+    /// shift is left alone — better the 170 Hz default than a wrong guess.
+    fn set_shift(&mut self, hz: f32) {
+        let snapped = [170.0f32, 425.0, 850.0]
+            .into_iter()
+            .min_by(|a, b| {
+                (a - hz)
+                    .abs()
+                    .partial_cmp(&(b - hz).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(170.0);
+        if (snapped - hz).abs() <= 0.15 * snapped {
+            RttyDecoder::set_shift(self, snapped);
+        }
+    }
+
+    /// Framing success, rescaled so noise reads zero.
+    ///
+    /// A Baudot framer fed noise still finds a start bit and a valid stop bit
+    /// about half the time — that is the whole reason `process` throws the
+    /// buffer away below 50% rather than below zero. So half is the floor
+    /// here too, and only what is framed above chance counts as copy.
+    /// Too few frames to judge is reported as no opinion rather than as no
+    /// confidence. The first characters of a transmission arrive on the first
+    /// two or three frames — calling that zero would hold back exactly the
+    /// copy the decoder waited for its polarity vote to release.
+    fn confidence(&self) -> Option<f32> {
+        let fr = &self.framers[self.chosen()?];
+        if fr.good + fr.err < 4 {
+            return None;
+        }
+        Some(((fr.framed() - 0.5) * 2.0).clamp(0.0, 1.0))
+    }
+
+    fn speed(&self) -> Option<String> {
+        Some(format!("{:.0}bd", self.baud))
+    }
+
     /// `r` forces the polarity and stops the detector second-guessing it.
     fn toggle(&mut self) {
         let cur = self.chosen().unwrap_or(0);

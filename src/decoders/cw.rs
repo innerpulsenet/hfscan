@@ -1009,6 +1009,18 @@ impl Decoder for CwDecoder {
         }
     }
 
+    /// How cleanly recent marks fell into the dit and dah buckets. Keying that
+    /// is really noise through the slicer has random mark lengths, so they
+    /// straddle the boundary and this collapses; well-sent CW sits near 1.
+    fn confidence(&self) -> Option<f32> {
+        Some(self.quality.clamp(0.0, 1.0))
+    }
+
+    fn speed(&self) -> Option<String> {
+        let wpm = self.wpm();
+        (wpm >= 1.0).then(|| format!("{wpm:.0}wpm"))
+    }
+
     fn reset(&mut self) {
         self.text.clear();
         self.marks.clear();

@@ -65,6 +65,24 @@ pub struct Ident {
     pub kind: Kind,
     /// 0..1 confidence.
     pub score: f32,
+    /// Measured mark/space separation for `Kind::Rtty`. 170 Hz is the common
+    /// case but 425 and 850 are both in amateur use, and a decoder given the
+    /// wrong one frames noise — so the classifier passes on what it measured
+    /// rather than letting the decoder assume.
+    pub shift_hz: Option<f32>,
+}
+
+impl Ident {
+    /// Whether an offset falls inside what this signal already explains.
+    ///
+    /// An FSK signal reaches beyond its own shift: each tone keys on and off,
+    /// and the sidebands and squaring cross-terms that produces are what the
+    /// narrowband probes latch onto a couple of hundred hertz out. Anything
+    /// found in there belongs to this signal, not beside it.
+    pub fn covers(&self, offset_hz: f32) -> bool {
+        let margin = if self.kind == Kind::Rtty { 150.0 } else { 0.0 };
+        (self.offset_hz - offset_hz).abs() <= self.bw_hz * 0.5 + margin
+    }
 }
 
 /// Classify occupied regions in `spectrum` using a short IQ buffer.
@@ -94,7 +112,7 @@ pub fn classify_span(
             continue;
         }
         let abs = abs_center + o.offset_hz as f64;
-        let (kind, score) = classify_one(&audio, fs_a, o.bw_hz, abs, &mut fft);
+        let (kind, score, fsk) = classify_one(&audio, fs_a, o.bw_hz, abs, &mut fft);
         // Nyquist-edge junk, mixed to audio, often looks like an FT8
         // forest. Ham modes do not live outside the allocations.
         if kind.amateur_only() && !bands::in_amateur(abs) {
@@ -103,20 +121,39 @@ pub fn classify_span(
         if kind == Kind::Unknown && score < 0.35 {
             continue;
         }
-        if out
-            .iter()
-            .any(|i: &Ident| (i.offset_hz - o.offset_hz).abs() < o.bw_hz.max(80.0) * 0.5)
-        {
+        // Against the wider of the two footprints, not just this
+        // occupancy's. A wide-shift FSK signal appears in the periodogram as
+        // two separate occupancies, and the second one — a lone keyed tone —
+        // classifies as CW and spawns its own decoder unless the RTTY ident
+        // already covering that frequency is allowed to claim it.
+        if out.iter().any(|i: &Ident| {
+            (i.offset_hz - o.offset_hz).abs() < i.bw_hz.max(o.bw_hz).max(80.0) * 0.5
+        }) {
             continue;
         }
         out.push(Ident {
-            offset_hz: o.offset_hz,
-            bw_hz: o.bw_hz,
+            // An FSK occupancy peaks on whichever tone is busier — mark, for
+            // a station that idles there. Report the midpoint instead, which
+            // is where a decoder has to sit.
+            offset_hz: o.offset_hz + fsk.map_or(0.0, |(_, mid)| mid),
+            // An FSK signal occupies its shift plus a bit of skirt, whatever
+            // the occupancy detector made of its two halves.
+            bw_hz: fsk.map_or(o.bw_hz, |(sep, _)| (sep + 200.0).max(o.bw_hz)),
             snr_db: o.snr_db,
             kind,
             score,
+            shift_hz: fsk.map(|(sep, _)| sep),
         });
     }
+    // An FSK signal covers its whole shift, and its two tones are each a
+    // keyed carrier in their own right — so whatever else was identified
+    // inside that span is one of those tones read on its own. This is
+    // resolved here rather than by the overlap check above, which runs
+    // strongest-occupancy-first and would just as happily let a mark tone's
+    // PSK31 verdict suppress the RTTY ident that explains it. Two tones
+    // alternating is the stronger claim whichever arrived first.
+    let spans: Vec<Ident> = out.iter().filter(|i| i.kind == Kind::Rtty).cloned().collect();
+    out.retain(|i| i.kind == Kind::Rtty || !spans.iter().any(|r| r.covers(i.offset_hz)));
     cluster_ft(out)
 }
 
@@ -183,13 +220,16 @@ fn ft_kind(abs_hz: f64) -> Option<Kind> {
     }
 }
 
+/// (kind, confidence, mark/space shift and mid-shift offset when it is FSK).
+type Verdict = (Kind, f32, Option<(f32, f32)>);
+
 fn classify_one(
     audio: &[Complex32],
     fs_a: f32,
     coarse_bw: f32,
     abs_hz: f64,
     psd: &mut Psd,
-) -> (Kind, f32) {
+) -> Verdict {
     let spec = psd.power(audio);
     let fine = features(&spec, fs_a / spec.len() as f32, audio, fs_a);
     let ft = ft_kind(abs_hz);
@@ -206,6 +246,22 @@ fn classify_one(
     // rendered as complex baseband neither confirms as PSK31 nor frames as
     // Baudot (see the tests of exactly that).
     let shared = bands::narrow_mode(abs_hz).is_some();
+
+    // FSK first, because it is the one narrowband mode that announces itself.
+    // A signal alternating between two tones cannot be anything else, whereas
+    // "looks like BPSK" and "looks like keyed CW" are both things a single
+    // RTTY tone satisfies — and whichever probe runs first wins, so running
+    // the weaker evidence first is what produced RTTY labelled PSK31.
+    let fsk = fsk_shift(audio, fs_a).filter(|_| fine.obw_hz < 1500.0);
+    if let Some((sep, mid, share)) = fsk {
+        // The same FT-window rule the peak-pair test below uses: inside an
+        // FT8/FT4 window only the band plan's own narrowband sub-bands may
+        // claim to be something else.
+        if shared || !matches!(ft, Some(Kind::Ft8) | Some(Kind::Ft4)) {
+            return (Kind::Rtty, (0.60 + 0.35 * share).min(0.95), Some((sep, mid)));
+        }
+    }
+
     if ft.is_none() || shared {
         let psk = psk31::scan_span(audio, fs_a as f64, &[(0.0, 20.0)]);
         if let Some(h) = psk.iter().max_by(|a, b| {
@@ -214,7 +270,7 @@ fn classify_one(
                 .unwrap_or(std::cmp::Ordering::Equal)
         }) {
             if h.quality > 0.7 && coarse_bw < 250.0 && fine.obw_hz < 250.0 {
-                return (Kind::Psk31, h.quality);
+                return (Kind::Psk31, h.quality, None);
             }
         }
         let cw = cw::scan_span(audio, fs_a as f64, &[(0.0, 20.0)]);
@@ -224,7 +280,7 @@ fn classify_one(
                 .unwrap_or(std::cmp::Ordering::Equal)
         }) {
             if h.quality > 0.45 && coarse_bw < 250.0 && fine.obw_hz < 200.0 {
-                return (Kind::Cw, h.quality);
+                return (Kind::Cw, h.quality, None);
             }
         }
     }
@@ -239,23 +295,23 @@ fn classify_one(
             && fine.obw_hz < 450.0
             && (shared || !matches!(ft, Some(Kind::Ft8)));
         if clean {
-            return (Kind::Rtty, 0.78);
+            return (Kind::Rtty, 0.78, None);
         }
     }
 
     if let Some(k) = ft {
         let wide = coarse_bw.max(fine.obw_hz);
         if fine.speech > 0.55 && (1800.0..3600.0).contains(&wide) && fine.n_peaks < 5 {
-            return (Kind::Ssb, 0.55);
+            return (Kind::Ssb, 0.55, None);
         }
-        return (k, 0.74);
+        return (k, 0.74, None);
     }
 
     if fine.carrier && fine.obw_hz > 3500.0 {
-        return (Kind::Am, 0.72);
+        return (Kind::Am, 0.72, None);
     }
     if fine.carrier && fine.obw_hz < 200.0 && fine.env_cv < 0.2 {
-        return (Kind::Carrier, 0.65);
+        return (Kind::Carrier, 0.65, None);
     }
 
     let wide = coarse_bw.max(fine.obw_hz);
@@ -264,16 +320,16 @@ fn classify_one(
         && fine.n_peaks < 8
         && fine.speech > 0.35
     {
-        return (Kind::Ssb, 0.62 + 0.2 * fine.speech.min(1.0));
+        return (Kind::Ssb, 0.62 + 0.2 * fine.speech.min(1.0), None);
     }
     if (1200.0..3600.0).contains(&wide) && !fine.carrier && fine.tonality < 8.0 {
-        return (Kind::Ssb, 0.5);
+        return (Kind::Ssb, 0.5, None);
     }
 
     if coarse_bw < 150.0 && fine.tonality > 10.0 && fine.env_cv < 0.15 {
-        return (Kind::Carrier, 0.5);
+        return (Kind::Carrier, 0.5, None);
     }
-    (Kind::Unknown, 0.2)
+    (Kind::Unknown, 0.2, None)
 }
 
 /// Collapse neighbouring FT8/FT4 blobs into one pile-up so the spectrum
@@ -318,6 +374,7 @@ pub fn cluster_ft(idents: Vec<Ident>) -> Vec<Ident> {
             snr_db: snr,
             kind,
             score,
+            shift_hz: None,
         });
         i = j;
     }
@@ -414,6 +471,112 @@ fn features(psd: &[f32], bin_hz: f32, audio: &[Complex32], fs_a: f32) -> Feat {
         env_cv,
         speech,
     }
+}
+
+/// Two tones, one signal — measured from where the signal *is*, moment to
+/// moment, rather than from two peaks in an averaged spectrum.
+///
+/// The peak-pair test this backs up needs both tones to show up in a PSD with
+/// the weaker within 6 dB of the stronger, and real RTTY does not oblige: a
+/// station idles on mark and returns to mark between characters, so mark can
+/// be several dB up on space over any averaging window. When the pair test
+/// misses, the occupancy falls through to the probes below it and a mark tone
+/// keying on and off is read as BPSK — which is how RTTY ends up labelled
+/// PSK31 with a decoder attached to it.
+///
+/// Instantaneous frequency does not have that problem. FSK spends all its
+/// time at exactly two frequencies whatever the duty cycle between them, so
+/// the histogram is bimodal even when one mode is three times the other.
+/// Returns (shift Hz, mid-shift offset Hz, share of the signal's time the two
+/// tones account for). The offset matters as much as the shift: an occupancy
+/// peaks on whichever tone is busier, and a decoder handed that instead of
+/// the midpoint is half a shift off before it starts.
+fn fsk_shift(audio: &[Complex32], fs: f32) -> Option<(f32, f32, f32)> {
+    // ~4 ms blocks: short against a 45 baud bit (22 ms), long enough that the
+    // coherent sum inside one is a frequency estimate rather than a sample.
+    let blk = (fs / 250.0).round().max(2.0) as usize;
+    if audio.len() < blk * 32 {
+        return None;
+    }
+    const BIN_HZ: f32 = 20.0;
+    const SPAN_HZ: f32 = 1200.0;
+    let nbins = (2.0 * SPAN_HZ / BIN_HZ) as usize;
+    let mut hist = vec![0.0f32; nbins];
+    let mut total = 0.0f32;
+    let mut i = 1usize;
+    while i + blk <= audio.len() {
+        let mut acc = Complex32::new(0.0, 0.0);
+        for k in 0..blk {
+            acc += audio[i + k] * audio[i + k - 1].conj();
+        }
+        i += blk;
+        // The weight is the coherent sum's own magnitude, so a block of noise
+        // — whose phase differences cancel — barely votes, and the gaps
+        // between characters cannot invent a third tone.
+        let w = acc.norm();
+        if w < 1e-12 {
+            continue;
+        }
+        let hz = acc.arg() * fs / (2.0 * PI);
+        if hz.abs() >= SPAN_HZ {
+            continue;
+        }
+        let b = ((hz + SPAN_HZ) / BIN_HZ) as usize;
+        hist[b.min(nbins - 1)] += w;
+        total += w;
+    }
+    if total <= 0.0 {
+        return None;
+    }
+    let bin_hz = |b: usize| (b as f32 + 0.5) * BIN_HZ - SPAN_HZ;
+    let mass = |centre: f32| -> f32 {
+        hist.iter()
+            .enumerate()
+            .filter(|(b, _)| (bin_hz(*b) - centre).abs() <= 40.0)
+            .map(|(_, v)| *v)
+            .sum()
+    };
+    let top = (0..nbins).max_by(|&a, &b| {
+        hist[a].partial_cmp(&hist[b]).unwrap_or(std::cmp::Ordering::Equal)
+    })?;
+    let a_hz = bin_hz(top);
+    // The second tone has to be a separate mode, not the shoulder of the
+    // first, so anything within 80 Hz of the winner is the same tone.
+    let second = (0..nbins)
+        .filter(|&b| (bin_hz(b) - a_hz).abs() > 80.0)
+        .max_by(|&x, &y| hist[x].partial_cmp(&hist[y]).unwrap_or(std::cmp::Ordering::Equal))?;
+    let b_hz = bin_hz(second);
+    let (ma, mb) = (mass(a_hz), mass(b_hz));
+    // Bins are 20 Hz; the centroid inside each mode recovers the real tone
+    // frequency, which is what makes the shift worth reporting to a decoder.
+    let centroid = |centre: f32| -> f32 {
+        let (mut num, mut den) = (0.0f32, 0.0f32);
+        for (b, &v) in hist.iter().enumerate() {
+            let f = bin_hz(b);
+            if (f - centre).abs() <= 40.0 {
+                num += f * v;
+                den += v;
+            }
+        }
+        if den > 0.0 { num / den } else { centre }
+    };
+    let (a_c, b_c) = (centroid(a_hz), centroid(b_hz));
+    let sep = (a_c - b_c).abs();
+    // Shifts in amateur use run 170 (most), 425 and 850. Below 100 Hz the
+    // "pair" is one tone's own sidebands; above 1000 it is two stations.
+    if !(100.0..=1000.0).contains(&sep) {
+        return None;
+    }
+    let share = (ma + mb) / total;
+    let weaker = mb / (ma + mb).max(1e-20);
+    // A single keyed tone puts everything in one mode; noise puts it
+    // everywhere. Only a signal that genuinely alternates between two
+    // frequencies has most of its time in two modes with the lesser one
+    // holding a real share of it.
+    if share < 0.55 || weaker < 0.12 {
+        return None;
+    }
+    Some((sep, (a_c + b_c) * 0.5, share))
 }
 
 fn rtty_sep(peaks: &[(f32, f32)]) -> Option<f32> {
@@ -582,6 +745,142 @@ mod tests {
         spec
     }
 
+
+    /// Realistic RTTY: idle mark, Baudot characters, 45.45 baud / 170 Hz.
+    ///
+    /// The existing `classifies_rtty_tone_pair` fixture alternates mark and
+    /// space every bit, which is the one pattern real RTTY never sends. Real
+    /// traffic idles on mark and spends most of its time there, so the space
+    /// tone is far weaker in an averaged PSD — which is exactly the case the
+    /// two-peak test has to survive.
+    fn real_rtty(fs: f32, secs: f32, snr: f32, centre: f32, idle_only: bool) -> Vec<Complex32> {
+        const LTRS: &str = "\0E\nA SIU\rDRJNFCKTZLWHYPQOBG\0MXV\0";
+        let text = "CQ CQ DE W1AW W1AW K ";
+        let sps = fs / 45.45;
+        let mut bits: Vec<bool> = vec![true; 60];
+        for c in text.chars().take(if idle_only { 0 } else { usize::MAX }) {
+            let Some(code) = LTRS.chars().position(|x| x == c) else { continue };
+            bits.push(false);
+            for b in 0..5 {
+                bits.push(code as u8 & (1 << b) != 0);
+            }
+            bits.push(true);
+            bits.push(true);
+        }
+        bits.extend(std::iter::repeat_n(true, 60));
+        let mut rng = 0x1234_5678u32;
+        let mut noise = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            (rng as f32 / u32::MAX as f32) - 0.5
+        };
+        let mut out = Vec::new();
+        let mut phase = 0.0f32;
+        let want = (fs * secs) as usize;
+        let mut i = 0usize;
+        while out.len() < want {
+            let mark = bits[i % bits.len()];
+            let f = centre + if mark { 85.0 } else { -85.0 };
+            for _ in 0..sps as usize {
+                phase += 2.0 * PI * f / fs;
+                out.push(
+                    Complex32::from_polar(1.0, phase)
+                        + Complex32::new(noise(), noise()) * snr,
+                );
+            }
+            i += 1;
+        }
+        out
+    }
+
+
+    /// The reported failure: RTTY on the waterfall, labelled PSK31, with a
+    /// decoder attached producing nonsense.
+    ///
+    /// The fixture is what makes this a real test — a station that idles on
+    /// mark, so its space tone is far weaker than mark over any averaging
+    /// window and the two-peak test cannot see it. That is ordinary RTTY, and
+    /// it is exactly the case that used to fall through to the PSK31 probe.
+    #[test]
+    fn real_rtty_is_not_psk31() {
+        let sig = real_rtty(8000.0, 3.0, 0.05, 400.0, false);
+        let disp = spec_peak(256, 8000.0, 400.0, 4);
+        let ids = classify_span(&sig, 8000.0, &disp, 7_047_000.0);
+        assert!(
+            !ids.iter().any(|i| i.kind == Kind::Psk31),
+            "RTTY classified as PSK31: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|i| i.kind == Kind::Rtty),
+            "RTTY was not identified at all: {ids:?}"
+        );
+    }
+
+    /// The confirmation the misidentification actually turned on. Whatever the
+    /// classifier decides, the PSK31 scout runs across the whole span on its
+    /// own and raises its own idents — so it has to reject a mark tone too.
+    #[test]
+    fn psk31_scout_rejects_an_rtty_tone() {
+        let sig = real_rtty(8000.0, 3.0, 0.05, 400.0, false);
+        for probe in [400.0f64, 485.0, 315.0] {
+            let hits = psk31::scan_span(&sig, 8000.0, &[(probe, 20.0)]);
+            assert!(
+                hits.is_empty(),
+                "PSK31 confirmed at {probe} Hz on an RTTY signal: {:?}",
+                hits.iter().map(|h| (h.offset_hz, h.quality)).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// What the FSK test must and must not fire on. A keyed carrier, a plain
+    /// carrier, PSK31 and noise all have to come back None, or the cure is
+    /// worse than the disease.
+    #[test]
+    fn fsk_detector_only_fires_on_two_tones() {
+        let rtty = real_rtty(8000.0, 3.0, 0.05, 0.0, false);
+        let (sep, mid, _) = fsk_shift(&rtty, 8000.0).expect("170 Hz RTTY is FSK");
+        assert!((sep - 170.0).abs() < 25.0, "shift measured as {sep:.0} Hz");
+        assert!(mid.abs() < 40.0, "mid-shift offset {mid:.0} Hz should be near zero");
+
+        // A station idling on mark is a carrier, and saying so is correct.
+        assert!(fsk_shift(&real_rtty(8000.0, 3.0, 0.05, 0.0, true), 8000.0).is_none());
+        assert!(fsk_shift(&keyed_cw(24000, 8000.0, 20.0, 50.0), 8000.0).is_none());
+        assert!(fsk_shift(&tone(24000, 8000.0, 50.0), 8000.0).is_none());
+        let psk = crate::decoders::tests::gen_psk31_at("CQ DE W1AW ", 8000.0, 0.0, 0.03, 3.0);
+        assert!(fsk_shift(&psk, 8000.0).is_none(), "PSK31 read as FSK");
+        let mut rng = 0xBEEF_0001u32;
+        let noise: Vec<Complex32> = (0..24000)
+            .map(|_| {
+                let mut f = || {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 17;
+                    rng ^= rng << 5;
+                    (rng as f32 / u32::MAX as f32) - 0.5
+                };
+                Complex32::new(f(), f())
+            })
+            .collect();
+        assert!(fsk_shift(&noise, 8000.0).is_none(), "noise read as FSK");
+    }
+
+    /// 425 and 850 Hz shifts are both in amateur use, and measuring the shift
+    /// is what lets the decoder be set to it instead of framing noise at 170.
+    #[test]
+    fn wide_shifts_are_measured_not_assumed() {
+        for want in [425.0f32, 850.0] {
+            let sig = crate::decoders::tests::gen_rtty_at(
+                "CQ DE W1AW ", 8000.0, 0.0, want, 0.03, 3.0,
+            );
+            let (sep, _, _) = fsk_shift(&sig, 8000.0)
+                .unwrap_or_else(|| panic!("{want:.0} Hz shift RTTY not seen as FSK"));
+            assert!(
+                (sep - want).abs() < 0.1 * want,
+                "{want:.0} Hz shift measured as {sep:.0} Hz"
+            );
+        }
+    }
+
     #[test]
     fn classifies_keyed_cw() {
         let sig = keyed_cw(8000, 8000.0, 20.0, 400.0);
@@ -732,6 +1031,7 @@ mod tests {
                 snr_db: 10.0,
                 kind: Kind::Ft8,
                 score: 0.7,
+                shift_hz: None,
             },
             Ident {
                 offset_hz: 400.0,
@@ -739,6 +1039,7 @@ mod tests {
                 snr_db: 12.0,
                 kind: Kind::Ft8,
                 score: 0.8,
+                shift_hz: None,
             },
             Ident {
                 offset_hz: 5000.0,
@@ -746,6 +1047,7 @@ mod tests {
                 snr_db: 8.0,
                 kind: Kind::Cw,
                 score: 0.6,
+                shift_hz: None,
             },
         ]);
         let ft: Vec<_> = ids.iter().filter(|i| i.kind == Kind::Ft8).collect();
@@ -763,6 +1065,7 @@ mod tests {
                 snr_db: 12.0,
                 kind: Kind::Cw,
                 score: 0.8,
+                shift_hz: None,
             },
             Ident {
                 offset_hz: 200.0,
@@ -770,6 +1073,7 @@ mod tests {
                 snr_db: 10.0,
                 kind: Kind::Cw,
                 score: 0.7,
+                shift_hz: None,
             },
             Ident {
                 offset_hz: 1500.0,
@@ -777,6 +1081,7 @@ mod tests {
                 snr_db: 15.0,
                 kind: Kind::Ssb,
                 score: 0.6,
+                shift_hz: None,
             },
         ];
         assert_eq!(summary(&ids), "2 CW  1 SSB");

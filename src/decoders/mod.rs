@@ -84,9 +84,31 @@ pub trait Decoder: Send {
     fn process(&mut self, samples: &[Complex32]) -> String;
     /// Short human-readable state (speed estimate, lock indicator, ...).
     fn status(&self) -> String;
+    /// How much of what this decoder is emitting is real copy rather than
+    /// noise read as characters, 0..1.
+    ///
+    /// Calibrated per mode so that 0 means "this is the demodulator chewing on
+    /// band noise" and 1 means "every symbol resolved cleanly" — the scanner
+    /// compares it against one threshold across every mode, so a metric that
+    /// merely trends the right way is not enough. `None` means no opinion —
+    /// either the mode decides per transmission and reports an SNR with each
+    /// message instead, or it has not yet seen enough to judge — and copy with
+    /// no opinion attached is passed through rather than held back.
+    fn confidence(&self) -> Option<f32> {
+        None
+    }
+    /// Sending speed as a column-width label: `18wpm`, `45bd`. `None` when the
+    /// mode has no speed to speak of.
+    fn speed(&self) -> Option<String> {
+        None
+    }
     fn reset(&mut self);
     /// Mode-specific toggle (currently only RTTY normal/reverse shift).
     fn toggle(&mut self) {}
+    /// Tell an FSK decoder the mark/space separation the classifier measured.
+    /// Ignored by every other mode. Set before `bandwidth()` is read — the
+    /// shift is most of an RTTY decoder's bandwidth.
+    fn set_shift(&mut self, _hz: f32) {}
     /// Offset added to the cursor when centring the tuning chain. FT8/FT4 use
     /// this to place the dial at the bottom edge of an audio passband.
     fn offset_shift(&self) -> f64 {

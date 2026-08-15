@@ -750,9 +750,13 @@ struct Heard {
     last: Instant,
 }
 
+/// One thing the receiver has to say for itself: a mode change, a retune, a
+/// warning. Signal detections are *not* notes — they are chips, and they stay
+/// on the row above where they can be read against each other. In auto mode on
+/// a busy band there are enough of them to bury everything else, which is the
+/// one thing this row exists to prevent.
 struct Note {
     text: String,
-    kind: Option<identify::Kind>,
 }
 
 /// Station settings dialog state.
@@ -1162,11 +1166,11 @@ impl App {
         while self.log.len() > 6 {
             self.log.pop_front();
         }
-        self.push_note(msg, None);
+        self.push_note(msg);
     }
 
-    fn push_note(&mut self, text: String, kind: Option<identify::Kind>) {
-        self.notes.push_back(Note { text, kind });
+    fn push_note(&mut self, text: String) {
+        self.notes.push_back(Note { text });
         while self.notes.len() > 80 {
             self.notes.pop_front();
         }
@@ -2496,7 +2500,6 @@ fn match_track(tracks: &[LabelTrack], id: &identify::Ident) -> Option<usize> {
 /// name a frequency after the live spectrum chip has gone.
 fn merge_heard(app: &mut App) {
     let now = Instant::now();
-    let mut fresh: Vec<(f64, identify::Kind, f32)> = Vec::new();
     for id in &app.idents {
         if id.kind == identify::Kind::Unknown {
             continue;
@@ -2530,16 +2533,7 @@ fn merge_heard(app: &mut App) {
                 count: 1,
                 last: now,
             });
-            fresh.push((freq, id.kind, id.snr_db));
         }
-    }
-    for (freq, kind, snr) in fresh {
-        let text = if matches!(kind, identify::Kind::Ft8 | identify::Kind::Ft4) {
-            format!("{:.3} kHz  {}  pile-up", freq / 1000.0, kind.label())
-        } else {
-            format!("{:.3} kHz  {}  {:+.0} dB", freq / 1000.0, kind.label(), snr)
-        };
-        app.push_note(text, Some(kind));
     }
     app.heard.retain(|h| {
         let ham = matches!(
@@ -3416,8 +3410,9 @@ fn pane_rects(area: Rect, app: &App) -> [Rect; 5] {
         Constraint::Length(10),
         Constraint::Min(3),
         dec,
-        // 1 content line + 2 border rows
-        Constraint::Length(3),
+        // 2 content lines + 2 border rows: the heard chips fill the first and
+        // would crowd a message off the end of it, so messages get their own.
+        Constraint::Length(4),
     ])
     .split(area);
     [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]]
@@ -3938,39 +3933,106 @@ fn draw_activity(f: &mut Frame, area: Rect, app: &App) {
             used += 4;
         }
     }
-    if let Some(note) = app
-        .notes
-        .iter()
-        .rev()
-        .nth(app.note_scroll)
-    {
-        let room = w.saturating_sub(used);
-        if room > 8 {
-            let sep = if used == 0 { "" } else { " │ " };
-            let budget = room.saturating_sub(sep.len());
-            // Measured and cut in cells, not bytes: a byte-index truncate can
-            // split a character and leaves the status line wider than the room
-            // it was given, which pushes the frame's own border off the grid.
-            let note_text = sanitize(&note.text);
-            let mut text = note_text.clone();
-            if note_text.chars().count() > budget {
-                text = note_text.chars().take(budget.saturating_sub(1)).collect();
-                text.push('…');
-            }
-            spans.push(Span::styled(sep, Style::default().fg(Color::DarkGray)));
-            let style = match note.kind {
-                Some(k) => Style::default().fg(ident_color(k)),
-                None => Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
-            };
-            spans.push(Span::styled(text, style));
+    // The chips are laid out to fill the width, so a message sharing the row
+    // with them was only ever shown when the band was quiet enough to leave
+    // room — which is exactly when there is nothing to say. It gets its own
+    // row instead, and only falls back to sharing on a terminal too short to
+    // give it one.
+    let (chip_row, note_row) = if inner.height >= 2 && inner.width > 2 {
+        (
+            Rect { height: 1, ..inner },
+            // Indented by one, since the chips above are drawn space-padded,
+            // and a cell short of the far edge so both margins match.
+            Some(Rect {
+                x: inner.x + 1,
+                y: inner.y + 1,
+                width: inner.width - 2,
+                height: inner.height - 1,
+            }),
+        )
+    } else {
+        (inner, None)
+    };
+
+    let has_note = app.notes.len() > app.note_scroll;
+    match (has_note, note_row) {
+        (true, Some(row)) => {
+            f.render_widget(Paragraph::new(note_line(app, row.width as usize)), row);
         }
-    } else if spans.is_empty() {
-        spans.push(Span::styled(
+        (true, None) => {
+            let room = w.saturating_sub(used);
+            if room > 8 {
+                let sep = if used == 0 { "" } else { " │ " };
+                spans.push(Span::styled(sep, Style::default().fg(Color::DarkGray)));
+                spans.extend(note_line(app, room - sep.chars().count()).spans);
+            }
+        }
+        (false, _) if spans.is_empty() => spans.push(Span::styled(
             "listening…",
             Style::default().fg(Color::DarkGray),
-        ));
+        )),
+        (false, _) => {}
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), inner);
+    f.render_widget(Paragraph::new(Line::from(spans)), chip_row);
+}
+
+/// The message row: recent messages packed into `budget` cells, newest first.
+///
+/// These are short and they arrive in bursts — changing mode emits three — so
+/// showing only the newest would throw most of them away before they could be
+/// read. As many as fit are shown instead.
+///
+/// Newest goes on the left, which reads backwards in time but keeps the one
+/// that matters at a fixed spot: with the newest on the right it would shift
+/// around as messages of different lengths came and went, which is precisely
+/// when the eye needs to find it. Only the newest is ever truncated, so the
+/// current state of the receiver is never the message that got cut; the older
+/// ones join it whole or not at all, dimmed so the ordering stays obvious.
+///
+/// When the reader has wheeled back through the history the position is shown,
+/// so a stale message is not mistaken for the current one.
+fn note_line(app: &App, budget: usize) -> Line<'static> {
+    const SEP: &str = "  ·  ";
+    let mut spans = Vec::new();
+    let mut room = budget;
+    if app.note_scroll > 0 {
+        let mark = format!("↑{} ", app.note_scroll);
+        room = room.saturating_sub(mark.chars().count());
+        spans.push(Span::styled(mark, Style::default().fg(Color::DarkGray)));
+    }
+    for (i, note) in app.notes.iter().rev().skip(app.note_scroll).enumerate() {
+        // Measured and cut in cells, not bytes: a byte-index truncate can split
+        // a character and leaves the line wider than the room it was given,
+        // which pushes the frame's own border off the grid.
+        let text = sanitize(&note.text);
+        let len = text.chars().count();
+        if i == 0 {
+            let text = if len > room {
+                let mut t: String = text.chars().take(room.saturating_sub(1)).collect();
+                t.push('…');
+                t
+            } else {
+                text
+            };
+            room = room.saturating_sub(text.chars().count());
+            spans.push(Span::styled(
+                text,
+                Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
+            ));
+        } else {
+            let need = len + SEP.chars().count();
+            if need > room {
+                break;
+            }
+            room -= need;
+            spans.push(Span::styled(SEP, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                text,
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            ));
+        }
+    }
+    Line::from(spans)
 }
 
 /// Map the visible frequency window onto bin indices.
@@ -5917,12 +5979,21 @@ mod tests {
             shift_hz: None,
         }];
         super::merge_heard(&mut app);
+        // The first sighting is recorded as a chip, with the frequency, mode
+        // and signal it was heard at. That is the whole record of it — a
+        // detection is not also written to the message row, where in auto mode
+        // a busy band would bury everything the receiver has to say.
         assert_eq!(app.heard.len(), 1);
+        let h = &app.heard[0];
+        assert_eq!(h.kind, super::identify::Kind::Cw);
         assert!(
-            app.notes
-                .iter()
-                .any(|n| n.text.contains("CW") && n.text.contains("14074")),
-            "first sighting should land in the activity log: {:?}",
+            (h.freq_hz - 14_074_000.0).abs() < 1.0,
+            "chip is at the wrong frequency: {}",
+            h.freq_hz
+        );
+        assert!(
+            !app.notes.iter().any(|n| n.text.contains("14074")),
+            "a detection must not crowd the message row: {:?}",
             app.notes.iter().map(|n| n.text.as_str()).collect::<Vec<_>>()
         );
         let notes = app.notes.len();
@@ -5931,6 +6002,174 @@ mod tests {
         assert_eq!(app.notes.len(), notes, "re-detect must not spam the log");
         app.idents.clear();
         assert_eq!(app.heard.len(), 1, "memory stays after the live chip fades");
+    }
+
+    /// A message must reach the screen when the band is busy, which is the one
+    /// time it could not before: the heard chips are laid out to fill their
+    /// row, so anything sharing that row was squeezed out by exactly the
+    /// traffic that makes a status message worth reading.
+    #[test]
+    fn a_message_survives_a_full_activity_row() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
+        // Enough signals to fill the widest row this test draws.
+        app.idents = (0..24)
+            .map(|i| super::identify::Ident {
+                offset_hz: 2000.0 + i as f32 * 900.0,
+                bw_hz: 80.0,
+                snr_db: 14.0,
+                kind: super::identify::Kind::Cw,
+                score: 0.8,
+                shift_hz: None,
+            })
+            .collect();
+        super::merge_heard(&mut app);
+        assert!(app.heard.len() > 8, "test needs a crowded activity row");
+        app.log("AGC: soft".into());
+
+        for (w, h) in [(80u16, 24u16), (120, 30), (200, 60)] {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| super::draw(f, &app)).unwrap();
+            let buf = t.backend().buffer();
+            let mut text = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    text.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+                }
+                text.push('\n');
+            }
+            assert!(
+                text.contains("AGC: soft"),
+                "message lost behind the chips at {w}x{h}:\n{text}"
+            );
+        }
+    }
+
+    /// The two rows carry different things and must keep to themselves. In
+    /// auto mode on a busy band the detections arrive far faster than anything
+    /// else, so sharing a list with them buried every message worth reading.
+    #[test]
+    fn detections_stay_on_the_chip_row() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
+        app.idents = (0..5)
+            .map(|i| super::identify::Ident {
+                offset_hz: 2000.0 + i as f32 * 2600.0,
+                bw_hz: 80.0,
+                snr_db: 12.0,
+                kind: identify::Kind::Cw,
+                score: 0.8,
+                shift_hz: None,
+            })
+            .collect();
+        super::merge_heard(&mut app);
+        app.log("AGC: soft hang".into());
+
+        let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        t.draw(|f| super::draw(f, &app)).unwrap();
+        let buf = t.backend().buffer();
+        let row = |y: u16| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+        };
+        let (chips, messages) = (row(buf.area.height - 3), row(buf.area.height - 2));
+
+        assert!(chips.contains("14072.000"), "no detections on the chip row: {chips:?}");
+        assert!(
+            messages.contains("AGC: soft hang"),
+            "message row lost its message: {messages:?}"
+        );
+        assert!(
+            !messages.contains("14072"),
+            "a detection reached the message row: {messages:?}"
+        );
+    }
+
+    /// Messages arrive in bursts — changing mode emits three at once — so the
+    /// row packs as many as fit rather than keeping only the newest.
+    #[test]
+    fn the_message_row_packs_what_fits() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
+        for msg in ["oldest one", "middle one", "newest one"] {
+            app.log(msg.into());
+        }
+        let render = |app: &App, w: u16| {
+            let mut t = Terminal::new(TestBackend::new(w, 30)).unwrap();
+            t.draw(|f| super::draw(f, app)).unwrap();
+            let buf = t.backend().buffer();
+            let mut text = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    text.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+                }
+                text.push('\n');
+            }
+            text
+        };
+
+        let wide = render(&app, 120);
+        for msg in ["newest one", "middle one", "oldest one"] {
+            assert!(wide.contains(msg), "{msg:?} missing from a wide row:\n{wide}");
+        }
+        // Newest first, so the one that matters sits at a fixed spot.
+        let (newest, oldest) = (
+            wide.find("newest one").unwrap(),
+            wide.find("oldest one").unwrap(),
+        );
+        assert!(newest < oldest, "messages are not newest-first:\n{wide}");
+
+        // Narrow enough that they cannot all fit: the newest is the survivor,
+        // never the casualty.
+        let narrow = render(&app, 40);
+        assert!(
+            narrow.contains("newest one"),
+            "the newest message must always be shown:\n{narrow}"
+        );
+        assert!(
+            !narrow.contains("oldest one"),
+            "a message was shown that could not fit:\n{narrow}"
+        );
+    }
+
+    /// Wheeling back through the messages has to say so, or an old one reads
+    /// as the current state of the receiver.
+    #[test]
+    fn scrolled_back_messages_are_marked() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
+        app.log("older message".into());
+        app.log("newest message".into());
+        let render = |app: &App| {
+            let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            t.draw(|f| super::draw(f, app)).unwrap();
+            let buf = t.backend().buffer();
+            let mut text = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    text.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+                }
+                text.push('\n');
+            }
+            text
+        };
+        let live = render(&app);
+        assert!(live.contains("newest message"), "latest not shown:\n{live}");
+        assert!(!live.contains('↑'), "live view must not look scrolled");
+
+        app.note_scroll = 1;
+        let back = render(&app);
+        assert!(back.contains("older message"), "no scrollback:\n{back}");
+        assert!(back.contains("↑1"), "scrollback not marked:\n{back}");
     }
 
     /// Stations must keep their first-heard order as decodes arrive, so the
@@ -6417,8 +6656,26 @@ mod psk_auto_tests {
     /// that `feed` gates on wall-clock time — a test loop runs far faster
     /// than real time and would otherwise never trigger them.
     pub(super) fn run_auto(app: &mut App, iq: &[Complex32], fs: f64) {
+        run_auto_watching(app, iq, fs);
+    }
+
+    /// As `run_auto`, but reporting every decoder kind that held a slot at any
+    /// point rather than only those still holding one at the end.
+    ///
+    /// `App::feed` fires its own scout and ident passes off 800 ms and 1200 ms
+    /// wall-clock timers, on top of the ones below. How many of those land, and
+    /// where they fall in the IQ, therefore depends on how fast the machine is
+    /// and what else it is running — so which pass happens to be the last one
+    /// is not a property of the signal. A test asking whether a signal can be
+    /// found has to watch the whole run.
+    pub(super) fn run_auto_watching(
+        app: &mut App,
+        iq: &[Complex32],
+        fs: f64,
+    ) -> Vec<identify::Kind> {
         let mut spec = Spectrum::new(4096);
         let mut out = Vec::new();
+        let mut seen: Vec<identify::Kind> = Vec::new();
         let per_pass = ((fs * 1.2) as usize / 16_384).max(1);
         for (i, block) in iq.chunks(16_384).enumerate() {
             app.feed(block, &mut spec, &mut out);
@@ -6427,7 +6684,13 @@ mod psk_auto_tests {
                 refresh_cw_hits(app);
                 refresh_idents(app);
             }
+            for s in &app.auto {
+                if !seen.contains(&s.kind) {
+                    seen.push(s.kind);
+                }
+            }
         }
+        seen
     }
 
     fn psk_span(offset: f64, db: f32, fs: f64, secs: f64) -> Vec<Complex32> {
@@ -6669,11 +6932,8 @@ mod psk_auto_tests {
 
         let mut on_top = App::new(14_070_000.0, fs, Mode::Auto);
         on_top.agc = AgcMode::Off;
-        run_auto(&mut on_top, &iq, fs);
-        let seen_on_top = on_top
-            .auto
-            .iter()
-            .any(|s| s.kind == identify::Kind::Psk31);
+        let seen_on_top =
+            run_auto_watching(&mut on_top, &iq, fs).contains(&identify::Kind::Psk31);
 
         // The same IQ, with the receiver 10 kHz lower: the signal now sits
         // clear of the LO and everything about it is otherwise identical.
@@ -6687,8 +6947,8 @@ mod psk_auto_tests {
                 *s * Complex32::from_polar(1.0, ph)
             })
             .collect();
-        run_auto(&mut moved, &shifted, fs);
-        let seen_moved = moved.auto.iter().any(|s| s.kind == identify::Kind::Psk31);
+        let seen_moved =
+            run_auto_watching(&mut moved, &shifted, fs).contains(&identify::Kind::Psk31);
 
         assert!(
             !seen_on_top,

@@ -154,7 +154,14 @@ decode. Live signals get a coloured chip on the spectrum sitting on a
 shelf as wide as the occupancy. Chips hold for a few seconds and
 fade rather than blinking off when a classify pass misses. A thin **activity** strip at the bottom
 keeps every detection in this span (frequency, mode, SNR) after the
-chip fades, and shows the latest status message. Band scan (`s`) prints
+chip fades. Beneath it, a second row carries what the receiver has to say for
+itself — mode changes, retunes, spot uploads, warnings. The two are kept
+strictly apart: detections are chips and only chips, because in auto mode on a
+busy band they arrive fast enough to bury every message worth reading. Messages
+are short and arrive in bursts, so as many as fit are shown, newest first and
+leftmost, the older ones dimmed; only the newest is ever truncated. Wheel over
+the strip to page back through earlier messages; an `↑n` marks how far back you
+are. Band scan (`s`) prints
 the same tags next to each hit. Park the cursor on a chip and press `d`
 to copy it.
 

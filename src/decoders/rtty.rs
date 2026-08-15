@@ -34,6 +34,7 @@ pub struct RttyDecoder {
     shift: f32,
     samples_per_bit: f32,
     tone_phase: f32,
+    center_phase: f32,
     mark_acc: Complex32,
     space_acc: Complex32,
     mark_peak: f32,
@@ -214,6 +215,7 @@ impl RttyDecoder {
             shift: 170.0,
             samples_per_bit: fs / baud,
             tone_phase: 0.0,
+            center_phase: 0.0,
             mark_acc: Complex32::new(0.0, 0.0),
             space_acc: Complex32::new(0.0, 0.0),
             mark_peak: 1e-6,
@@ -262,10 +264,14 @@ impl Decoder for RttyDecoder {
 
     fn process(&mut self, samples: &[Complex32]) -> String {
         for &s in samples {
+            let (cs, cc) = self.center_phase.sin_cos();
+            let s = s * Complex32::new(cc, -cs);
             let (sin, cos) = self.tone_phase.sin_cos();
             let mark_mix = s * Complex32::new(cos, -sin);
             let space_mix = s * Complex32::new(cos, sin);
             let a = (3.0 / self.samples_per_bit).min(1.0);
+            let old_mark = self.mark_acc;
+            let old_space = self.space_acc;
             self.mark_acc += (mark_mix - self.mark_acc) * a;
             self.space_acc += (space_mix - self.space_acc) * a;
             let em = self.mark_acc.norm_sqr();
@@ -274,9 +280,16 @@ impl Decoder for RttyDecoder {
             self.mark_peak = (self.mark_peak * decay).max(em);
             self.space_peak = (self.space_peak * decay).max(es);
             let f = em / self.mark_peak.max(1e-9) - es / self.space_peak.max(1e-9);
-            let step = 2.0 * std::f32::consts::PI * (self.shift * 0.5 + self.afc_hz) / self.fs;
+            let dominant = if em > es { (self.mark_acc, old_mark) } else { (self.space_acc, old_space) };
+            if dominant.0.norm_sqr() > 1e-8 && dominant.1.norm_sqr() > 1e-8 {
+                let residual = (dominant.0 * dominant.1.conj()).arg() * self.fs / (2.0 * std::f32::consts::PI);
+                self.afc_hz = (self.afc_hz + 0.00005 * residual.clamp(-20.0, 20.0)).clamp(-10.0, 10.0);
+            }
+            let step = 2.0 * std::f32::consts::PI * self.shift * 0.5 / self.fs;
             self.tone_phase += step;
             if self.tone_phase > std::f32::consts::PI { self.tone_phase -= 2.0 * std::f32::consts::PI; }
+            self.center_phase += 2.0 * std::f32::consts::PI * self.afc_hz / self.fs;
+            if self.center_phase.abs() > std::f32::consts::PI { self.center_phase -= self.center_phase.signum() * 2.0 * std::f32::consts::PI; }
 
             // Both polarities are framed; only one of them is the station.
             let (thr, spb) = (0.0, self.samples_per_bit);
@@ -369,6 +382,7 @@ impl Decoder for RttyDecoder {
             self.polarity = None;
         }
         self.tone_phase = 0.0;
+        self.center_phase = 0.0;
         self.mark_acc = Complex32::new(0.0, 0.0);
         self.space_acc = Complex32::new(0.0, 0.0);
         self.mark_peak = 1e-6;

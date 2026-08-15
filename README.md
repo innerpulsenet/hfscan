@@ -154,8 +154,9 @@ decode. Live signals get a coloured chip on the spectrum sitting on a
 shelf as wide as the occupancy. Chips hold for a few seconds and
 fade rather than blinking off when a classify pass misses. A thin **activity** strip at the bottom
 keeps every detection in this span (frequency, mode, SNR) after the
-chip fades. Beneath it, a second row carries what the receiver has to say for
-itself — mode changes, retunes, spot uploads, warnings. The two are kept
+chip fades, most recently heard first so the row leads with what is on the band
+now rather than with whatever sits lowest in it. Beneath it, a second row
+carries what the receiver has to say for itself — mode changes, retunes, spot uploads, warnings. The two are kept
 strictly apart: detections are chips and only chips, because in auto mode on a
 busy band they arrive fast enough to bury every message worth reading. Messages
 are short and arrive in bursts, so as many as fit are shown, newest first and

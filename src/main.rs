@@ -657,6 +657,8 @@ struct App {
     tracks: Vec<LabelTrack>,
     /// Detections that linger after the live label fades, for the activity strip.
     heard: Vec<Heard>,
+    /// Monotonic discovery counter for `Heard::seq`.
+    heard_seq: u64,
     /// Status / detection lines shown in the bottom activity window.
     notes: VecDeque<Note>,
     /// How many activity-log lines to step back from live.
@@ -748,6 +750,9 @@ struct Heard {
     snr_db: f32,
     count: u32,
     last: Instant,
+    /// Order of discovery, to break ties between signals last heard in the
+    /// same pass — which on a busy band is all of the live ones.
+    seq: u64,
 }
 
 /// One thing the receiver has to say for itself: a mode change, a retune, a
@@ -857,6 +862,7 @@ impl App {
             idents: Vec::new(),
             tracks: Vec::new(),
             heard: Vec::new(),
+            heard_seq: 0,
             notes: VecDeque::new(),
             note_scroll: 0,
             scout_at: Instant::now(),
@@ -2524,6 +2530,7 @@ fn merge_heard(app: &mut App) {
             h.count = h.count.saturating_add(1).max(1);
             h.last = now;
         } else {
+            app.heard_seq += 1;
             app.heard.push(Heard {
                 freq_hz: freq,
                 freq_lo: freq - half,
@@ -2532,6 +2539,7 @@ fn merge_heard(app: &mut App) {
                 snr_db: id.snr_db,
                 count: 1,
                 last: now,
+                seq: app.heard_seq,
             });
         }
     }
@@ -2546,11 +2554,16 @@ fn merge_heard(app: &mut App) {
         );
         !(ham && !bands::in_amateur(h.freq_hz)) && h.last.elapsed() < Duration::from_secs(180)
     });
-    app.heard.sort_by(|a, b| {
-        a.freq_hz
-            .partial_cmp(&b.freq_hz)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Most recently heard first, and among those heard in the same pass the
+    // most recently discovered.
+    //
+    // This used to sort by frequency, which reads as an attempt to line the
+    // chips up with the spectrum above — but they are packed left to right by
+    // how wide each one happens to be, so they never did line up. What the
+    // ordering actually did was hand the front of the row permanently to
+    // whatever sits lowest in the band, which on the amateur bands is the
+    // bottom edge, and bury everything found since behind the `+N`.
+    app.heard.sort_by(|a, b| b.last.cmp(&a.last).then(b.seq.cmp(&a.seq)));
 }
 
 fn cycle_agc(app: &mut App, radio: &radio::Radio) {
@@ -6045,6 +6058,49 @@ mod tests {
                 "message lost behind the chips at {w}x{h}:\n{text}"
             );
         }
+    }
+
+    /// The chip row shows what is on the band now, so it has to lead with the
+    /// newest. Ordered by frequency it led with whatever sat lowest, which on
+    /// an amateur band is the bottom edge — the same handful of chips every
+    /// time, with everything found since hidden behind the `+N`.
+    #[test]
+    fn the_chip_row_leads_with_the_newest() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
+        let ident = |off: f32| super::identify::Ident {
+            offset_hz: off,
+            bw_hz: 80.0,
+            snr_db: 12.0,
+            kind: identify::Kind::Cw,
+            score: 0.8,
+            shift_hz: None,
+        };
+        // Discovered low-in-the-band first, exactly the case that used to pin
+        // the front of the row.
+        app.idents = vec![ident(1000.0)];
+        super::merge_heard(&mut app);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        app.idents = vec![ident(9000.0)];
+        super::merge_heard(&mut app);
+        assert_eq!(app.heard.len(), 2);
+
+        let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        t.draw(|f| super::draw(f, &app)).unwrap();
+        let buf = t.backend().buffer();
+        let chips: String = (0..buf.area.width)
+            .map(|x| buf[(x, buf.area.height - 3)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        let (newest, oldest) = (
+            chips.find("14079.000").expect("newest chip missing"),
+            chips.find("14071.000").expect("older chip missing"),
+        );
+        assert!(
+            newest < oldest,
+            "the newest detection must lead the row: {chips:?}"
+        );
     }
 
     /// The two rows carry different things and must keep to themselves. In

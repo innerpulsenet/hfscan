@@ -6,19 +6,30 @@ pub struct Band {
     pub start: f64,
     pub end: f64,
     /// Where to park the receiver when jumping to this band.
+    ///
+    /// Deliberately *not* on a digital calling frequency, though that is the
+    /// obvious choice. A zero-IF front end leaves a spike at the local
+    /// oscillator, so every candidate picker here blanks the bins either side
+    /// of it — which means a real signal within roughly 50 Hz of the LO is
+    /// invisible by construction, and the LO's phase noise and 1/f skirt sit
+    /// over the first few hundred Hz beyond that. Parking on the dial
+    /// frequency put exactly that region on the bottom of the sub-band people
+    /// work. These sit ~10 kHz below the segment instead, so the whole thing
+    /// lands at a clean positive offset with every marker still well inside
+    /// a 192 kHz span.
     pub default: f64,
 }
 
 pub const BANDS: &[Band] = &[
-    Band { name: "160m", start: 1_800_000.0,  end: 2_000_000.0,  default: 1_838_000.0 },
-    Band { name: "80m",  start: 3_500_000.0,  end: 4_000_000.0,  default: 3_580_000.0 },
-    Band { name: "60m",  start: 5_330_000.0,  end: 5_405_000.0,  default: 5_357_000.0 },
-    Band { name: "40m",  start: 7_000_000.0,  end: 7_300_000.0,  default: 7_040_000.0 },
-    Band { name: "30m",  start: 10_100_000.0, end: 10_150_000.0, default: 10_140_000.0 },
-    Band { name: "20m",  start: 14_000_000.0, end: 14_350_000.0, default: 14_070_000.0 },
-    Band { name: "17m",  start: 18_068_000.0, end: 18_168_000.0, default: 18_100_000.0 },
-    Band { name: "15m",  start: 21_000_000.0, end: 21_450_000.0, default: 21_080_000.0 },
-    Band { name: "12m",  start: 24_890_000.0, end: 24_990_000.0, default: 24_920_000.0 },
+    Band { name: "160m", start: 1_800_000.0,  end: 2_000_000.0,  default: 1_828_000.0 },
+    Band { name: "80m",  start: 3_500_000.0,  end: 4_000_000.0,  default: 3_563_000.0 },
+    Band { name: "60m",  start: 5_330_000.0,  end: 5_405_000.0,  default: 5_347_000.0 },
+    Band { name: "40m",  start: 7_000_000.0,  end: 7_300_000.0,  default: 7_030_000.0 },
+    Band { name: "30m",  start: 10_100_000.0, end: 10_150_000.0, default: 10_126_000.0 },
+    Band { name: "20m",  start: 14_000_000.0, end: 14_350_000.0, default: 14_060_000.0 },
+    Band { name: "17m",  start: 18_068_000.0, end: 18_168_000.0, default: 18_090_000.0 },
+    Band { name: "15m",  start: 21_000_000.0, end: 21_450_000.0, default: 21_060_000.0 },
+    Band { name: "12m",  start: 24_890_000.0, end: 24_990_000.0, default: 24_905_000.0 },
     Band { name: "10m",  start: 28_000_000.0, end: 29_700_000.0, default: 28_120_000.0 },
     Band { name: "WWV",  start: 4_990_000.0,  end: 15_010_000.0, default: 10_000_000.0 },
 ];
@@ -112,4 +123,71 @@ pub fn ft_mode(freq: f64) -> Option<&'static str> {
         }
     }
     best.map(|(l, _)| l)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A band default must not park the receiver on a calling frequency.
+    ///
+    /// The obvious default is the calling frequency itself, and it is the
+    /// wrong one: the LO blanking hides anything within tens of Hz of it, and
+    /// the phase-noise skirt covers the first part of the sub-band beyond
+    /// that. Every default used to do exactly that.
+    #[test]
+    fn defaults_keep_the_lo_off_the_calling_frequencies() {
+        for b in BANDS {
+            if b.name == "WWV" {
+                continue;
+            }
+            for m in MARKERS {
+                if m.label == "WWV" || m.freq < b.start || m.freq > b.end {
+                    continue;
+                }
+                let off = (m.freq - b.default).abs();
+                assert!(
+                    off >= 5_000.0,
+                    "{} parks the LO {off:.0} Hz from the {} marker at {:.3} MHz",
+                    b.name,
+                    m.label,
+                    m.freq / 1e6
+                );
+            }
+        }
+    }
+
+    /// ...while still keeping the markers where they can be seen: inside a
+    /// 192 kHz span, and clear of the edge bins the pickers discard.
+    #[test]
+    fn defaults_keep_the_calling_frequencies_in_view() {
+        const HALF: f64 = 96_000.0;
+        const EDGE: f64 = 5_000.0; // discarded edge plus the USB passband
+        for b in BANDS {
+            if b.name == "WWV" {
+                continue;
+            }
+            let mut seen = false;
+            for m in MARKERS {
+                if m.label == "WWV" || m.freq < b.start || m.freq > b.end {
+                    continue;
+                }
+                seen = true;
+                // 10 m spreads its digital segments over 110 kHz, so FT4 at
+                // 28.180 cannot share a span with PSK31 at 28.070 whatever
+                // the default is; the main cluster is what is kept in view.
+                if b.name == "10m" && m.freq > 28_150_000.0 {
+                    continue;
+                }
+                let off = m.freq - b.default;
+                assert!(
+                    off > -(HALF - EDGE) && off + 3_000.0 < HALF - EDGE,
+                    "{} puts the {} marker at {off:+.0} Hz, outside a usable span",
+                    b.name,
+                    m.label
+                );
+            }
+            assert!(seen || b.name == "60m", "{} has no markers", b.name);
+        }
+    }
 }

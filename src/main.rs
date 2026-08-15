@@ -401,8 +401,10 @@ struct Args {
     /// SoapySDR device arguments
     #[arg(long, default_value = "driver=sdrplay")]
     device: String,
-    /// Starting centre frequency in Hz (accepts e.g. 14070000)
-    #[arg(short, long, default_value_t = 14_070_000.0)]
+    /// Starting centre frequency in Hz (accepts e.g. 14070000).
+    /// The default sits 10 kHz below the 20 m digital segment rather than on
+    /// it — see `bands::Band::default` for why that matters.
+    #[arg(short, long, default_value_t = 14_060_000.0)]
     freq: f64,
     /// Sample rate in Hz; this is also the width of the spectrum view
     #[arg(short, long, default_value_t = FT_SAFE_RATE)]
@@ -5491,6 +5493,7 @@ mod tests {
 #[cfg(test)]
 mod psk_auto_tests {
     use super::*;
+    const PI_F: f32 = std::f32::consts::PI;
 
     /// Drive one span of IQ through auto mode, including the periodic passes
     /// that `feed` gates on wall-clock time — a test loop runs far faster
@@ -5581,6 +5584,124 @@ mod psk_auto_tests {
             .map(|r| r.copy.chars().filter(|c| !c.is_whitespace()).count())
             .sum();
         assert!(chars <= 4, "noise produced {chars} characters of copy");
+    }
+
+    /// A receiver's own DC artefact: the constant bias every zero-IF front
+    /// end leaves at the LO, plus the phase-noise skirt around it. Both are
+    /// ordinary; neither is in a synthetic span unless it is put there, which
+    /// is why every measurement so far has been flattering near the centre.
+    fn add_dc_artifact(iq: &mut [Complex32], fs: f64, spike_amp: f32) {
+        if spike_amp <= 0.0 {
+            return;
+        }
+        let mut rng = 0x51ed_2700u32;
+        let mut n = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            (rng as f32 / u32::MAX as f32) - 0.5
+        };
+        // Phase noise: a slow random walk on a carrier sitting at the LO.
+        let mut ph = 0.0f32;
+        let mut drift = 0.0f32;
+        for (i, s) in iq.iter_mut().enumerate() {
+            drift = 0.9995 * drift + 0.0005 * n() * 40.0;
+            ph += 2.0 * PI_F * drift / fs as f32;
+            *s += Complex32::new(spike_amp, 0.0); // DC offset
+            *s += Complex32::from_polar(spike_amp * 0.5, ph); // LO skirt
+            let _ = i;
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_psk31_vs_dc_offset() {
+        let fs = 192_000.0f64;
+        let n_total = (1.0f32 / 6.0).sqrt();
+        let in_bw = n_total * (31.25 / fs as f32).sqrt();
+        let scale = 10f32.powf(-15.0 / 20.0) / in_bw;
+        println!("\nPSK31 at 15 dB, by distance from the LO and size of the LO artefact");
+        println!("(artefact amplitude is relative to the wanted signal's)");
+        println!("{:>12}{:>10}{:>10}{:>10}", "offset", "clean", "1x", "5x");
+        // Offsets chosen clear of the FT8/FT4 windows above 14.074, which
+        // veto narrowband classification for their own good reasons.
+        for off in [200.0f64, 400.0, 800.0, 1_500.0, 2_500.0, 3_500.0, 20_000.0] {
+            let base = decoders::tests::gen_psk31_at(
+                "CQ CQ DE W1AW W1AW K ", fs, off, scale, 12.0);
+            let mut row = Vec::new();
+            for spike in [0.0f32, 1.0, 5.0] {
+                let mut iq = base.clone();
+                add_dc_artifact(&mut iq, fs, spike);
+                let mut app = App::new(14_070_000.0, fs, Mode::Auto);
+                app.agc = AgcMode::Off;
+                run_auto(&mut app, &iq, fs);
+                let copy: String = app
+                    .rows
+                    .iter()
+                    .filter(|r| r.kind == identify::Kind::Psk31)
+                    .map(|r| r.copy.clone())
+                    .collect();
+                row.push(if copy.contains("W1AW") { "copy" } else { "--" });
+            }
+            println!(
+                "{:>12}{:>10}{:>10}{:>10}",
+                format!("{:+.0} Hz", off),
+                row[0], row[1], row[2]
+            );
+        }
+    }
+
+    /// Every candidate picker blanks the bins either side of the LO, because
+    /// a zero-IF front end leaves a spike there that is not a signal. That is
+    /// right, but it means a real signal within about 94 Hz of the LO cannot
+    /// be seen at all — and the band defaults used to park the LO exactly on
+    /// the PSK31 dial frequency, which is the bottom of the sub-band people
+    /// actually work.
+    ///
+    /// Moving the LO is the whole fix: the same signal, same strength, same
+    /// everything, seen or not seen purely by where the receiver sits.
+    #[test]
+    fn a_signal_on_top_of_the_lo_is_invisible_until_the_lo_moves() {
+        let fs = 192_000.0f64;
+        let n_total = (1.0f32 / 6.0).sqrt();
+        let in_bw = n_total * (31.25 / fs as f32).sqrt();
+        let scale = 10f32.powf(-20.0 / 20.0) / in_bw;
+        // A PSK31 signal 60 Hz above the dial: inside the blanked region if
+        // the receiver is parked on the dial frequency.
+        let iq = decoders::tests::gen_psk31_at(
+            "CQ CQ DE W1AW W1AW K ", fs, 60.0, scale, 12.0);
+
+        let mut on_top = App::new(14_070_000.0, fs, Mode::Auto);
+        on_top.agc = AgcMode::Off;
+        run_auto(&mut on_top, &iq, fs);
+        let seen_on_top = on_top
+            .auto
+            .iter()
+            .any(|s| s.kind == identify::Kind::Psk31);
+
+        // The same IQ, with the receiver 10 kHz lower: the signal now sits
+        // clear of the LO and everything about it is otherwise identical.
+        let mut moved = App::new(14_060_000.0, fs, Mode::Auto);
+        moved.agc = AgcMode::Off;
+        let shifted: Vec<Complex32> = iq
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let ph = 2.0 * PI_F * 10_000.0 * i as f32 / fs as f32;
+                *s * Complex32::from_polar(1.0, ph)
+            })
+            .collect();
+        run_auto(&mut moved, &shifted, fs);
+        let seen_moved = moved.auto.iter().any(|s| s.kind == identify::Kind::Psk31);
+
+        assert!(
+            !seen_on_top,
+            "expected the LO blanking to hide a signal sitting on it"
+        );
+        assert!(
+            seen_moved,
+            "the same signal 10 kHz off the LO should be found"
+        );
     }
 
     /// PSK31 through the whole automatic path: the span classifier has to

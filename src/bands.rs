@@ -39,6 +39,11 @@ pub struct Band {
     pub span: f64,
 }
 
+/// Band the app opens on when nothing says otherwise. An index rather than a
+/// duplicated frequency, so the startup centre and span cannot drift out of
+/// step with the preset the way a hard-coded default did.
+pub const DEFAULT_BAND: usize = 5; // 20m
+
 pub const BANDS: &[Band] = &[
     Band { name: "160m", start: 1_800_000.0,   end: 2_000_000.0,   default: 1_900_000.0,   span: 240_000.0 },
     Band { name: "80m",  start: 3_500_000.0,   end: 4_000_000.0,   default: 3_750_000.0,   span: 600_000.0 },

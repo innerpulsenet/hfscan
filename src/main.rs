@@ -497,13 +497,14 @@ struct Args {
     #[arg(long, default_value = "driver=sdrplay")]
     device: String,
     /// Starting centre frequency in Hz (accepts e.g. 14070000).
-    /// The default sits 10 kHz below the 20 m digital segment rather than on
-    /// it — see `bands::Band::default` for why that matters.
-    #[arg(short, long, default_value_t = 14_060_000.0)]
-    freq: f64,
-    /// Sample rate in Hz; this is also the width of the spectrum view
-    #[arg(short, long, default_value_t = FT_SAFE_RATE)]
-    rate: f64,
+    /// Defaults to 20 m, at the same centre pressing `b` to it would use.
+    #[arg(short, long)]
+    freq: Option<f64>,
+    /// Sample rate in Hz; this is also the width of the spectrum view.
+    /// Defaults to the span of whichever band the starting frequency is in,
+    /// so the app opens on a band exactly as switching to it would.
+    #[arg(short, long)]
+    rate: Option<f64>,
     /// Prefer the SDRplay low-IF acquisition path (250 kS/s). FT8/FT4 still
     /// switch to 192 kS/s so their audio clock remains exact.
     #[arg(long)]
@@ -1849,14 +1850,23 @@ fn main() -> Result<()> {
     soapysdr::configure_logging();
 
     let mode = parse_mode(&args.mode);
-    let mut rate = if args.low_if { LOW_IF_RATE } else { args.rate };
+    // Opening on a band has to look exactly like switching to it: same centre,
+    // same span. Both come from the band table unless the flags say otherwise,
+    // so a default can never drift out of step with the preset again.
+    let start_band = bands::BANDS
+        .iter()
+        .position(|b| args.freq.is_some_and(|f| f >= b.start && f <= b.end))
+        .unwrap_or(bands::DEFAULT_BAND);
+    let freq = args.freq.unwrap_or(bands::BANDS[start_band].default);
+    let want_rate = args.rate.unwrap_or(bands::BANDS[start_band].span);
+    let mut rate = if args.low_if { LOW_IF_RATE } else { want_rate };
     if needs_exact_audio(mode) && !rate_ok_for_ft(rate) {
         rate = FT_SAFE_RATE;
     }
 
-    let radio = radio::spawn(args.device.clone(), rate, args.freq)?;
+    let radio = radio::spawn(args.device.clone(), rate, freq)?;
     rate = radio.rate;
-    let mut app = App::new(args.freq, rate, mode);
+    let mut app = App::new(freq, rate, mode);
     app.ppm = args.ppm;
     if args.ppm.abs() >= 0.0001 {
         let _ = radio.cmd.send(radio::Cmd::Ppm(args.ppm));
@@ -1881,19 +1891,16 @@ fn main() -> Result<()> {
     }
     if args.low_if && (rate - LOW_IF_RATE).abs() < 1.0 {
         app.log("low-IF acquisition: 250000 Hz (SDRplay 6 MS/s decimated path)".into());
-    } else if needs_exact_audio(mode) && (rate - FT_SAFE_RATE).abs() < 1.0 && rate != args.rate {
+    } else if needs_exact_audio(mode) && (rate - FT_SAFE_RATE).abs() < 1.0 && rate != want_rate {
         app.log(format!("sample rate forced to {rate:.0} Hz for FT8/FT4"));
-    } else if rate != args.rate {
+    } else if rate != want_rate {
         app.log(format!("backend sample rate: {rate:.0} Hz"));
     }
     app.fft_idx = FFT_SIZES
         .iter()
         .position(|n| *n >= args.fft)
         .unwrap_or(FFT_SIZES.len() - 1);
-    app.band_idx = bands::BANDS
-        .iter()
-        .position(|b| args.freq >= b.start && args.freq <= b.end)
-        .unwrap_or(5);
+    app.band_idx = start_band;
 
     let mut terminal_session = TerminalSession::enter()?;
     let stdout = std::io::stdout();
@@ -6158,6 +6165,37 @@ mod tests {
                 "message lost behind the chips at {w}x{h}:\n{text}"
             );
         }
+    }
+
+    /// Opening on a band and switching to it have to agree. They did not: the
+    /// starting centre and rate were hard-coded flag defaults, so the app came
+    /// up on 20 m at 192 kHz and at a centre 115 kHz from where `b` puts it,
+    /// while every default drifted independently of the band table.
+    #[test]
+    fn the_default_band_opens_the_way_switching_to_it_would() {
+        let b = &super::bands::BANDS[super::bands::DEFAULT_BAND];
+        assert_eq!(b.name, "20m", "DEFAULT_BAND no longer points at 20m");
+
+        // What startup resolves with no --freq / --rate.
+        let (freq, rate) = (b.default, b.span);
+        let opened = App::new(freq, rate, Mode::Auto);
+
+        // What `b` / `B` would land on for the same band.
+        let mut switched = App::new(1_828_000.0, 240_000.0, Mode::Auto);
+        switched.band_idx = super::bands::DEFAULT_BAND;
+        let target = &super::bands::BANDS[switched.band_idx];
+
+        assert_eq!(opened.center, target.default, "different centre");
+        assert_eq!(opened.rate, target.span, "different span");
+        // ...and that span really does show the band, not 192 kHz of it.
+        assert!(
+            opened.rate > 192_000.0,
+            "20m opened at {:.0} Hz, which is not the whole band",
+            opened.rate
+        );
+        let (lo, hi) = opened.view_range();
+        let (lo, hi) = (opened.center + lo, opened.center + hi);
+        assert!(lo <= target.start && hi >= target.end, "band not fully in view");
     }
 
     /// A band jump has to land on a span that shows the whole band, at a rate

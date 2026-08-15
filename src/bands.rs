@@ -33,7 +33,6 @@ pub const BANDS: &[Band] = &[
     Band { name: "10m",  start: 28_000_000.0, end: 29_700_000.0, default: 28_120_000.0 },
     Band { name: "6m",   start: 50_000_000.0, end: 54_000_000.0, default: 50_303_000.0 },
     Band { name: "2m",   start: 144_000_000.0, end: 148_000_000.0, default: 144_164_000.0 },
-    Band { name: "70cm", start: 420_000_000.0, end: 450_000_000.0, default: 432_164_000.0 },
     Band { name: "WWV",  start: 4_990_000.0,  end: 15_010_000.0, default: 10_000_000.0 },
 ];
 
@@ -79,8 +78,6 @@ pub const MARKERS: &[Marker] = &[
     Marker { freq: 50_318_000.0, label: "FT4" },
     Marker { freq: 144_170_000.0, label: "FT4" },
     Marker { freq: 144_174_000.0, label: "FT8" },
-    Marker { freq: 432_170_000.0, label: "FT4" },
-    Marker { freq: 432_174_000.0, label: "FT8" },
     Marker { freq: 5_000_000.0,  label: "WWV" },
     Marker { freq: 10_000_000.0, label: "WWV" },
     Marker { freq: 15_000_000.0, label: "WWV" },

@@ -413,6 +413,17 @@ const SMOOTH_TIME: [f32; 3] = [0.28, 0.12, 0.06];
 /// Frequency-domain binomial width: 1 = off, 3 = light, 5 = heavy.
 const SMOOTH_BINS: [usize; 3] = [1, 3, 5];
 const SMOOTH_LABELS: [&str; 3] = ["light", "medium", "heavy"];
+/// Smoothing the *detectors* run on, fixed and not the `e` setting.
+///
+/// The classifier and both scouts used to read the same buffer the waterfall
+/// is drawn from, which made a cosmetic preference into a detection parameter:
+/// "heavy" is a 5-bin binomial smooth plus a slow time average, and that
+/// broadens every peak, merges CW signals that sit close together, and slows
+/// the response to a station coming up. Detection gets its own buffer at what
+/// used to be the default, so what the receiver hears no longer depends on how
+/// the operator likes the waterfall to look.
+const DETECT_SMOOTH_BINS: usize = 3;
+const DETECT_SMOOTH_TIME: f32 = 0.12;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AgcMode {
@@ -588,6 +599,10 @@ struct App {
     noise_floor: Vec<f32>,
     spec_work: Vec<f32>,
     smoothed: Vec<f32>,
+    /// Fixed-smoothing spectrum the classifier and scouts run on. See
+    /// `DETECT_SMOOTH_BINS`.
+    detect_spec: Vec<f32>,
+    detect_work: Vec<f32>,
     waterfall: VecDeque<Vec<f32>>,
     wf_accum: Vec<f32>,
     wf_last: Instant,
@@ -828,6 +843,8 @@ impl App {
             noise_floor: Vec::new(),
             spec_work: Vec::new(),
             smoothed: Vec::new(),
+            detect_spec: Vec::new(),
+            detect_work: Vec::new(),
             waterfall: VecDeque::new(),
             wf_accum: Vec::new(),
             wf_last: Instant::now(),
@@ -1520,6 +1537,15 @@ impl App {
                 *s = (1.0 - a) * *s + a * *v;
             }
         }
+        // The detectors' own copy, at fixed smoothing.
+        smooth_bins(&self.spectrum, DETECT_SMOOTH_BINS, &mut self.detect_work);
+        if self.detect_spec.len() != self.detect_work.len() {
+            self.detect_spec = self.detect_work.clone();
+        } else {
+            for (s, v) in self.detect_spec.iter_mut().zip(&self.detect_work) {
+                *s = (1.0 - DETECT_SMOOTH_TIME) * *s + DETECT_SMOOTH_TIME * *v;
+            }
+        }
 
         // Accumulate the peak between waterfall rows instead of pushing a row
         // per block - otherwise the display scrolls far faster than it reads.
@@ -1596,7 +1622,7 @@ impl App {
         // and the status line. Once PSK31 is locked, measure a tight window
         // on the carrier rather than the whole search band.
         if let Some(d) = &self.decoder {
-            let n = self.smoothed.len();
+            let n = self.detect_spec.len();
             if n > 0 {
                 let bin_hz = self.rate / n as f64;
                 let (centre_hz, half_hz) = if matches!(self.mode, Mode::Psk31 | Mode::Cw)
@@ -1610,7 +1636,7 @@ impl App {
                 let centre = (n as f64 / 2.0 + centre_hz / bin_hz) as isize;
                 let lo = (centre - half).clamp(0, n as isize - 1) as usize;
                 let hi = (centre + half).clamp(0, n as isize - 1) as usize;
-                let peak = self.smoothed[lo..=hi.max(lo)]
+                let peak = self.detect_spec[lo..=hi.max(lo)]
                     .iter()
                     .cloned()
                     .fold(f32::MIN, f32::max);
@@ -1883,6 +1909,8 @@ fn run_app<B: Backend>(
             app.spectrum.clear();
             app.spec_work.clear();
             app.smoothed.clear();
+            app.detect_spec.clear();
+    app.detect_spec.clear();
             app.wf_accum.clear();
             app.waterfall.clear();
         }
@@ -2287,7 +2315,7 @@ fn next_signal(app: &mut App, forward: bool) {
         next_cw(app, forward);
         return;
     }
-    let mut peaks = find_peaks(&app.smoothed, &app.noise_floor, 0.0, app.rate);
+    let mut peaks = find_peaks(&app.detect_spec, &app.noise_floor, 0.0, app.rate);
     if peaks.is_empty() {
         app.log("no signals above the noise floor".into());
         return;
@@ -2316,14 +2344,14 @@ fn next_signal(app: &mut App, forward: bool) {
 }
 
 fn refresh_psk_hits(app: &mut App) {
-    let mut peaks = scout_peaks(&app.smoothed, &app.noise_floor, 0.0, app.rate);
+    let mut peaks = scout_peaks(&app.detect_spec, &app.noise_floor, 0.0, app.rate);
     peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     peaks.truncate(24);
     app.psk_hits = psk31::scan_span(&app.scout_iq, app.rate, &peaks);
 }
 
 fn refresh_cw_hits(app: &mut App) {
-    let mut peaks = scout_peaks(&app.smoothed, &app.noise_floor, 0.0, app.rate);
+    let mut peaks = scout_peaks(&app.detect_spec, &app.noise_floor, 0.0, app.rate);
     peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     peaks.truncate(24);
     app.cw_hits = cw::scan_span(&app.scout_iq, app.rate, &peaks);
@@ -2343,12 +2371,12 @@ fn refresh_cw_hits(app: &mut App) {
 /// candidate down to baseband and match it there rather than reading a
 /// bin. They were already running — just not in the mode that needed them.
 fn scout_idents(app: &App) -> Vec<identify::Ident> {
-    if app.mode != Mode::Auto || app.smoothed.is_empty() {
+    if app.mode != Mode::Auto || app.detect_spec.is_empty() {
         return Vec::new();
     }
-    let n = app.smoothed.len();
+    let n = app.detect_spec.len();
     let bin = app.rate as f32 / n as f32;
-    let mut sorted = app.smoothed.clone();
+    let mut sorted = app.detect_spec.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let med = sorted[n / 2];
     // The scouts report an offset, not a level; read the level back off the
@@ -2356,7 +2384,7 @@ fn scout_idents(app: &App) -> Vec<identify::Ident> {
     let snr_at = |off_hz: f32| {
         let i = ((off_hz / bin) + n as f32 / 2.0).round();
         let i = (i.clamp(0.0, n as f32 - 1.0)) as usize;
-        app.smoothed[i] - med
+        app.detect_spec[i] - med
     };
     let mut out = Vec::new();
     for h in &app.psk_hits {
@@ -2391,10 +2419,10 @@ fn scout_idents(app: &App) -> Vec<identify::Ident> {
 }
 
 fn refresh_idents(app: &mut App) {
-    if app.smoothed.is_empty() || app.scout_iq.len() < (app.rate * 0.25) as usize {
+    if app.detect_spec.is_empty() || app.scout_iq.len() < (app.rate * 0.25) as usize {
         return;
     }
-    let mut raw = identify::classify_span(&app.scout_iq, app.rate, &app.smoothed, app.center);
+    let mut raw = identify::classify_span(&app.scout_iq, app.rate, &app.detect_spec, app.center);
     // The classifier wins where it has an opinion; the scouts only add what
     // it never saw, so this cannot override a considered classification.
     for s in scout_idents(app) {
@@ -2652,6 +2680,7 @@ fn set_radio_rate(app: &mut App, radio: &radio::Radio, rate: f64) {
     app.waterfall.clear();
     app.spectrum.clear();
     app.smoothed.clear();
+    app.detect_spec.clear();
     app.spec_work.clear();
     app.wf_accum.clear();
     app.auto.clear();
@@ -2746,6 +2775,7 @@ fn accept_actual_rate(app: &mut App, rate: f64) {
     app.waterfall.clear();
     app.spectrum.clear();
     app.smoothed.clear();
+    app.detect_spec.clear();
     app.spec_work.clear();
     app.wf_accum.clear();
     app.auto.clear();
@@ -3003,6 +3033,7 @@ fn retune(app: &mut App, radio: &radio::Radio, freq: f64) {
     app.waterfall.clear();
     app.spectrum.clear();
     app.smoothed.clear();
+    app.detect_spec.clear();
     app.spec_work.clear();
     app.wf_accum.clear();
     app.floor_db = -90.0;
@@ -3100,7 +3131,7 @@ fn step_scan(app: &mut App) -> Option<bool> {
     let kind = app.scan.as_ref()?.kind;
     match kind {
         ScanKind::Psk31 => {
-            let peaks = find_peaks(&app.smoothed, &app.noise_floor, 0.0, app.rate);
+            let peaks = find_peaks(&app.detect_spec, &app.noise_floor, 0.0, app.rate);
             let hits = psk31::scan_span(&app.scout_iq, app.rate, &peaks);
             if let Some(s) = app.scan.as_mut() {
                 for h in hits {
@@ -3115,7 +3146,7 @@ fn step_scan(app: &mut App) -> Option<bool> {
             }
         }
         ScanKind::Cw => {
-            let peaks = find_peaks(&app.smoothed, &app.noise_floor, 0.0, app.rate);
+            let peaks = find_peaks(&app.detect_spec, &app.noise_floor, 0.0, app.rate);
             let hits = cw::scan_span(&app.scout_iq, app.rate, &peaks);
             if let Some(s) = app.scan.as_mut() {
                 for h in hits {
@@ -3130,8 +3161,8 @@ fn step_scan(app: &mut App) -> Option<bool> {
             }
         }
         ScanKind::Energy => {
-            let peaks = find_peaks(&app.smoothed, &app.noise_floor, cur, app.rate);
-            let ids = identify::classify_span(&app.scout_iq, app.rate, &app.smoothed, app.center);
+            let peaks = find_peaks(&app.detect_spec, &app.noise_floor, cur, app.rate);
+            let ids = identify::classify_span(&app.scout_iq, app.rate, &app.detect_spec, app.center);
             if let Some(s) = app.scan.as_mut() {
                 for (f, snr) in peaks {
                     let label = ids
@@ -6101,6 +6132,63 @@ mod tests {
         }
     }
 
+    /// How the operator likes the waterfall to look must not change what the
+    /// receiver hears. The classifier and both scouts used to read the same
+    /// buffer the waterfall is drawn from, so `e` — nominally a cosmetic
+    /// preference — widened every peak the detectors saw and slowed their
+    /// response to a station coming up.
+    #[test]
+    fn spectrum_smoothing_does_not_move_detection() {
+        let fs = 192_000.0f64;
+        // Two CW carriers close enough that heavy smoothing can merge them,
+        // plus a PSK31 signal, in noise.
+        let mut rng = 0x5a5a_1234u32;
+        let n = (fs * 2.0) as usize;
+        let iq: Vec<Complex32> = (0..n)
+            .map(|i| {
+                let t = i as f32;
+                let mut v = Complex32::new(
+                    super::dsp::frontend_tests::noise(&mut rng),
+                    super::dsp::frontend_tests::noise(&mut rng),
+                ) * 0.02;
+                for off in [8_000.0f32, 8_600.0, -12_000.0] {
+                    let keyed = ((t / fs as f32 * 12.0) as u32) % 2 == 0;
+                    if keyed {
+                        let ph = 2.0 * std::f32::consts::PI * off * t / fs as f32;
+                        v += Complex32::from_polar(0.25, ph);
+                    }
+                }
+                v
+            })
+            .collect();
+
+        let run = |smooth_idx: usize| {
+            let mut app = App::new(14_060_000.0, fs, Mode::Auto);
+            app.agc = super::AgcMode::Off;
+            app.smooth_idx = smooth_idx;
+            let mut spec = super::Spectrum::new(4096);
+            let mut out = Vec::new();
+            for block in iq.chunks(16_384) {
+                app.feed(block, &mut spec, &mut out);
+            }
+            super::refresh_idents(&mut app);
+            let mut got: Vec<String> = app
+                .idents
+                .iter()
+                .map(|i| format!("{} @{:.0}", i.kind.label(), i.offset_hz))
+                .collect();
+            got.sort();
+            got
+        };
+
+        let light = run(0);
+        let medium = run(1);
+        let heavy = run(2);
+        assert!(!medium.is_empty(), "test signal produced no detections");
+        assert_eq!(light, medium, "'light' smoothing changed what was detected");
+        assert_eq!(heavy, medium, "'heavy' smoothing changed what was detected");
+    }
+
     /// Spots broken down by mode, so a span carrying four decoders shows
     /// which of them are actually producing. The status line has the running
     /// total but no room for this — it already clips at 80 columns.
@@ -7244,6 +7332,51 @@ mod psk_auto_tests {
 mod scout_cost {
     use super::*;
 
+    /// How the scouts scale with the sample rate. Full-band coverage means
+    /// running them over spans up to 4.8 MS/s, and they walk the whole scout
+    /// buffer once per candidate peak.
+    #[test]
+    #[ignore]
+    fn bench_scout_cost_vs_rate() {
+        for rate in [192_000.0f64, 384_000.0, 600_000.0, 1_200_000.0, 2_040_000.0] {
+            let mut rng = 0x1234_5678u32;
+            let mut noise = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                (rng as f32 / u32::MAX as f32) - 0.5
+            };
+            let n = (rate * 1.6) as usize;
+            let mut iq: Vec<Complex32> = (0..n)
+                .map(|_| Complex32::new(noise(), noise()) * 0.05)
+                .collect();
+            for k in 0..40 {
+                let off = -(rate / 5.0) + k as f64 * (rate / 100.0);
+                for (i, s) in iq.iter_mut().enumerate() {
+                    let ph = 2.0 * std::f64::consts::PI * off * i as f64 / rate;
+                    *s += Complex32::from_polar(0.5, ph as f32);
+                }
+            }
+            let mut app = App::new(14_060_000.0, rate, Mode::Auto);
+            let mut spec = Spectrum::new(4096);
+            let mut out = Vec::new();
+            for block in iq.chunks(16_384) {
+                app.feed(block, &mut spec, &mut out);
+            }
+            let t = Instant::now();
+            refresh_psk_hits(&mut app);
+            let psk = t.elapsed().as_secs_f64() * 1000.0;
+            let t = Instant::now();
+            refresh_cw_hits(&mut app);
+            let cw = t.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "  {:>7.0} kS/s: psk {psk:7.1} ms  cw {cw:6.1} ms  = {:5.0}% of the 800 ms budget",
+                rate / 1000.0,
+                100.0 * (psk + cw) / 800.0
+            );
+        }
+    }
+
     /// Auto mode now runs both narrowband scouts every 800 ms over 1.6 s of
     /// span IQ. That is the price of seeing weak signals; it has to stay well
     /// under the budget or the waterfall stutters.
@@ -7294,7 +7427,7 @@ mod scout_cost {
         }
         println!(
             "  candidates: {} peaks",
-            scout_peaks(&app.smoothed, &app.noise_floor, 0.0, app.rate).len()
+            scout_peaks(&app.detect_spec, &app.noise_floor, 0.0, app.rate).len()
         );
     }
 }

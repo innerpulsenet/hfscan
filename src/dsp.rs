@@ -306,28 +306,41 @@ pub struct DecimFir {
     taps: Vec<f32>,
     buf: Vec<Complex32>,
     decim: usize,
+    fft: Option<Arc<dyn Fft<f32>>>,
+    ifft: Option<Arc<dyn Fft<f32>>>,
+    response: Vec<Complex32>,
+    work: Vec<Complex32>,
+    overlap: Vec<Complex32>,
+    fft_len: usize,
+    fft_phase: usize,
+    fft_warm: usize,
 }
 
 #[allow(dead_code)]
 impl DecimFir {
     pub fn new(cutoff_hz: f32, fs: f32, decim: usize, ntaps: usize) -> Self {
         let ntaps = ntaps | 1; // force odd so there is a center tap
-        Self {
+        let mut this = Self {
             taps: lowpass_taps(cutoff_hz, fs, ntaps),
             buf: Vec::with_capacity(ntaps * 4),
             decim,
-        }
+            fft: None, ifft: None, response: Vec::new(), work: Vec::new(), overlap: Vec::new(), fft_len: 0, fft_phase: 0, fft_warm: 0,
+        };
+        this.rebuild_fft();
+        this
     }
 
     pub fn set_cutoff(&mut self, cutoff_hz: f32, fs: f32) {
         let n = self.taps.len();
         self.taps = lowpass_taps(cutoff_hz, fs, n);
+        self.rebuild_fft();
     }
 
     /// Redesign at a new length as well as a new cutoff. The sample history
     /// is kept, so changing the filter does not click.
     pub fn set_taps(&mut self, cutoff_hz: f32, fs: f32, ntaps: usize) {
         self.taps = lowpass_taps(cutoff_hz, fs, ntaps | 1);
+        self.rebuild_fft();
     }
 
     pub fn decim(&self) -> usize {
@@ -335,20 +348,82 @@ impl DecimFir {
     }
 
     pub fn process(&mut self, input: &[Complex32], out: &mut Vec<Complex32>) {
+        if self.fft.is_some() {
+            self.process_fft(input, out);
+            return;
+        }
         out.clear();
         self.buf.extend_from_slice(input);
         let n = self.taps.len();
         let mut i = 0usize;
         while i + n <= self.buf.len() {
-            let mut acc = Complex32::new(0.0, 0.0);
+            let mut re = 0.0f64;
+            let mut im = 0.0f64;
             for k in 0..n {
-                acc += self.buf[i + k] * self.taps[k];
+                re += self.buf[i + k].re as f64 * self.taps[k] as f64;
+                im += self.buf[i + k].im as f64 * self.taps[k] as f64;
             }
-            out.push(acc);
+            out.push(Complex32::new(re as f32, im as f32));
             i += self.decim;
         }
         if i > 0 {
             self.buf.drain(..i);
+        }
+    }
+
+    fn rebuild_fft(&mut self) {
+        if self.taps.len() < 64 {
+            self.fft = None;
+            return;
+        }
+        self.fft_len = self.taps.len().next_power_of_two();
+        if self.fft_len - (self.taps.len() - 1) < 512 {
+            self.fft_len *= 2;
+        }
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(self.fft_len);
+        let ifft = planner.plan_fft_inverse(self.fft_len);
+        self.response = vec![Complex32::new(0.0, 0.0); self.fft_len];
+        for (dst, &tap) in self.response.iter_mut().zip(&self.taps) { dst.re = tap; }
+        fft.process(&mut self.response);
+        self.work.resize(self.fft_len, Complex32::new(0.0, 0.0));
+        self.overlap.resize(self.taps.len() - 1, Complex32::new(0.0, 0.0));
+        self.fft = Some(fft);
+        self.ifft = Some(ifft);
+        self.buf.clear();
+        self.fft_phase = 0;
+        self.fft_warm = self.taps.len() - 1;
+    }
+
+    fn process_fft(&mut self, input: &[Complex32], out: &mut Vec<Complex32>) {
+        out.clear();
+        self.buf.extend_from_slice(input);
+        let discard = self.taps.len() - 1;
+        let hop = self.fft_len - discard;
+        while self.buf.len() >= hop {
+            self.work.fill(Complex32::new(0.0, 0.0));
+            self.work[..discard].copy_from_slice(&self.overlap);
+            self.work[discard..discard + hop].copy_from_slice(&self.buf[..hop]);
+            self.fft.as_ref().unwrap().process(&mut self.work);
+            for (x, h) in self.work.iter_mut().zip(&self.response) { *x *= *h; }
+            self.ifft.as_ref().unwrap().process(&mut self.work);
+            let scale = 1.0 / self.fft_len as f32;
+            for x in &self.work[discard..discard + hop] {
+                if self.fft_warm > 0 {
+                    self.fft_warm -= 1;
+                    continue;
+                }
+                if self.fft_phase == 0 { out.push(*x * scale); }
+                self.fft_phase += 1;
+                if self.fft_phase == self.decim { self.fft_phase = 0; }
+            }
+            if discard <= hop {
+                self.overlap.copy_from_slice(&self.buf[hop - discard..hop]);
+            } else {
+                self.overlap.rotate_left(hop);
+                self.overlap[discard - hop..].copy_from_slice(&self.buf[..hop]);
+            }
+            self.buf.drain(..hop);
         }
     }
 }
@@ -381,9 +456,9 @@ fn lowpass_taps(cutoff_hz: f32, fs: f32, ntaps: usize) -> Vec<f32> {
         } else {
             (2.0 * PI * fc * x).sin() / (PI * x)
         };
-        // Blackman window keeps the stopband clean enough for narrow HF filters
-        let w = 0.42 - 0.5 * (2.0 * PI * i as f32 / (ntaps - 1) as f32).cos()
-            + 0.08 * (4.0 * PI * i as f32 / (ntaps - 1) as f32).cos();
+        let xw = 2.0 * PI * i as f32 / (ntaps - 1) as f32;
+        let w = 0.358_75 - 0.488_29 * xw.cos() + 0.141_28 * (2.0 * xw).cos()
+            - 0.011_68 * (3.0 * xw).cos();
         taps.push(sinc * w);
     }
     let sum: f32 = taps.iter().sum();
@@ -395,9 +470,9 @@ fn lowpass_taps(cutoff_hz: f32, fs: f32, ntaps: usize) -> Vec<f32> {
 
 /// Radio-rate taps. Only the samples the decimator keeps are evaluated, so
 /// this costs `taps × fs_out` multiplies per second regardless of `fs_in`.
-const RADIO_TAPS: usize = 511;
+const RADIO_TAPS: usize = 2047;
 const AUDIO_TAPS_MIN: usize = 129;
-const AUDIO_TAPS_MAX: usize = 1023;
+const AUDIO_TAPS_MAX: usize = 4095;
 
 /// NCO + decimating lowpass: takes wideband IQ at the radio rate and produces
 /// narrowband complex baseband centred on the cursor at the mode's audio rate.
@@ -467,7 +542,7 @@ impl DecodeChain {
         // lower skirt has to be flat at 200 Hz and already stopped at 0 Hz —
         // 129 taps could not do that and cost the edges of the waterfall
         // several dB. Ask for a transition that fits inside the setting.
-        let want_tr = (0.06 * bw).max(0.01 * fs_out);
+        let want_tr = (0.03 * bw).max(0.01 * fs_out);
         let ntaps = taps_for_transition(fs_out, want_tr, AUDIO_TAPS_MIN, AUDIO_TAPS_MAX);
         self.audio.set_taps(half, fs_out, ntaps);
     }
@@ -648,6 +723,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn overlap_save_matches_direct_decimation() {
+        let input: Vec<_> = (0..20_000).map(|i| Complex32::new((i as f32 * 0.013).sin(), (i as f32 * 0.021).cos())).collect();
+        let mut fast = DecimFir::new(3500.0, 192_000.0, 24, 4095);
+        let taps = fast.taps.clone();
+        let mut got = Vec::new();
+        for block in input.chunks(3000) { let mut part = Vec::new(); fast.process(block, &mut part); got.extend(part); }
+        let mut want = Vec::new();
+        for i in (0..=input.len() - taps.len()).step_by(24) {
+            want.push(input[i..i + taps.len()].iter().zip(&taps).map(|(x, h)| *x * *h).sum::<Complex32>());
+        }
+        let err = got.iter().zip(&want).map(|(a,b)| (*a-*b).norm()).fold(0.0f32, f32::max);
+        assert!(err < 1e-3, "overlap-save differs by {err}");
+    }
+
     /// Gain of the whole chain at `hz` off centre, relative to DC, in dB.
     fn chain_resp_db(fs_in: f64, bw: f32, target: f64, hz: f64) -> f32 {
         let tone = |hz: f64| -> f32 {
@@ -659,6 +749,7 @@ mod tests {
                 .map(|_| {
                     let s = Complex32::from_polar(1.0, phase as f32);
                     phase += step;
+                    if phase > std::f64::consts::PI { phase -= 2.0 * std::f64::consts::PI; }
                     s
                 })
                 .collect();
@@ -725,10 +816,30 @@ mod tests {
         for hz in [7900.0, 8000.0, 8100.0, 16_000.0] {
             let r = chain_resp_db(192_000.0, 400.0, 8000.0, hz);
             assert!(
-                r < -60.0,
+                r < -80.0,
                 "{hz:.0} Hz folds into the channel at {r:.1} dB"
             );
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_fast_convolution() {
+        use std::time::Instant;
+        let input: Vec<_> = (0..96_000).map(|i| Complex32::new((i as f32 * 0.017).sin(), 0.0)).collect();
+        let taps = lowpass_taps(100.0, 8000.0, 1101);
+        let at = Instant::now();
+        let mut direct = Vec::with_capacity(input.len());
+        for i in 0..input.len() - taps.len() {
+            direct.push(input[i..i + taps.len()].iter().zip(&taps).map(|(x, h)| *x * *h).sum::<Complex32>());
+        }
+        let direct_ms = at.elapsed().as_secs_f64() * 1000.0;
+        let mut fir = DecimFir::new(100.0, 8000.0, 1, 1101);
+        let at = Instant::now();
+        let mut out = Vec::new();
+        for block in input.chunks(4096) { fir.process(block, &mut out); }
+        let fft_ms = at.elapsed().as_secs_f64() * 1000.0;
+        println!("1101-tap convolution: direct {direct_ms:.1} ms, overlap-save {fft_ms:.1} ms ({:.1}x faster)", direct_ms / fft_ms);
     }
 }
 

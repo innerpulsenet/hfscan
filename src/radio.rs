@@ -38,6 +38,20 @@ pub fn spawn(args: String, rate: f64, freq: f64) -> Result<Radio> {
     let _ = dev.set_gain_mode(Rx, 0, false);
     let _ = dev.set_gain(Rx, 0, 36.0);
     let _ = dev.write_setting("biasT_ctrl", "false");
+    // Ask the driver to null the DC offset itself. Where a device can do that
+    // — in hardware, or knowing its own front end — it does it better than
+    // anything downstream, and it is the artefact that forces every candidate
+    // picker here to blank the bins around the LO. Support is patchy across
+    // SoapySDR backends and there is no penalty for asking a device that
+    // lacks it. SoapySDR exposes no equivalent automatic mode for IQ balance
+    // (only a manual correction value), so that one is always ours.
+    // `dsp::FrontEnd` cleans up whatever is left of both regardless.
+    let dc_auto = dev.has_dc_offset_mode(Rx, 0).unwrap_or(false)
+        && dev.set_dc_offset_mode(Rx, 0, true).is_ok();
+    let _ = log_tx.try_send(format!(
+        "front end: DC correction {}, IQ balance software",
+        if dc_auto { "driver + software" } else { "software" },
+    ));
 
     std::thread::spawn(move || {
         if let Err(e) = run(dev, rate, cmd_rx, iq_tx, log_tx.clone()) {

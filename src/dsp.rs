@@ -664,3 +664,318 @@ mod tests {
         }
     }
 }
+
+/// Basic receiver front-end cleanup, applied to raw IQ before anything else
+/// looks at it.
+///
+/// A quadrature front end has two defects that are not signals and that no
+/// amount of care downstream can undo:
+///
+/// * a **DC offset** — a constant bias on I and Q, which is a carrier sitting
+///   exactly on the local oscillator. It is why every candidate picker here
+///   has to blank the bins either side of the LO, and so why a real signal
+///   that close cannot be seen.
+/// * **IQ imbalance** — the two channels differing slightly in gain or in
+///   quadrature, which mirrors a copy of every signal about the LO. The image
+///   of a strong station is an ordinary-looking weak one, and detection
+///   thresholds low enough to find real weak signals are low enough to find
+///   those too.
+///
+/// The driver corrects both where it can (see `radio`), but support varies by
+/// device and by SoapySDR backend, so the same corrections are done here as
+/// well. Both are cheap, and both are no-ops on IQ that is already clean.
+pub struct FrontEnd {
+    fs: f64,
+    dc: Complex32,
+    dc_a: f32,
+    /// Running estimates for the imbalance solve.
+    ii: f32,
+    qq: f32,
+    iq: f32,
+    est_a: f32,
+    /// Applied correction, updated slowly from the estimates.
+    gain: f32,
+    cross: f32,
+    /// Samples seen, against the number needed before correcting at all.
+    warm: u32,
+    settle: u32,
+}
+
+impl FrontEnd {
+    pub fn new(fs: f64) -> Self {
+        let fsf = fs as f32;
+        Self {
+            fs,
+            dc: Complex32::new(0.0, 0.0),
+            // ~2 Hz corner. Slow enough that it is a bias estimate rather
+            // than a filter, so it cannot touch a signal even a few tens of
+            // hertz off the LO — the region worth recovering in the first place.
+            dc_a: 1.0 - (-2.0 * PI * 2.0 / fsf).exp(),
+            ii: 1.0,
+            qq: 1.0,
+            iq: 0.0,
+            // ~1 Hz: imbalance is a property of the hardware and drifts with
+            // temperature, not with the traffic on the band.
+            est_a: 1.0 - (-2.0 * PI * 1.0 / fsf).exp(),
+            gain: 1.0,
+            cross: 0.0,
+            warm: 0,
+            // Two time constants of the estimator above.
+            settle: (2.0 * fs) as u32,
+        }
+    }
+
+    /// Forget everything learned — after a retune or a rate change, when the
+    /// front end is being asked a different question.
+    pub fn reset(&mut self) {
+        *self = FrontEnd::new(self.fs);
+    }
+
+    /// The correction currently being applied, for display: DC magnitude and
+    /// image rejection in dB (higher is better; ~100 means nothing to correct).
+    pub fn status(&self) -> (f32, f32) {
+        let err = (self.gain - 1.0).abs() + self.cross.abs();
+        let rej = if err > 1e-6 {
+            -20.0 * (err / 2.0).log10()
+        } else {
+            100.0
+        };
+        (self.dc.norm(), rej.min(100.0))
+    }
+
+    pub fn process(&mut self, iq: &mut [Complex32]) {
+        for s in iq.iter_mut() {
+            // --- DC offset: track the mean and subtract it.
+            self.dc += (*s - self.dc) * self.dc_a;
+            let v = *s - self.dc;
+
+            // --- IQ imbalance: the band is noise-like in aggregate, so the
+            // true signal has equal power in I and Q and no correlation
+            // between them. Whatever departs from that is the front end.
+            self.ii += (v.re * v.re - self.ii) * self.est_a;
+            self.qq += (v.im * v.im - self.qq) * self.est_a;
+            self.iq += (v.re * v.im - self.iq) * self.est_a;
+
+            // Q' = g * (Q + c * I): orthogonalise against I, then match its
+            // power. The cross term is inside the gain, not beside it.
+            *s = Complex32::new(v.re, self.gain * (v.im + self.cross * v.re));
+        }
+
+        // Solved once per block, not per sample: `ii`/`qq`/`iq` already carry
+        // a one-second time constant, so the solution is smooth without any
+        // further filtering — and filtering it again per *block* made the
+        // correction converge at a rate that depended on how the caller
+        // happened to chunk its input, which is no rate at all.
+        self.warm = self.warm.saturating_add(iq.len() as u32);
+        if self.warm < self.settle {
+            // Nothing is corrected until the estimators have seen enough to
+            // be estimates; a correction derived from a tenth of a second of
+            // one loud carrier is worse than none.
+            return;
+        }
+        if self.ii > 1e-20 && self.qq > 1e-20 {
+            let cross = -self.iq / self.ii;
+            let resid = self.qq - self.iq * self.iq / self.ii;
+            if resid > 1e-20 {
+                let gain = (self.ii / resid).sqrt();
+                // Clamped hard: a real front end is within a few percent, and
+                // a band dominated by one strong carrier can briefly look
+                // correlated in a way that is the signal, not the hardware.
+                if (0.8..=1.25).contains(&gain) && cross.abs() < 0.25 {
+                    self.gain = gain;
+                    self.cross = cross;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod frontend_tests {
+    use super::*;
+
+    pub(crate) fn noise(rng: &mut u32) -> f32 {
+        *rng ^= *rng << 13;
+        *rng ^= *rng >> 17;
+        *rng ^= *rng << 5;
+        (*rng as f32 / u32::MAX as f32) - 0.5
+    }
+
+    /// Power in a narrow band around `hz`, by direct correlation.
+    pub(crate) fn power_at(iq: &[Complex32], fs: f32, hz: f32) -> f32 {
+        let n = iq.len().min(200_000);
+        let start = iq.len() - n;
+        let mut osc = Rotator::new(-2.0 * PI * hz / fs);
+        let mut acc = Complex32::new(0.0, 0.0);
+        for &s in &iq[start..] {
+            acc += s * osc.next();
+        }
+        (acc / n as f32).norm_sqr()
+    }
+
+    /// A band of noise with a signal on it, a DC offset, and a gain and
+    /// quadrature error between I and Q — an ordinary uncorrected front end.
+    pub(crate) fn dirty_iq(fs: f32, sig_hz: f32, dc: Complex32, gain_err: f32, phase_err: f32) -> Vec<Complex32> {
+        let mut rng = 0x1234_5678u32;
+        // Long enough to cover the front end's settle time several times over.
+        (0..(fs * 10.0) as usize)
+            .map(|i| {
+                let ph = 2.0 * PI * sig_hz * i as f32 / fs;
+                let clean = Complex32::from_polar(0.5, ph)
+                    + Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.05;
+                // Gain and quadrature error on Q, then the DC bias.
+                let q = clean.im * gain_err + clean.re * phase_err;
+                Complex32::new(clean.re, q) + dc
+            })
+            .collect()
+    }
+
+    /// Run a long stretch of dirty IQ through in blocks, as the app does,
+    /// and return the settled tail of the output. Feeding the corrected
+    /// output back in instead would measure a feedback loop, not the
+    /// correction.
+    pub(crate) fn run_frontend(iq: &[Complex32], fs: f32) -> Vec<Complex32> {
+        let mut fe = FrontEnd::new(fs as f64);
+        let mut out = Vec::with_capacity(iq.len());
+        for chunk in iq.chunks(16_384) {
+            let mut buf = chunk.to_vec();
+            fe.process(&mut buf);
+            out.extend_from_slice(&buf);
+        }
+        // The last quarter, by which time the estimators have long settled.
+        out.split_off(out.len() * 3 / 4)
+    }
+
+    /// The DC offset is what forces the LO bins to be blanked, so removing it
+    /// is the difference between a signal near the LO being findable and not.
+    #[test]
+    fn dc_offset_is_removed() {
+        let fs = 48_000.0f32;
+        let iq = dirty_iq(fs, 400.0, Complex32::new(0.25, -0.18), 1.0, 0.0);
+        let before = power_at(&iq, fs, 0.0);
+        let after = power_at(&run_frontend(&iq, fs), fs, 0.0);
+        let db = 10.0 * (before / after.max(1e-30)).log10();
+        assert!(
+            db > 40.0,
+            "DC only came down {db:.0} dB ({before:.6} -> {after:.9})"
+        );
+    }
+
+    /// IQ imbalance mirrors every signal about the LO. With detection
+    /// thresholds low enough to find real weak signals, the image of a strong
+    /// station is an ordinary-looking weak one — a station that is not there.
+    #[test]
+    fn iq_imbalance_image_is_suppressed() {
+        let fs = 48_000.0f32;
+        // 6% gain error and 3 degrees of quadrature error: poor, but the sort
+        // of thing an uncorrected direct-conversion front end really does.
+        let iq = dirty_iq(fs, 400.0, Complex32::new(0.0, 0.0), 1.06, 0.052);
+        let before =
+            10.0 * (power_at(&iq, fs, 400.0) / power_at(&iq, fs, -400.0)).log10();
+        let out = run_frontend(&iq, fs);
+        let sig = power_at(&out, fs, 400.0);
+        let after = 10.0 * (sig / power_at(&out, fs, -400.0)).log10();
+        assert!(
+            after > before + 15.0,
+            "image rejection only improved {:.1} dB ({before:.1} -> {after:.1})",
+            after - before
+        );
+        assert!(
+            sig > power_at(&iq, fs, 400.0) * 0.5,
+            "the wanted signal was attenuated"
+        );
+    }
+
+    /// And clean IQ must come out unharmed — the correction has to be a
+    /// no-op on a front end that has nothing wrong with it.
+    #[test]
+    fn clean_iq_is_left_alone() {
+        let fs = 48_000.0f32;
+        let clean = dirty_iq(fs, 400.0, Complex32::new(0.0, 0.0), 1.0, 0.0);
+        let out = run_frontend(&clean, fs);
+        let sig = power_at(&out, fs, 400.0);
+        let want = power_at(&clean, fs, 400.0);
+        assert!(
+            (sig / want - 1.0).abs() < 0.05,
+            "clean signal changed by {:.1}%",
+            (sig / want - 1.0) * 100.0
+        );
+        let img = 10.0 * (sig / power_at(&out, fs, -400.0)).log10();
+        assert!(img > 40.0, "invented an image: {img:.0} dB rejection");
+    }
+}
+
+#[cfg(test)]
+mod frontend_bench {
+    use super::*;
+    use super::frontend_tests::*;
+
+    #[test]
+    #[ignore]
+    fn bench_frontend() {
+        let fs = 48_000.0f32;
+        println!("\n== DC offset removal ==");
+        for dc in [0.02f32, 0.10, 0.25] {
+            let iq = dirty_iq(fs, 400.0, Complex32::new(dc, -dc * 0.7), 1.0, 0.0);
+            let before = power_at(&iq, fs, 0.0);
+            let after = power_at(&run_frontend(&iq, fs), fs, 0.0);
+            println!(
+                "  offset {:.2} of full scale: {:.0} dB down",
+                dc,
+                10.0 * (before / after.max(1e-30)).log10()
+            );
+        }
+
+        println!("\n== IQ image rejection (gain error / quadrature error) ==");
+        for (g, p) in [(1.01f32, 0.009f32), (1.03, 0.026), (1.06, 0.052), (1.12, 0.105)] {
+            let iq = dirty_iq(fs, 400.0, Complex32::new(0.0, 0.0), g, p);
+            let before =
+                10.0 * (power_at(&iq, fs, 400.0) / power_at(&iq, fs, -400.0)).log10();
+            let out = run_frontend(&iq, fs);
+            let after =
+                10.0 * (power_at(&out, fs, 400.0) / power_at(&out, fs, -400.0)).log10();
+            println!(
+                "  {:>4.0}% gain, {:>4.1} deg: {:>5.1} dB -> {:>5.1} dB",
+                (g - 1.0) * 100.0,
+                p.asin().to_degrees(),
+                before,
+                after
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod frontend_cost {
+    use super::*;
+
+    /// The front end runs on every sample of every block, so it has to be
+    /// negligible against the 192 kHz stream it sits in front of.
+    #[test]
+    #[ignore]
+    fn bench_frontend_cost() {
+        let fs = 192_000.0f64;
+        let n = (fs * 4.0) as usize;
+        let mut rng = 0x2222_1111u32;
+        let mut nz = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            (rng as f32 / u32::MAX as f32) - 0.5
+        };
+        let iq: Vec<Complex32> = (0..n).map(|_| Complex32::new(nz(), nz())).collect();
+        let mut fe = FrontEnd::new(fs);
+        let t = std::time::Instant::now();
+        for chunk in iq.chunks(16_384) {
+            let mut buf = chunk.to_vec();
+            fe.process(&mut buf);
+        }
+        let el = t.elapsed().as_secs_f64();
+        println!(
+            "  {:.1} ms for {:.1} s of 192 kHz IQ ({:.2}% of real time)",
+            el * 1000.0,
+            n as f64 / fs,
+            el / (n as f64 / fs) * 100.0
+        );
+    }
+}

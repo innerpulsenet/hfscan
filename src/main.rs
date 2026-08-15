@@ -485,6 +485,9 @@ struct App {
     /// many decoders talking at once, so its output is kept as records with
     /// their own columns rather than folded into the flat transcript.
     decode_log: VecDeque<DecodeEntry>,
+    /// Receiver front-end cleanup, and the block it works in.
+    front: dsp::FrontEnd,
+    iq_buf: Vec<Complex32>,
     /// One held row per signal heard in `Mode::Auto`. Live signals sort to
     /// the top, signals that have gone quiet sink to the bottom.
     rows: Vec<SignalRow>,
@@ -672,6 +675,8 @@ impl App {
             chain: DecodeChain::new(rate, 400.0, Mode::Off.audio_rate()),
             text: String::new(),
             decode_log: VecDeque::new(),
+            front: dsp::FrontEnd::new(rate),
+            iq_buf: Vec::new(),
             rows: Vec::new(),
             auto_view: AutoView::Rows,
             ft_msgs: VecDeque::new(),
@@ -1190,6 +1195,18 @@ impl App {
     }
 
     fn feed(&mut self, block: &[Complex32], spec: &mut Spectrum, out: &mut Vec<Complex32>) {
+        // Front-end cleanup first, so nothing downstream — spectrum,
+        // classifier, scouts, decoders — ever sees the receiver's own DC
+        // offset or the image its IQ imbalance mirrors about the LO. Applied
+        // here rather than in the radio thread so the tests go through it
+        // too; the software AGC was invisible to every bench for exactly the
+        // opposite reason.
+        let mut buf = std::mem::take(&mut self.iq_buf);
+        buf.clear();
+        buf.extend_from_slice(block);
+        self.front.process(&mut buf);
+        let block: &[Complex32] = &buf;
+
         spec.power_db(block, &mut self.spectrum);
         smooth_bins(
             &self.spectrum,
@@ -1358,6 +1375,9 @@ impl App {
                 }
             }
         }
+
+        // Hand the scratch buffer back so the next block reuses it.
+        self.iq_buf = buf;
     }
 }
 
@@ -1624,6 +1644,9 @@ fn run_app<B: Backend>(
                         if needs_exact_audio(next) && !rate_ok_for_ft(app.rate) {
                             app.rate = FT_SAFE_RATE;
                             let _ = radio.cmd.send(radio::Cmd::Rate(FT_SAFE_RATE));
+                            // The front end's time constants are in samples,
+                            // so its estimates belong to the old rate.
+                            app.front = dsp::FrontEnd::new(FT_SAFE_RATE);
                             app.waterfall.clear();
                             app.log(format!("sample rate -> {FT_SAFE_RATE:.0} Hz for FT"));
                         }
@@ -2374,6 +2397,9 @@ fn retune(app: &mut App, radio: &radio::Radio, freq: f64) {
     app.tracks.clear();
     app.heard.clear();
     app.scout_iq.clear();
+    // DC offset and IQ imbalance are both frequency-dependent, so what was
+    // learned on the old centre is wrong for the new one.
+    app.front.reset();
     app.ident_at = Instant::now();
     // Every automatic slot was tuned relative to the old centre.
     app.auto.clear();
@@ -2932,6 +2958,28 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     if let Some(slot) = slot {
         spans2.push(lbl("  slot "));
         spans2.push(Span::styled(slot, Style::default().fg(Color::Magenta)));
+    }
+    // Front-end correction, shown only while it is doing something. A DC
+    // offset or a poor image rejection is a property of the receiver, not of
+    // the band, and is otherwise invisible — which is how it went unnoticed.
+    let (dc, rej) = app.front.status();
+    if rej < 45.0 {
+        spans2.push(lbl("  img "));
+        spans2.push(Span::styled(
+            format!("{rej:.0} dB"),
+            Style::default().fg(if rej < 30.0 {
+                Color::Yellow
+            } else {
+                Color::Gray
+            }),
+        ));
+    }
+    if dc > 0.02 {
+        spans2.push(lbl("  dc "));
+        spans2.push(Span::styled(
+            format!("{:.0}%", dc * 100.0),
+            Style::default().fg(if dc > 0.15 { Color::Yellow } else { Color::Gray }),
+        ));
     }
     spans2.extend([
         lbl("  snr "),

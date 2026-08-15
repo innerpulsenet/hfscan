@@ -156,6 +156,19 @@ impl WfRes {
 /// frequencies, there are only ever a handful in a span, and charging them to
 /// the narrowband budget quietly shrank it on every band that has them.
 const MAX_AUTO_SLOTS: usize = 24;
+/// Slots × sample rate the decode fleet may spend, which is the quantity that
+/// actually costs time.
+///
+/// Every slot mixes and decimates from the full input rate, so its cost is
+/// linear in that rate: `bench_feed_cost_per_band` measures 24 slots at
+/// 14% of real time on a 192 kS/s span, 27% at 384 and 70% at 768. The UI is
+/// single-threaded and the radio drops blocks rather than blocking, so going
+/// much past a third of real time is dropped IQ and a stuttering waterfall.
+///
+/// 24 slots at 400 kS/s is that third. Below it the cap alone applies; above
+/// it the fleet shrinks so a wide span cannot outrun the stream. Nothing in
+/// the band table reaches that point — this is the guard for `--rate`.
+const SLOT_RATE_BUDGET: f64 = MAX_AUTO_SLOTS as f64 * 400_000.0;
 /// Drop a narrowband slot whose signal the classifier has not seen for this
 /// long. FT8/FT4 slots are pinned to their calling frequencies instead.
 const AUTO_IDLE: Duration = Duration::from_secs(25);
@@ -1221,6 +1234,12 @@ impl App {
         self.note_scroll = 0;
     }
 
+    /// Narrowband decoders this span can afford. See `SLOT_RATE_BUDGET`.
+    fn slot_budget(&self) -> usize {
+        let by_rate = (SLOT_RATE_BUDGET / self.rate.max(1.0)) as usize;
+        by_rate.clamp(4, MAX_AUTO_SLOTS)
+    }
+
     /// How often the narrowband scouts may run.
     ///
     /// They walk the whole scout buffer once per candidate peak, so their cost
@@ -1455,7 +1474,7 @@ impl App {
                 s.last_seen = now;
                 continue;
             }
-            if !pinned && self.auto.iter().filter(|s| !s.pinned).count() >= MAX_AUTO_SLOTS {
+            if !pinned && self.auto.iter().filter(|s| !s.pinned).count() >= self.slot_budget() {
                 continue;
             }
             if let Some(slot) = AutoSlot::new(kind, dial, self.center, self.rate, pinned, shift) {
@@ -6221,15 +6240,16 @@ mod tests {
 
         assert_eq!(opened.center, target.default, "different centre");
         assert_eq!(opened.rate, target.span, "different span");
-        // ...and that span really does show the band, not 192 kHz of it.
-        assert!(
-            opened.rate > 192_000.0,
-            "20m opened at {:.0} Hz, which is not the whole band",
-            opened.rate
-        );
+        // ...and it opens showing the part of the band that gets decoded.
         let (lo, hi) = opened.view_range();
         let (lo, hi) = (opened.center + lo, opened.center + hi);
-        assert!(lo <= target.start && hi >= target.end, "band not fully in view");
+        assert!(
+            lo <= target.dig_start && hi >= target.dig_end,
+            "20m opens at {lo:.3}-{hi:.3} MHz, missing part of the decoded \
+             {:.3}-{:.3}",
+            target.dig_start / 1e6,
+            target.dig_end / 1e6
+        );
     }
 
     /// Whatever a band jump lands on, the digital segment has to be in the
@@ -6273,6 +6293,50 @@ mod tests {
                 b.name, b.span
             );
         }
+    }
+
+    /// Every band must be affordable. The decode fleet costs time in
+    /// proportion to slots × sample rate, and the UI is single-threaded: a
+    /// span the fleet cannot keep up with means dropped IQ and a stuttering
+    /// waterfall, which is what shipping 768 kS/s and 5 MS/s spans did.
+    #[test]
+    fn no_band_asks_for_more_decoding_than_it_can_afford() {
+        for b in super::bands::BANDS {
+            let app = App::new(b.default, b.span, Mode::Auto);
+            let cost = app.slot_budget() as f64 * app.rate;
+            assert!(
+                cost <= super::SLOT_RATE_BUDGET * 1.001,
+                "{}: {} slots at {:.0} kS/s is {:.1}x the budget",
+                b.name,
+                app.slot_budget(),
+                b.span / 1000.0,
+                cost / super::SLOT_RATE_BUDGET
+            );
+        }
+    }
+
+    /// ...and the budget must not be quietly starving the bands that are fine.
+    /// Everything in the table should still get the full fleet.
+    #[test]
+    fn the_working_spans_still_get_a_full_fleet() {
+        for b in super::bands::BANDS {
+            let app = App::new(b.default, b.span, Mode::Auto);
+            assert_eq!(
+                app.slot_budget(),
+                super::MAX_AUTO_SLOTS,
+                "{} at {:.0} kS/s only affords {} decoders",
+                b.name,
+                b.span / 1000.0,
+                app.slot_budget()
+            );
+        }
+        // A --rate override past the budget shrinks the fleet rather than
+        // overrunning the stream.
+        let wide = App::new(28_125_000.0, 5_016_000.0, Mode::Auto);
+        assert!(
+            wide.slot_budget() < super::MAX_AUTO_SLOTS,
+            "a 5 MS/s span must not still claim a full fleet"
+        );
     }
 
     /// The scouts walk the whole buffer per candidate, so their cost tracks
@@ -7495,6 +7559,69 @@ mod psk_auto_tests {
 #[cfg(test)]
 mod scout_cost {
     use super::*;
+
+    /// Can the app keep up with the stream at each band's span?
+    ///
+    /// Everything on the hot path scales with the sample rate: the front end's
+    /// per-block FFT round trip, the spectrum, every auto slot's first
+    /// decimation stage, and the scouts. Over 100% of real time here means the
+    /// UI cannot drain the radio's channel and the display stutters.
+    #[test]
+    #[ignore]
+    fn bench_feed_cost_per_band() {
+        for b in bands::BANDS {
+            if b.name == "WWV" {
+                continue;
+            }
+            let rate = b.span;
+            let mut rng = 0x1234_5678u32;
+            let mut noise = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                (rng as f32 / u32::MAX as f32) - 0.5
+            };
+            let secs = 2.0;
+            let n = (rate * secs) as usize;
+            let mut iq: Vec<Complex32> = (0..n)
+                .map(|_| Complex32::new(noise(), noise()) * 0.05)
+                .collect();
+            for k in 0..30 {
+                let off = -(rate / 6.0) + k as f64 * (rate / 100.0);
+                for (i, s) in iq.iter_mut().enumerate() {
+                    let ph = 2.0 * std::f64::consts::PI * off * i as f64 / rate;
+                    *s += Complex32::from_polar(0.3, ph as f32);
+                }
+            }
+            let mut app = App::new(b.default, rate, Mode::Auto);
+            app.agc = AgcMode::Off;
+            // A full narrowband fleet, which is what a busy band produces.
+            for k in 0..MAX_AUTO_SLOTS {
+                let dial = b.default - rate / 6.0 + k as f64 * (rate / 100.0);
+                if let Some(sl) =
+                    AutoSlot::new(identify::Kind::Cw, dial, app.center, app.rate, false, None)
+                {
+                    app.auto.push(sl);
+                }
+            }
+            let slots = app.auto.len();
+            let mut spec = Spectrum::new(4096);
+            let mut out = Vec::new();
+            let t = Instant::now();
+            for block in iq.chunks(16_384) {
+                app.feed(block, &mut spec, &mut out);
+            }
+            let el = t.elapsed().as_secs_f64();
+            println!(
+                "  {:>5} {:>8.0} kS/s  {slots:>2} slots  {:>6.0} ms for {secs:.0}s  = {:>5.1}% of real time{}",
+                b.name,
+                rate / 1000.0,
+                el * 1000.0,
+                100.0 * el / secs,
+                if el / secs > 0.8 { "   <<< OVER" } else { "" }
+            );
+        }
+    }
 
     /// How the scouts scale with the sample rate. Full-band coverage means
     /// running them over spans up to 4.8 MS/s, and they walk the whole scout

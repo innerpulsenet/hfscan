@@ -421,18 +421,20 @@ mod tests {
     /// clamped rate under a centre chosen for the width that was asked for.
     #[test]
     fn a_clamped_rate_that_hides_the_digital_segment_is_caught() {
-        let twenty = bands::BANDS.iter().find(|b| b.name == "20m").unwrap();
-        // What the plan asks for, and gets.
-        let good = check_band(twenty, twenty.span, twenty.span);
+        // 10m spreads its calling frequencies over 110 kHz and plans for a
+        // 384 kHz span to hold them.
+        let ten = bands::BANDS.iter().find(|b| b.name == "10m").unwrap();
+        let good = check_band(ten, ten.span, ten.span);
         assert!(good.ok(), "the shipped plan should pass: {good:?}");
 
-        // 456 kHz asked, 192 kHz delivered — the regression, with the old
-        // band-middle centre still in place.
-        let clamped = check_band(twenty, 192_000.0, 192_000.0);
+        // Delivered a quarter of what it asked for: FT4 at 28.180 falls off
+        // the top. This is the shape of the failure that shipped — a clamped
+        // rate under a centre chosen for the width that was requested.
+        let clamped = check_band(ten, 96_000.0, 96_000.0);
         assert!(!clamped.ok(), "a clamped rate must not pass");
         assert!(
-            clamped.markers_lost.contains(&"FT8"),
-            "should report FT8 off-screen, got {:?}",
+            clamped.markers_lost.contains(&"FT4"),
+            "should report FT4 off-screen, got {:?}",
             clamped.markers_lost
         );
     }

@@ -33,41 +33,45 @@ Options:
 
 ### Band spans
 
-Each band preset carries its own sample rate, applied by `b` / `B`, sized so
-the whole allocation is in view *and* behind an analog filter wide enough not
-to clip its edges. All of it is verified against the hardware by `--bench`.
+Each band preset carries its own sample rate and centre, applied by `b` / `B`.
+The span covers the **CW and digital stretch at the bottom of the band**, not
+the whole allocation — operators respect those boundaries, so the SSB portion
+above holds nothing any decoder here can read.
 
-| band | span | filter | | band | span | filter |
+| band | decoded | span | | band | decoded | span |
 | --- | --- | --- | --- | --- | --- | --- |
-| 160m | 384 kHz | 300 kHz | | 15m | 768 kHz | 600 kHz |
-| 80m | 768 kHz | 600 kHz | | 12m | 192 kHz | 200 kHz |
-| 60m | 192 kHz | 200 kHz | | 10m | 5.016 MHz | 5 MHz |
-| 40m | 768 kHz | 600 kHz | | 6m | 5.016 MHz | 5 MHz |
-| 30m | 192 kHz | 200 kHz | | 2m | 5.016 MHz | 5 MHz |
-| 20m | 768 kHz | 600 kHz | | 17m | 192 kHz | 200 kHz |
+| 160m | 1.800–1.850 | 192 kHz | | 17m | 18.068–18.115 | 192 kHz |
+| 80m | 3.500–3.600 | 192 kHz | | 15m | 21.000–21.150 | 192 kHz |
+| 60m | 5.330–5.405 | 192 kHz | | 12m | 24.890–24.930 | 192 kHz |
+| 40m | 7.000–7.100 | 192 kHz | | 10m | 28.000–28.200 | 384 kHz |
+| 30m | 10.100–10.150 | 192 kHz | | 6m | 50.240–50.360 | 192 kHz |
+| 20m | 14.000–14.150 | 192 kHz | | 2m | 144.000–144.300 | 384 kHz |
 
-Three constraints pin those numbers.
+Four constraints pin those numbers.
 
 **Rates the receiver actually has.** The RSP1A offers 62.5, 96, 125, 192, 250,
 384, 500, 768 and 1000 kS/s as fixed steps, then anything from 2 to
 10.66 MS/s. Ask for something else and the driver clamps silently — and a band
-centred for a width it never got can put its digital segment outside the view,
-which means no decodes at all on that band.
+centred for a width it never got can put its calling frequencies outside the
+view, which means no decodes on that band at all.
 
 **An exact audio clock.** Every span divides by 24 kHz, the LCM of the 8 kHz
-and 12 kHz audio rates, so FT8 and FT4 keep an exact divisor at full-band width
-instead of forcing a retune.
+and 12 kHz audio rates, so FT8 and FT4 keep an exact divisor.
 
 **Room for the filter.** The tuner's analog filters are 200, 300, 600, 1536 and
-5000 kHz, and the driver will not pick one wider than the span. A 350 kHz band
-inside a 384 kHz span therefore gets the 300 kHz filter and loses 25 kHz off
-each end — this is what edge rolloff on the waterfall actually is. 768 kS/s is
-what buys the 600 kHz filter; 10m, 6m and 2m need the 5 MHz one and so run at
-5.016 MS/s, under the 6 MS/s point where the converter still gives 14 bits.
+5000 kHz and the driver will not pick one wider than the span, so a span sized
+tightly to what it carries leaves the filter corner inside the view — which is
+what edge rolloff on the waterfall is. Every decoded segment sits inside the
+filter its span lands on.
 
-The scouts walk their whole buffer once per candidate, so their cost tracks the
-sample rate; above 2 MS/s the rescan interval stretches in proportion, keeping
-their share of a core flat on the wide bands. `--rate` overrides for a run.
+**Time.** Every decoder slot mixes and decimates from the full input rate, so
+the decode fleet costs CPU in proportion to it: a full fleet is 14% of real
+time on a 192 kS/s span, 27% at 384, 70% at 768 and 840% at 5 MS/s
+(`bench_feed_cost_per_band`). The UI is single-threaded and the radio drops
+blocks rather than blocking, so the last two stutter or cannot run. Sizing the
+span to the decoded segment rather than the allocation is what keeps almost
+every band at 192 kS/s. A hard budget on slots × sample rate backs this up, so
+a `--rate` override shrinks the fleet instead of overrunning the stream.
 
 ### Measuring the receiver
 

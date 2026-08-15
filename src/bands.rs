@@ -15,14 +15,10 @@ pub struct Band {
     /// that. Parking on the dial frequency put exactly that region on the
     /// bottom of the sub-band people work.
     ///
-    /// Bands that fit inside their span are centred on the allocation, which
-    /// keeps both edges an equal distance from Nyquist. The rest are centred
-    /// so their *digital* segment sits comfortably inside the view: on nearly
-    /// every band the modes this decodes live in the bottom tens of kHz, so
-    /// when something has to be cut it is the top of the phone segment.
-    ///
-    /// Either way the LO lands at least 10 kHz from the nearest calling
-    /// frequency, since a zero-IF spike sits on top of whatever it lands on.
+    /// Centred on `dig_start..dig_end`, the part of the band that gets
+    /// decoded, and nudged so the LO lands at least 5 kHz from the nearest
+    /// calling frequency — a zero-IF spike sits on top of whatever it lands
+    /// on, and the pickers blank the bins either side of it.
     pub default: f64,
     /// Sample rate to run at on this band, which is also the width of the
     /// spectrum view — chosen so the whole allocation fits in one span.
@@ -60,6 +56,18 @@ pub struct Band {
     /// `--bench` after any antenna change.
     pub rfgr: f64,
     pub ifgr: f64,
+    /// The stretch of the band this actually decodes: CW at the bottom, then
+    /// the digital segment, ending where phone starts.
+    ///
+    /// Operators respect these boundaries, so the SSB portion above holds
+    /// nothing any decoder here can read. Sizing the span to the whole
+    /// allocation meant carrying hundreds of kilohertz of voice through the
+    /// front end, the spectrum, the scouts and every decoder slot's first
+    /// decimation stage — all of which cost time in proportion to the sample
+    /// rate — to decode nothing at all. Sizing it to this instead is what puts
+    /// almost every band back on a 192 kS/s span.
+    pub dig_start: f64,
+    pub dig_end: f64,
 }
 
 /// Band the app opens on when nothing says otherwise. An index rather than a
@@ -68,19 +76,19 @@ pub struct Band {
 pub const DEFAULT_BAND: usize = 5; // 20m
 
 pub const BANDS: &[Band] = &[
-    Band { name: "160m", start: 1_800_000.0,   end: 2_000_000.0,   default: 1_900_000.0,   span: 384_000.0, rfgr: 0.0, ifgr: 56.0 },
-    Band { name: "80m",  start: 3_500_000.0,   end: 4_000_000.0,   default: 3_750_000.0,   span: 768_000.0, rfgr: 0.0, ifgr: 52.0 },
-    Band { name: "60m",  start: 5_330_000.0,   end: 5_405_000.0,   default: 5_367_500.0,   span: 192_000.0, rfgr: 0.0, ifgr: 56.0 },
-    Band { name: "40m",  start: 7_000_000.0,   end: 7_300_000.0,   default: 7_150_000.0,   span: 768_000.0, rfgr: 0.0, ifgr: 56.0 },
-    Band { name: "30m",  start: 10_100_000.0,  end: 10_150_000.0,  default: 10_125_000.0,  span: 192_000.0, rfgr: 0.0, ifgr: 56.0 },
-    Band { name: "20m",  start: 14_000_000.0,  end: 14_350_000.0,  default: 14_175_000.0,  span: 768_000.0, rfgr: 0.0, ifgr: 48.0 },
-    Band { name: "17m",  start: 18_068_000.0,  end: 18_168_000.0,  default: 18_118_000.0,  span: 192_000.0, rfgr: 0.0, ifgr: 48.0 },
-    Band { name: "15m",  start: 21_000_000.0,  end: 21_450_000.0,  default: 21_225_000.0,  span: 768_000.0, rfgr: 0.0, ifgr: 48.0 },
-    Band { name: "12m",  start: 24_890_000.0,  end: 24_990_000.0,  default: 24_940_000.0,  span: 192_000.0, rfgr: 0.0, ifgr: 48.0 },
-    Band { name: "10m",  start: 28_000_000.0,  end: 29_700_000.0,  default: 28_850_000.0,  span: 5_016_000.0, rfgr: 0.0, ifgr: 40.0 },
-    Band { name: "6m",   start: 50_000_000.0,  end: 54_000_000.0,  default: 52_000_000.0,  span: 5_016_000.0, rfgr: 0.0, ifgr: 40.0 },
-    Band { name: "2m",   start: 144_000_000.0, end: 148_000_000.0, default: 146_000_000.0, span: 5_016_000.0, rfgr: 0.0, ifgr: 56.0 },
-    Band { name: "WWV",  start: 4_990_000.0,   end: 15_010_000.0,  default: 10_000_000.0,  span: 192_000.0, rfgr: 0.0, ifgr: 48.0 },
+    Band { name: "160m", start: 1_800_000.0,   end: 2_000_000.0,   default: 1_825_000.0,   span: 192_000.0, rfgr: 0.0, ifgr: 56.0,    dig_start: 1_800_000.0,   dig_end: 1_850_000.0 },
+    Band { name: "80m",  start: 3_500_000.0,   end: 4_000_000.0,   default: 3_550_000.0,   span: 192_000.0, rfgr: 0.0, ifgr: 52.0,    dig_start: 3_500_000.0,   dig_end: 3_600_000.0 },
+    Band { name: "60m",  start: 5_330_000.0,   end: 5_405_000.0,   default: 5_367_500.0,   span: 192_000.0, rfgr: 0.0, ifgr: 56.0,    dig_start: 5_330_000.0,   dig_end: 5_405_000.0 },
+    Band { name: "40m",  start: 7_000_000.0,   end: 7_300_000.0,   default: 7_055_000.0,   span: 192_000.0, rfgr: 0.0, ifgr: 56.0,    dig_start: 7_000_000.0,   dig_end: 7_100_000.0 },
+    Band { name: "30m",  start: 10_100_000.0,  end: 10_150_000.0,  default: 10_125_000.0,  span: 192_000.0, rfgr: 0.0, ifgr: 56.0,    dig_start: 10_100_000.0,  dig_end: 10_150_000.0 },
+    Band { name: "20m",  start: 14_000_000.0,  end: 14_350_000.0,  default: 14_060_000.0,  span: 192_000.0, rfgr: 0.0, ifgr: 48.0,    dig_start: 14_000_000.0,  dig_end: 14_150_000.0 },
+    Band { name: "17m",  start: 18_068_000.0,  end: 18_168_000.0,  default: 18_090_000.0,  span: 192_000.0, rfgr: 0.0, ifgr: 48.0,    dig_start: 18_068_000.0,  dig_end: 18_115_000.0 },
+    Band { name: "15m",  start: 21_000_000.0,  end: 21_450_000.0,  default: 21_060_000.0,  span: 192_000.0, rfgr: 0.0, ifgr: 48.0,    dig_start: 21_000_000.0,  dig_end: 21_150_000.0 },
+    Band { name: "12m",  start: 24_890_000.0,  end: 24_990_000.0,  default: 24_905_000.0,  span: 192_000.0, rfgr: 0.0, ifgr: 48.0,    dig_start: 24_890_000.0,  dig_end: 24_930_000.0 },
+    Band { name: "10m",  start: 28_000_000.0,  end: 29_700_000.0,  default: 28_100_000.0,  span: 384_000.0, rfgr: 0.0, ifgr: 40.0,    dig_start: 28_000_000.0,  dig_end: 28_200_000.0 },
+    Band { name: "6m",   start: 50_000_000.0,  end: 54_000_000.0,  default: 50_300_000.0,  span: 192_000.0, rfgr: 0.0, ifgr: 40.0,    dig_start: 50_240_000.0,  dig_end: 50_360_000.0 },
+    Band { name: "2m",   start: 144_000_000.0, end: 148_000_000.0, default: 144_160_000.0, span: 384_000.0, rfgr: 0.0, ifgr: 56.0,    dig_start: 144_000_000.0, dig_end: 144_300_000.0 },
+    Band { name: "WWV",  start: 4_990_000.0,   end: 15_010_000.0,  default: 10_000_000.0,  span: 192_000.0, rfgr: 0.0, ifgr: 48.0,    dig_start: 9_995_000.0,   dig_end: 10_005_000.0 },
 ];
 
 pub struct Marker {
@@ -299,51 +307,86 @@ mod tests {
         }
     }
 
-    /// Every band is shown whole, which is the point of a per-band span.
+    /// The decoded stretch of every band must be in view. Whether the phone
+    /// segment above it is has no bearing on anything: no decoder here can
+    /// read SSB, so carrying it costs sample rate and returns nothing.
     #[test]
-    fn every_band_is_shown_whole() {
+    fn the_decoded_segment_is_shown_whole() {
         for b in BANDS {
-            if b.name == "WWV" {
-                continue;
-            }
             let half = b.span / 2.0;
             assert!(
-                b.default - half <= b.start && b.default + half >= b.end,
-                "{}: {:.3}-{:.3} MHz does not cover {:.3}-{:.3}",
+                b.default - half <= b.dig_start && b.default + half >= b.dig_end,
+                "{}: view {:.3}-{:.3} MHz does not cover the decoded {:.3}-{:.3}",
                 b.name,
                 (b.default - half) / 1e6,
                 (b.default + half) / 1e6,
-                b.start / 1e6,
-                b.end / 1e6
+                b.dig_start / 1e6,
+                b.dig_end / 1e6
             );
         }
     }
 
-    /// The tuner's analog filters are 200, 300, 600, 1536 and 5000 kHz. The
-    /// driver will not choose one wider than the span, so a span must leave
-    /// room for a filter that covers the whole allocation — which is what a
-    /// 350 kHz band inside a 384 kHz span failed to do, taking the 300 kHz
-    /// filter and losing 25 kHz off each end.
-    ///
-    /// The exception is a span narrower than the narrowest filter: the four
-    /// 192 kHz bands get the 200 kHz filter, marginally wider than Nyquist,
-    /// which the receiver confirms and which covers them many times over.
+    /// ...and that stretch has to be inside the band, at the bottom of it,
+    /// with every calling frequency on the band falling inside it. A digital
+    /// segment that missed a marker would mean a mode that never decodes.
     #[test]
-    fn every_band_ends_up_behind_a_filter_that_covers_it() {
+    fn the_decoded_segment_holds_every_calling_frequency() {
+        for b in BANDS {
+            if b.name == "WWV" {
+                continue; // a spot frequency, not a band: every HF marker is "inside" it
+            }
+            assert!(
+                b.dig_start >= b.start && b.dig_end <= b.end && b.dig_start < b.dig_end,
+                "{}: decoded {:.3}-{:.3} is not inside {:.3}-{:.3}",
+                b.name,
+                b.dig_start / 1e6,
+                b.dig_end / 1e6,
+                b.start / 1e6,
+                b.end / 1e6
+            );
+            for m in MARKERS {
+                if m.label == "WWV" || m.freq < b.start || m.freq > b.end {
+                    continue;
+                }
+                assert!(
+                    m.freq >= b.dig_start && m.freq + 3_000.0 <= b.dig_end,
+                    "{}: the {} marker at {:.3} is outside the decoded {:.3}-{:.3}",
+                    b.name,
+                    m.label,
+                    m.freq / 1e6,
+                    b.dig_start / 1e6,
+                    b.dig_end / 1e6
+                );
+            }
+        }
+    }
+
+    /// The digital segment has to sit behind a filter that passes it. The
+    /// tuner's filters are 200, 300, 600, 1536 and 5000 kHz and the driver
+    /// will not pick one wider than the span, so a 384 kHz span lands on the
+    /// 300 kHz filter — which clips the extreme edges of a 350 kHz band, and
+    /// must not clip anything that gets decoded.
+    #[test]
+    fn every_digital_segment_is_behind_a_filter_that_passes_it() {
         for b in BANDS {
             if b.name == "WWV" {
                 continue;
             }
-            let width = b.end - b.start;
-            let chosen = filter_for(b.span, width);
-            assert!(
-                chosen >= width,
-                "{}: a {:.0} kHz span lands on the {:.0} kHz filter, which clips {:.0} kHz of band",
-                b.name,
-                b.span / 1000.0,
-                chosen / 1000.0,
-                width / 1000.0
-            );
+            let half = filter_for(b.span, b.end - b.start) / 2.0;
+            for m in MARKERS {
+                if m.label == "WWV" || m.freq < b.start || m.freq > b.end {
+                    continue;
+                }
+                let off = (m.freq + 3_000.0 - b.default).abs();
+                assert!(
+                    off < half,
+                    "{}: the {} marker is {:.0} kHz out, past the {:.0} kHz filter's edge",
+                    b.name,
+                    m.label,
+                    off / 1000.0,
+                    half * 2.0 / 1000.0
+                );
+            }
         }
     }
 

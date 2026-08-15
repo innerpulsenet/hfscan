@@ -292,12 +292,33 @@ override the file for that run. Once a callsign is configured, every FT8/FT4
 decode whose *sender* callsign is parsed out of the message (e.g. `CQ G4XYZ
 IO91` or `M0ABC G4XYZ -12`) becomes a spot carrying the sender call, absolute
 RF frequency, SNR, mode, and the sender's grid locator when the message
-contains one. PSK31 spots are taken from `DE CALL CALL` and `CQ CALL`
-decodes. Your own callsign and grid identify the receiver.
+contains one. Your own callsign and grid identify the receiver.
 
-The software id sent with each report is `HFScan vX.Y.Z by KQ2Y`. The version
-is placed before the callsign so pskreporter.info does not treat the `2` in
-`KQ2Y` as the start of the version and display the name as `HFScan by KQ`.
+CW, RTTY and PSK31 are spotted too, from three forms:
+
+- `CQ <call>`, including the contest and activity variants — `CQ TEST <call>`,
+  `CQ POTA DE <call>`, `CQ FIELD DAY DE <call>`.
+- `DE <call> <call>`, the classic idle. A single `DE <call>` counts as well.
+- `<addressee> <call>`, the exchange: two callsigns running together, where the
+  second is the station transmitting. This is the same "to, from" ordering FT8
+  packs into its message fields, and on CW and RTTY it is the commonest form of
+  all — every contest exchange and every turn of an ordinary QSO is one. An
+  addressee repeated before the sender, `W1AW W1AW K1ABC`, is read correctly.
+
+The exchange form has no keyword in front of it to establish that a callsign is
+what was meant, so it applies a stricter test: a callsign's separating digit
+follows the prefix and its suffix is letters, which is what keeps the `5NN` of
+a CW signal report and the `001` of a serial number out of the callsign slot.
+
+These modes carry no grid locator, and their copy has to clear the confidence
+floor (`[`/`]`) before it is reported at all — a callsign scraped out of noise
+is worse on pskreporter than it is on screen. The reported SNR is referred to a
+2500 Hz bandwidth, measured from the mark/space envelope levels for CW and from
+the passband noise for RTTY.
+
+The software id sent with each report is `HFScan vX.Y.Z`. Nothing containing a
+digit may precede the `v`: pskreporter.info treats the first digit in the field
+as the start of the version and truncates the displayed name there.
 
 Reports are batched and sent to `report.pskreporter.info:4739` at most once
 every five minutes (plus a random delay, as the site asks); the first batch

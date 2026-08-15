@@ -14,16 +14,15 @@
 //! the lock to DC. Once locked, a raised-cosine matched filter, Gardner-style
 //! dump timing, and the AFC keep the demod calibrated.
 
+use super::callscan::{utc_hhmmss, CallScanner};
 use super::{Decoder, FtMessage, PskView};
 use std::collections::VecDeque;
 use crate::dsp::{mix_decim, Rotator};
-use crate::report::is_callsign;
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const BAUD: f32 = 31.25;
 /// Search window around the cursor. A PSK31 signal anywhere in here is
@@ -139,10 +138,7 @@ pub struct Psk31Decoder {
     window: Vec<f32>,
 
     /// Word scanner for pskreporter spots (`DE CALL CALL`, `CQ CALL`).
-    word: String,
-    hear: Hear,
-    spots: Vec<FtMessage>,
-    last_spot: String,
+    scan: CallScanner,
     /// PSK31 signals identified in the current passband, strongest first.
     hits: Vec<PskHit>,
     varicode: HashMap<&'static str, char>,
@@ -153,14 +149,6 @@ pub struct Psk31Decoder {
 
     #[cfg(test)]
     pub(crate) captured_bits: Vec<bool>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Hear {
-    Idle,
-    AfterDe,
-    AfterDeCall,
-    AfterCq,
 }
 
 impl Psk31Decoder {
@@ -216,10 +204,7 @@ impl Psk31Decoder {
             fft,
             fft_buf: vec![Complex32::new(0.0, 0.0); FFT_SIZE],
             window,
-            word: String::new(),
-            hear: Hear::Idle,
-            spots: Vec::new(),
-            last_spot: String::new(),
+            scan: CallScanner::new(),
             hits: Vec::new(),
             varicode,
             sym_hist: VecDeque::with_capacity(SYM_HIST + 1),
@@ -275,8 +260,7 @@ impl Psk31Decoder {
             self.afc = 0.0;
             self.lpf = Complex32::new(0.0, 0.0);
             self.energy.iter_mut().for_each(|e| *e = 0.0);
-            self.word.clear();
-            self.hear = Hear::Idle;
+            self.scan.reset();
             // Confidence describes the carrier being demodulated, and this is
             // a different carrier. Carrying the old number over would let a
             // good lock vouch for whatever the search jumped to next.
@@ -422,8 +406,7 @@ impl Psk31Decoder {
         self.hits.clear();
         self.code.clear();
         self.pending_zero = false;
-        self.word.clear();
-        self.hear = Hear::Idle;
+        self.scan.reset();
         self.q_raw = 0.0;
         self.q_n = 0.0;
         self.reversals = 0.0;
@@ -502,7 +485,7 @@ impl Psk31Decoder {
                 if let Some(c) = self.varicode.get(self.code.as_str()).copied() {
                     if self.locked && self.conf() >= PRINT_QUALITY {
                         self.text.push(c);
-                        self.on_char(c);
+                        self.scan.push(c);
                     }
                 }
                 self.code.clear();
@@ -513,85 +496,6 @@ impl Psk31Decoder {
         }
     }
 
-    fn on_char(&mut self, c: char) {
-        if c.is_ascii_whitespace() || c == '\r' || c == '\n' {
-            self.flush_word();
-            return;
-        }
-        if c.is_ascii_graphic() {
-            self.word.push(c);
-            if self.word.len() > 16 {
-                self.word.clear();
-                self.hear = Hear::Idle;
-            }
-        }
-    }
-
-    fn flush_word(&mut self) {
-        if self.word.is_empty() {
-            return;
-        }
-        let w = self.word.to_ascii_uppercase();
-        self.word.clear();
-        match self.hear {
-            Hear::Idle => {
-                if w == "DE" {
-                    self.hear = Hear::AfterDe;
-                } else if w == "CQ" {
-                    self.hear = Hear::AfterCq;
-                }
-            }
-            Hear::AfterDe => {
-                if is_callsign(&w) {
-                    self.last_spot = w;
-                    self.hear = Hear::AfterDeCall;
-                } else if w != "DE" {
-                    self.hear = Hear::Idle;
-                }
-            }
-            Hear::AfterDeCall => {
-                // Classic PSK idle: "DE CALL CALL". Accept a single DE CALL
-                // as well — many operators only send it once.
-                let call = if is_callsign(&w) {
-                    w
-                } else {
-                    self.last_spot.clone()
-                };
-                self.emit_spot(call);
-                self.hear = Hear::Idle;
-            }
-            Hear::AfterCq => {
-                if w == "DX" || w == "CQ" || w.len() <= 3 && w.chars().all(|c| c.is_ascii_alphabetic())
-                {
-                    // CQ DX / CQ POTA / etc. — wait for the callsign.
-                } else if is_callsign(&w) {
-                    self.emit_spot(w);
-                    self.hear = Hear::Idle;
-                } else {
-                    self.hear = Hear::Idle;
-                }
-            }
-        }
-    }
-
-    fn emit_spot(&mut self, call: String) {
-        if self
-            .spots
-            .iter()
-            .any(|m| m.text.split_whitespace().last() == Some(call.as_str()))
-        {
-            return;
-        }
-        self.last_spot = call.clone();
-        let snr = snr_from_quality(self.conf());
-        self.spots.push(FtMessage {
-            stamp: utc_hhmmss(),
-            snr_db: snr,
-            dt_sec: 0.0,
-            freq_hz: self.lock_hz(),
-            text: format!("CQ {call}"),
-        });
-    }
 }
 
 /// True PSK31 after mixing `hz` to DC: BPSK on the real axis, a plausible
@@ -942,15 +846,6 @@ fn score_bpsk(buf: &[Complex32], fs: f32, hz: f32, sps: usize) -> (f32, f32) {
     (calibrate(best.0), best.1)
 }
 
-fn utc_hhmmss() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let s = secs % 86400;
-    format!("{:02}{:02}{:02}", s / 3600, (s % 3600) / 60, s % 60)
-}
-
 impl Decoder for Psk31Decoder {
     fn name(&self) -> &'static str {
         "PSK31"
@@ -1121,7 +1016,18 @@ impl Decoder for Psk31Decoder {
     }
 
     fn take_messages(&mut self) -> Vec<FtMessage> {
-        std::mem::take(&mut self.spots)
+        let (stamp, snr, hz) = (utc_hhmmss(), snr_from_quality(self.conf()), self.lock_hz());
+        self.scan
+            .take_calls()
+            .into_iter()
+            .map(|call| FtMessage {
+                stamp: stamp.clone(),
+                snr_db: snr,
+                dt_sec: 0.0,
+                freq_hz: hz,
+                text: format!("CQ {call}"),
+            })
+            .collect()
     }
 
     fn status(&self) -> String {
@@ -1148,8 +1054,7 @@ impl Decoder for Psk31Decoder {
 
     fn reset(&mut self) {
         self.text.clear();
-        self.spots.clear();
-        self.last_spot.clear();
+        self.scan.reset();
         self.clear_lock_state();
     }
 }

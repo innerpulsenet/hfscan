@@ -33,9 +33,8 @@ const REREPORT_SECS: u32 = 3600;
 /// Shown as `decodingSoftware` on pskreporter.info.
 ///
 /// The site treats the first ASCII digit in this field as the start of the
-/// version. Putting a callsign such as `KQ2Y` *before* the version therefore
-/// displays as `HFScan by KQ`. Version comes first so the full credit survives.
-const SOFTWARE: &str = concat!("HFScan v", env!("CARGO_PKG_VERSION"), " by KQ2Y");
+/// version, so nothing containing a digit may precede the `v`.
+const SOFTWARE: &str = concat!("HFScan v", env!("CARGO_PKG_VERSION"));
 
 pub struct Spot {
     call: String,
@@ -574,10 +573,10 @@ mod tests {
     }
 
     #[test]
-    fn software_id_does_not_put_callsign_digits_before_the_version() {
-        // "HFScan by KQ2Y v0.1.0" is shown as "HFScan by KQ" because the
-        // first digit (`2`) is parsed as the version. The version must be
-        // the first digit run, and the author callsign must still be present.
+    fn software_id_does_not_put_stray_digits_before_the_version() {
+        // pskreporter.info parses from the first digit onwards as the
+        // version, so anything ahead of the `v` that contains a digit
+        // truncates the displayed name.
         let first_digit = SOFTWARE
             .find(|c: char| c.is_ascii_digit())
             .expect("software id must include a version");
@@ -586,7 +585,6 @@ mod tests {
             "first digit must belong to the version, got {SOFTWARE:?}"
         );
         assert!(SOFTWARE.starts_with("HFScan v"), "got {SOFTWARE:?}");
-        assert!(SOFTWARE.contains("KQ2Y"), "author credit missing from {SOFTWARE:?}");
     }
 
     /// The reason a working reporter looks stalled: everything audible has

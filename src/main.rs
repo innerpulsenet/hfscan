@@ -3480,7 +3480,7 @@ fn draw_settings(f: &mut Frame, area: Rect, ed: &SettingsEdit) {
         Line::from("  tab: switch field   enter: save   esc: cancel"),
         Line::from(""),
         Line::from(Span::styled(
-            "  FT8, FT4 and PSK31 spots go to pskreporter.info",
+            "  FT8, FT4, CW, RTTY and PSK31 spots go to pskreporter.info",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(

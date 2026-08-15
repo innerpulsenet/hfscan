@@ -6,7 +6,8 @@
 //! garbage. A passband scout (FFT + keyed-envelope score) finds CW tones
 //! near the cursor and mixes the best one to DC; `n` hops to the next.
 
-use super::{CwView, Decoder};
+use super::callscan::{utc_hhmmss, CallScanner};
+use super::{CwView, Decoder, FtMessage};
 use crate::dsp::{mix_decim, OnePole};
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
@@ -203,6 +204,8 @@ pub struct CwDecoder {
     warming: bool,
     symbol: String,
     text: String,
+    /// Word scanner for pskreporter spots (`CQ ... CALL`, `DE CALL CALL`).
+    scan: CallScanner,
     idle: f32,
     started: bool,
     quality: f32,
@@ -211,6 +214,16 @@ pub struct CwDecoder {
     on_thr: f32,
     off_thr: f32,
     tune_err: f32,
+    /// Mean envelope well inside a mark, and well inside a space.
+    ///
+    /// Kept apart from `peak` and `floor`, which are slicer thresholds: those
+    /// are pulled toward each other on purpose — `peak` decays toward the
+    /// current envelope and `floor` is dragged up by the filter's tail out of
+    /// each mark — so their ratio barely moves when the band does. These two
+    /// sample only the settled middle of an element, and are the only honest
+    /// read of signal and noise the decoder has. Zero means not yet seen.
+    mark_env: f32,
+    space_env: f32,
     prev_mixed: Complex32,
     have_mixed: bool,
     /// Whether the peak/floor trackers have been seeded.
@@ -269,6 +282,7 @@ impl CwDecoder {
             warming: true,
             symbol: String::new(),
             text: String::new(),
+            scan: CallScanner::new(),
             idle: 0.0,
             started: false,
             quality: 0.0,
@@ -277,6 +291,8 @@ impl CwDecoder {
             on_thr: 0.55,
             off_thr: 0.35,
             tune_err: 0.0,
+            mark_env: 0.0,
+            space_env: 0.0,
             prev_mixed: Complex32::new(0.0, 0.0),
             have_mixed: false,
             have_env: false,
@@ -338,6 +354,7 @@ impl CwDecoder {
         }
         let c = morse_lookup(&self.symbol).unwrap_or('*');
         self.text.push(c);
+        self.scan.push(c);
         self.symbol.clear();
     }
 
@@ -568,8 +585,16 @@ impl CwDecoder {
         // drag the estimate out to the character gap.
         if len >= 2.0 * self.dit {
             self.push_symbol();
-            if len >= 5.0 * self.dit && !self.text.ends_with(' ') && !self.text.is_empty() {
-                self.text.push(' ');
+            if len >= 5.0 * self.dit {
+                // The scanner is told about the gap unconditionally. `text` is
+                // drained every block, so the guards below suppress a space
+                // that happens to land at the start of a fresh buffer — which
+                // is right for the display and wrong for word framing, where
+                // it would run "DE" and the callsign into one token.
+                self.scan.push(' ');
+                if !self.text.ends_with(' ') && !self.text.is_empty() {
+                    self.text.push(' ');
+                }
             }
         }
     }
@@ -684,7 +709,29 @@ impl CwDecoder {
         }
     }
 
+    /// SNR in a 2500 Hz reference bandwidth, for the spot report.
+    ///
+    /// `mark_env` and `space_env` are mean amplitudes out of the same chain, so
+    /// their ratio is a signal-to-noise ratio in this decoder's own noise
+    /// bandwidth. Three corrections turn that into the figure the reporting
+    /// convention wants. The space level is the mean of a Rayleigh envelope,
+    /// which sits at 0.886 of the noise power's square root, hence 1.05 dB.
+    /// The four-pole 150 Hz post-mix filter passes about 147 Hz of noise
+    /// against the 2500 Hz reference, hence 12.3 dB. The last is measured
+    /// rather than derived: the asymmetric averaging that keeps the ramps out
+    /// of the levels settles each one a little past the middle of its own
+    /// distribution, which reads about 3 dB high. Checked against synthesised
+    /// signals of known SNR from -1 to +25 dB, where it holds to about 1 dB.
+    fn spot_snr(&self) -> f32 {
+        if self.mark_env <= 0.0 || self.space_env <= 0.0 {
+            return -24.0;
+        }
+        let ratio = (self.mark_env / self.space_env).max(1.0);
+        (20.0 * ratio.log10() - 1.05 - 12.3 - 3.2).clamp(-24.0, 20.0)
+    }
+
     fn clear_lock_state(&mut self) {
+        self.scan.reset();
         self.mix_hz = 0.0;
         self.mix_phase = 0.0;
         self.post.reset();
@@ -704,6 +751,8 @@ impl CwDecoder {
         self.idle = 0.0;
         self.peak = 0.0;
         self.floor = 0.0;
+        self.mark_env = 0.0;
+        self.space_env = 0.0;
         self.have_env = false;
         self.matched.clear();
         self.matched_sum = 0.0;
@@ -934,6 +983,42 @@ impl Decoder for CwDecoder {
             };
             self.on_thr = on_thr;
             self.off_thr = off_thr;
+            // Sample the element's settled middle, which takes three guards.
+            // `run` clears the edge behind, where the smoother and the one-dit
+            // boxcar are still sliding off the last element. `pending` clears
+            // the edge ahead, where the raw slicer has already changed its
+            // mind but the debounce has not committed it. And the thresholds
+            // clear the keying ramp itself: a mark rising toward `on_thr` is
+            // still filed as a space by the state alone, so without this the
+            // space level reads the ramp instead of the band and lands two
+            // orders of magnitude high.
+            let settled = if self.key_down {
+                env > on_thr
+            } else {
+                env < off_thr
+            };
+            if settled && self.pending == 0.0 && self.run > 0.4 * self.dit {
+                // What survives the guards is still biased one way, and only
+                // one way: the last stretch of a gap is the envelope climbing
+                // into a mark the slicer has not called yet, so it can only
+                // push the space level up, never down — and symmetrically the
+                // start of a mark can only pull the mark level down. Averaging
+                // fast toward the clean side and slowly toward the dirty one
+                // settles each level where the element really sits instead of
+                // partway up its own ramp.
+                let (level, clean_is_up) = if self.key_down {
+                    (&mut self.mark_env, true)
+                } else {
+                    (&mut self.space_env, false)
+                };
+                if *level <= 0.0 {
+                    *level = env;
+                } else {
+                    let a = if (env > *level) == clean_is_up { 0.05 } else { 0.002 };
+                    *level += (env - *level) * a;
+                }
+            }
+
             let norm = ((env - self.floor) / span).clamp(0.0, 1.0);
             self.env_hist.push_back(norm);
             self.key_hist.push_back(next);
@@ -970,8 +1055,15 @@ impl Decoder for CwDecoder {
 
             if !self.key_down {
                 self.idle += 1.0;
-                if self.idle > 8.0 * self.dit && !self.symbol.is_empty() {
-                    self.push_symbol();
+                if self.idle > 8.0 * self.dit {
+                    if !self.symbol.is_empty() {
+                        self.push_symbol();
+                    }
+                    // A gap this long ends a word even when nothing follows
+                    // it. Without this the last token of "DE K1ABC K1ABC" is
+                    // still being assembled when the station stops sending,
+                    // and the spot the announcement was for never lands.
+                    self.scan.push(' ');
                 }
                 // A pause this long means the next thing heard is very
                 // likely a different station: hold their first elements and
@@ -1019,6 +1111,24 @@ impl Decoder for CwDecoder {
     fn speed(&self) -> Option<String> {
         let wpm = self.wpm();
         (wpm >= 1.0).then(|| format!("{wpm:.0}wpm"))
+    }
+
+    /// Stations that identified themselves since the last call. The scanner
+    /// only recognises `CQ` and `DE` announcements, so an exchange in progress
+    /// produces nothing — see `callscan` for why that is the right answer.
+    fn take_messages(&mut self) -> Vec<FtMessage> {
+        let (stamp, snr, hz) = (utc_hhmmss(), self.spot_snr(), self.mix_hz);
+        self.scan
+            .take_calls()
+            .into_iter()
+            .map(|call| FtMessage {
+                stamp: stamp.clone(),
+                snr_db: snr,
+                dt_sec: 0.0,
+                freq_hz: hz,
+                text: format!("CQ {call}"),
+            })
+            .collect()
     }
 
     fn reset(&mut self) {

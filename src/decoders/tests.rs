@@ -16,6 +16,9 @@ fn noise(rng: &mut u32) -> f32 {
     (*rng as f32 / u32::MAX as f32) - 0.5
 }
 
+const CQ: &str = "CQ CQ DE W1AW W1AW K";
+const RY_CQ: &str = "RYRY CQ CQ DE W1AW W1AW K ";
+
 // ------------------------------------------------------------------- CW
 
 fn morse_for(c: char) -> &'static str {
@@ -162,6 +165,93 @@ fn cw_follows_a_speed_change() {
         "speed-changed text lost: {out:?} ({})",
         d.status()
     );
+}
+
+/// Calls scraped out of a decoder's own copy, the way the reporter takes them.
+fn spotted(d: &mut dyn Decoder, sig: &[Complex32]) -> Vec<String> {
+    let mut calls = Vec::new();
+    for chunk in sig.chunks(4096) {
+        d.process(chunk);
+        calls.extend(d.take_messages().into_iter().map(|m| m.text));
+    }
+    calls
+}
+
+/// The whole point of the CW spotter: a station calling CQ ends up on the map.
+#[test]
+fn cw_spots_a_calling_station() {
+    let sig = gen_cw("CQ CQ DE W1AW W1AW K", 20.0, 0.02);
+    let mut d = cw::CwDecoder::new(FS);
+    let calls = spotted(&mut d, &sig);
+    assert!(
+        calls.iter().any(|c| c == "CQ W1AW"),
+        "no spot from a clean CQ, got {calls:?} ({})",
+        d.status()
+    );
+}
+
+/// ...and so does a station working someone, which on CW is the commoner case
+/// by far. "to, from" ordering means the second call of the pair is sending.
+#[test]
+fn cw_spots_the_sender_of_an_exchange() {
+    let sig = gen_cw("W1AW K1ABC 5NN 001 ", 20.0, 0.02);
+    let mut d = cw::CwDecoder::new(FS);
+    let calls = spotted(&mut d, &sig);
+    assert!(
+        calls.iter().any(|c| c == "CQ K1ABC"),
+        "expected the sending station, got {calls:?} ({})",
+        d.status()
+    );
+    assert!(
+        !calls.iter().any(|c| c == "CQ W1AW"),
+        "spotted the station being worked: {calls:?}"
+    );
+}
+
+/// A signal report is not a callsign, however much `5NN` looks like one.
+#[test]
+fn cw_does_not_spot_a_contest_exchange_as_a_station() {
+    let sig = gen_cw("W1AW 5NN 5NN TU ", 20.0, 0.02);
+    let mut d = cw::CwDecoder::new(FS);
+    let calls = spotted(&mut d, &sig);
+    assert!(calls.is_empty(), "spotted a signal report: {calls:?}");
+}
+
+/// An empty frequency spells letters through the slicer. None of them may
+/// reach pskreporter as a callsign — the report is wrong on someone else's map
+/// and there is no way to take it back.
+#[test]
+fn cw_spots_nothing_from_noise() {
+    let mut rng = 0x1234_5678u32;
+    let sig: Vec<Complex32> = (0..(FS as usize * 20))
+        .map(|_| Complex32::new(noise(&mut rng), noise(&mut rng)))
+        .collect();
+    let mut d = cw::CwDecoder::new(FS);
+    let calls = spotted(&mut d, &sig);
+    assert!(calls.is_empty(), "noise produced spots: {calls:?}");
+}
+
+#[test]
+fn rtty_spots_a_calling_station() {
+    let sig = gen_rtty("RYRY CQ CQ DE W1AW W1AW K ", 45.45, 170.0);
+    let mut d = rtty::RttyDecoder::new(FS);
+    let calls = spotted(&mut d, &sig);
+    assert!(
+        calls.iter().any(|c| c == "CQ W1AW"),
+        "no spot from a clean RTTY CQ, got {calls:?} ({})",
+        d.status()
+    );
+}
+
+#[test]
+fn rtty_spots_nothing_from_noise() {
+    let mut rng = 0x9E37_79B9u32;
+    let sig: Vec<Complex32> = (0..(FS as usize * 20))
+        .map(|_| Complex32::new(noise(&mut rng), noise(&mut rng)))
+        .collect();
+    let mut d = rtty::RttyDecoder::new(FS);
+    let calls = spotted(&mut d, &sig);
+    assert!(calls.is_empty(), "noise produced spots: {calls:?}");
 }
 
 /// A human fist: light dahs (2.2 dits) with ±15% element jitter, so the
@@ -2119,3 +2209,51 @@ fn bench_baud_line() {
     show("cw 20 wpm", &cw, CW_TONE);
 }
 
+/// A spot's SNR has to be a measurement, not a placeholder: it is the number
+/// that tells someone reading the map whether the path was marginal or solid.
+/// Both decoders are checked against signals of known SNR, so what is asserted
+/// here is that the reported figure tracks the band rather than sitting at a
+/// clamp — the failure both estimators started out with.
+#[test]
+fn spot_snr_follows_the_band() {
+    for (label, weak, strong) in [
+        ("CW", gen_cw(CQ, 20.0, 5.0), gen_cw(CQ, 20.0, 0.6)),
+        (
+            "RTTY",
+            gen_rtty_snr(RY_CQ, 45.45, 170.0, 5.0),
+            gen_rtty_snr(RY_CQ, 45.45, 170.0, 0.6),
+        ),
+    ] {
+        let mut snrs = Vec::new();
+        for sig in [&weak, &strong] {
+            let mut d: Box<dyn Decoder> = if label == "CW" {
+                Box::new(cw::CwDecoder::new(FS))
+            } else {
+                Box::new(rtty::RttyDecoder::new(FS))
+            };
+            let mut best = f32::MIN;
+            for chunk in sig.chunks(4096) {
+                d.process(chunk);
+                for m in d.take_messages() {
+                    best = best.max(m.snr_db);
+                }
+            }
+            snrs.push(best);
+        }
+        let (weak_db, strong_db) = (snrs[0], snrs[1]);
+        assert!(
+            weak_db > f32::MIN && strong_db > f32::MIN,
+            "{label}: no spot to take an SNR from"
+        );
+        // The two differ by 18 dB of added noise. Anything that reports them
+        // within a couple of dB of each other is measuring its own arithmetic.
+        assert!(
+            strong_db - weak_db > 8.0,
+            "{label}: {weak_db:.1} dB weak vs {strong_db:.1} dB strong — not tracking"
+        );
+        assert!(
+            (-24.0..=20.0).contains(&weak_db) && (-24.0..=20.0).contains(&strong_db),
+            "{label}: SNR outside the reportable range: {weak_db} / {strong_db}"
+        );
+    }
+}

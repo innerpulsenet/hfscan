@@ -10,7 +10,8 @@
 //! framed in parallel and the one that actually frames — start bit a space,
 //! stop bit a mark — wins; `r` still forces it either way.
 
-use super::Decoder;
+use super::callscan::{utc_hhmmss, CallScanner};
+use super::{Decoder, FtMessage};
 use num_complex::Complex32;
 
 /// Good frames one polarity must lead the other by before it is believed.
@@ -47,6 +48,22 @@ pub struct RttyDecoder {
     /// Whether the polarity is still being worked out, or the user has said.
     auto: bool,
     afc_hz: f32,
+    /// Mean power in the whole passband, and mean power in the two tone
+    /// filters. Their difference is the noise, which is the one way to get an
+    /// SNR out of this demodulator that is not defeated by its own
+    /// normalisation. Comparing the two tone filters saturates around 18 dB,
+    /// where the quieter one stops hearing the band and starts hearing its
+    /// neighbour's skirt. The discriminator cannot be used either: the peak
+    /// trackers that scale it decay over 1.5 s, so it swings by tens of
+    /// percent on the bit pattern alone. Wideband power has neither problem —
+    /// the noise there is far above any leakage, and nothing has normalised
+    /// it away. Zero means not yet seen.
+    band_pwr: f32,
+    tone_pwr: f32,
+    /// Word scanner for pskreporter spots (`CQ ... CALL`, `DE CALL CALL`).
+    /// Fed only from copy that has already survived the polarity vote — the
+    /// losing framer's output is the same bits read upside down.
+    scan: CallScanner,
 }
 
 #[derive(PartialEq)]
@@ -224,6 +241,9 @@ impl RttyDecoder {
             polarity: None,
             auto: true,
             afc_hz: 0.0,
+            band_pwr: 0.0,
+            tone_pwr: 0.0,
+            scan: CallScanner::new(),
         }
     }
 
@@ -251,6 +271,29 @@ impl RttyDecoder {
         self.shift = shift;
     }
 
+    /// SNR in a 2500 Hz reference bandwidth, for the spot report.
+    ///
+    /// The tones hold the signal and the rest of the passband holds the noise,
+    /// so `band_pwr - tone_pwr` is the noise in whatever bandwidth reaches the
+    /// decoder — the tuning chain's, or the sample rate if that is narrower —
+    /// and scaling it to 2500 Hz gives the figure the reporting convention
+    /// wants.
+    fn spot_snr(&self) -> f32 {
+        if self.band_pwr <= 0.0 || self.tone_pwr <= 0.0 {
+            // Nothing measured yet. Cannot happen once a call has been
+            // decoded, which takes far longer than these take to seed, but
+            // guessing the top of the range would be the wrong way to be wrong.
+            return 0.0;
+        }
+        let noise = self.band_pwr - self.tone_pwr;
+        if noise <= 0.0 {
+            // The tones account for everything in the passband.
+            return 20.0;
+        }
+        let bw = Decoder::bandwidth(self).min(self.fs);
+        let gamma = self.tone_pwr / (noise * 2500.0 / bw);
+        (10.0 * gamma.log10()).clamp(-24.0, 20.0)
+    }
 }
 
 impl Decoder for RttyDecoder {
@@ -280,6 +323,19 @@ impl Decoder for RttyDecoder {
             self.mark_peak = (self.mark_peak * decay).max(em);
             self.space_peak = (self.space_peak * decay).max(es);
             let f = em / self.mark_peak.max(1e-9) - es / self.space_peak.max(1e-9);
+            // Averaged over a few characters, so the pair describes the
+            // transmission rather than the bit going past.
+            let pa = 1.0 / (40.0 * self.samples_per_bit);
+            for (level, v) in [
+                (&mut self.band_pwr, s.norm_sqr()),
+                (&mut self.tone_pwr, em + es),
+            ] {
+                if *level <= 0.0 {
+                    *level = v;
+                } else {
+                    *level += (v - *level) * pa;
+                }
+            }
             let dominant = if em > es { (self.mark_acc, old_mark) } else { (self.space_acc, old_space) };
             if dominant.0.norm_sqr() > 1e-8 && dominant.1.norm_sqr() > 1e-8 {
                 let residual = (dominant.0 * dominant.1.conj()).arg() * self.fs / (2.0 * std::f32::consts::PI);
@@ -330,9 +386,16 @@ impl Decoder for RttyDecoder {
             if self.auto {
                 self.polarity = None;
             }
+            // Whatever announcement was half-heard belonged to a station that
+            // is no longer there; joining it to the next one invents a call.
+            self.scan.reset();
             return String::new();
         }
-        std::mem::take(&mut self.framers[p].text)
+        let out = std::mem::take(&mut self.framers[p].text);
+        for c in out.chars() {
+            self.scan.push(c);
+        }
+        out
     }
 
     fn status(&self) -> String {
@@ -403,6 +466,34 @@ impl Decoder for RttyDecoder {
         Some(format!("{:.0}bd", self.baud))
     }
 
+    /// Stations that identified themselves since the last call.
+    ///
+    /// The spot carries the mark tone, which is the frequency a RTTY contact
+    /// is logged and reported on. The cursor sits midway between the tones —
+    /// `process` mixes mark and space symmetrically about it — so the mark is
+    /// half a shift above it.
+    ///
+    /// The signal report comes from `spot_snr`.
+    fn take_messages(&mut self) -> Vec<FtMessage> {
+        let calls = self.scan.take_calls();
+        if calls.is_empty() {
+            return Vec::new();
+        }
+        let snr = self.spot_snr();
+        let stamp = utc_hhmmss();
+        let hz = 0.5 * self.shift;
+        calls
+            .into_iter()
+            .map(|call| FtMessage {
+                stamp: stamp.clone(),
+                snr_db: snr,
+                dt_sec: 0.0,
+                freq_hz: hz,
+                text: format!("CQ {call}"),
+            })
+            .collect()
+    }
+
     /// `r` forces the polarity and stops the detector second-guessing it.
     fn toggle(&mut self) {
         let cur = self.chosen().unwrap_or(0);
@@ -412,12 +503,14 @@ impl Decoder for RttyDecoder {
         for fr in self.framers.iter_mut() {
             fr.clear();
         }
+        self.scan.reset();
     }
 
     fn reset(&mut self) {
         for fr in self.framers.iter_mut() {
             fr.clear();
         }
+        self.scan.reset();
         // A reset means a new signal, so the polarity is an open question
         // again — unless the user answered it, in which case it stays theirs.
         if self.auto {
@@ -429,6 +522,8 @@ impl Decoder for RttyDecoder {
         self.space_acc = Complex32::new(0.0, 0.0);
         self.mark_peak = 1e-6;
         self.space_peak = 1e-6;
+        self.band_pwr = 0.0;
+        self.tone_pwr = 0.0;
     }
 }
 

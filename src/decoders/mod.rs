@@ -1,6 +1,7 @@
 //! Digital mode decoders. Each consumes complex baseband centred on the
 //! cursor at `DecodeChain::fs_out()` and emits decoded text incrementally.
 
+pub mod callscan;
 pub mod cw;
 pub mod ft8;
 pub mod psk31;

@@ -727,6 +727,92 @@ mod tests {
 /// The driver corrects both where it can (see `radio`), but support varies by
 /// device and by SoapySDR backend, so the same corrections are done here as
 /// well. Both are cheap, and both are no-ops on IQ that is already clean.
+/// Streaming wideband impulse blanker. It deliberately runs before every
+/// channel filter, while an RF impulse is still only a few samples wide.
+pub struct NoiseBlanker {
+    fs: f32,
+    background: f32,
+    level: u8,
+    tail: usize,
+    window_seen: usize,
+    window_blanked: usize,
+    last_rate: usize,
+    inhibited: bool,
+}
+
+impl NoiseBlanker {
+    pub fn new(fs: f64) -> Self {
+        Self {
+            fs: fs as f32,
+            background: 1e-3,
+            level: 2,
+            tail: 0,
+            window_seen: 0,
+            window_blanked: 0,
+            last_rate: 0,
+            inhibited: false,
+        }
+    }
+
+    /// Off, gentle (6x), normal (5x), aggressive (4x).
+    pub fn cycle(&mut self) -> &'static str {
+        self.level = (self.level + 1) % 4;
+        ["off", "gentle", "normal", "aggressive"][self.level as usize]
+    }
+
+    pub fn label(&self) -> &'static str {
+        ["off", "gentle", "normal", "aggressive"][self.level as usize]
+    }
+
+    pub fn blanks_per_second(&self) -> usize {
+        self.last_rate
+    }
+
+    fn process(&mut self, iq: &mut [Complex32]) {
+        let a = 1.0 - (-1.0 / (0.075 * self.fs)).exp();
+        let threshold = [f32::INFINITY, 6.0, 5.0, 4.0][self.level as usize];
+        for i in 0..iq.len() {
+            let mag = iq[i].norm();
+            if self.window_seen == 0 && self.last_rate == 0 {
+                self.background = mag.max(1e-6);
+            }
+            // Clamping keeps a crash from raising the reference used to
+            // recognise the rest of that same crash.
+            let observed = mag.min((self.background * 2.5).max(1e-6));
+            self.background += (observed - self.background) * a;
+            let hot = self.level != 0
+                && !self.inhibited
+                && self.window_seen > (self.fs as usize / 20).max(32)
+                && mag > threshold * self.background.max(1e-6);
+            if hot {
+                for back in 0..=2 {
+                    if let Some(s) = i.checked_sub(back).and_then(|j| iq.get_mut(j)) {
+                        if s.norm_sqr() != 0.0 {
+                            *s = Complex32::new(0.0, 0.0);
+                            self.window_blanked += 1;
+                        }
+                    }
+                }
+                self.tail = 3;
+            } else if self.tail > 0 {
+                // Raised-cosine-like return to full amplitude prevents the
+                // blanking edge itself from becoming a broadband click.
+                let weight = [1.0, 0.75, 0.25, 0.0][self.tail];
+                iq[i] *= weight;
+                self.window_blanked += 1;
+                self.tail -= 1;
+            }
+            self.window_seen += 1;
+            if self.window_seen >= self.fs as usize {
+                self.last_rate = self.window_blanked;
+                self.inhibited = self.window_blanked * 50 > self.window_seen;
+                self.window_seen = 0;
+                self.window_blanked = 0;
+            }
+        }
+    }
+}
+
 pub struct FrontEnd {
     fs: f64,
     dc: Complex32,
@@ -742,6 +828,7 @@ pub struct FrontEnd {
     /// Samples seen, against the number needed before correcting at all.
     warm: u32,
     settle: u32,
+    blanker: NoiseBlanker,
 }
 
 impl FrontEnd {
@@ -765,6 +852,7 @@ impl FrontEnd {
             warm: 0,
             // Two time constants of the estimator above.
             settle: (2.0 * fs) as u32,
+            blanker: NoiseBlanker::new(fs),
         }
     }
 
@@ -784,6 +872,14 @@ impl FrontEnd {
             100.0
         };
         (self.dc.norm(), rej.min(100.0))
+    }
+
+    pub fn cycle_blanker(&mut self) -> &'static str {
+        self.blanker.cycle()
+    }
+
+    pub fn blanker_status(&self) -> (&'static str, usize) {
+        (self.blanker.label(), self.blanker.blanks_per_second())
     }
 
     pub fn process(&mut self, iq: &mut [Complex32]) {
@@ -810,6 +906,7 @@ impl FrontEnd {
         // correction converge at a rate that depended on how the caller
         // happened to chunk its input, which is no rate at all.
         self.warm = self.warm.saturating_add(iq.len() as u32);
+        self.blanker.process(iq);
         if self.warm < self.settle {
             // Nothing is corrected until the estimators have seen enough to
             // be estimates; a correction derived from a tenth of a second of
@@ -887,6 +984,55 @@ pub(crate) mod frontend_tests {
         }
         // The last quarter, by which time the estimators have long settled.
         out.split_off(out.len() * 3 / 4)
+    }
+
+    fn impulse_case(fs: f32, impulses: bool) -> (Vec<Complex32>, Vec<Complex32>) {
+        let mut rng = 0x91ab_cdefu32;
+        let mut clean = Vec::with_capacity((fs * 3.0) as usize);
+        let mut dirty = Vec::with_capacity(clean.capacity());
+        for i in 0..clean.capacity() {
+            let tone = Complex32::from_polar(0.015, 2.0 * PI * 1500.0 * i as f32 / fs);
+            let noise = Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.025;
+            clean.push(tone + noise);
+            let crash = impulses && i > fs as usize && i % 1800 < 4;
+            dirty.push(tone + noise + if crash { Complex32::new(8.0, -6.0) } else { Complex32::new(0.0, 0.0) });
+        }
+        (clean, dirty)
+    }
+
+    fn error_power(got: &[Complex32], want: &[Complex32]) -> f32 {
+        got.iter().zip(want).skip(got.len() / 3).map(|(a, b)| (*a - *b).norm_sqr()).sum::<f32>()
+            / (got.len() - got.len() / 3) as f32
+    }
+
+    #[test]
+    fn noise_blanker_removes_impulses_without_harming_clean_iq() {
+        let fs = 48_000.0;
+        let (clean, dirty) = impulse_case(fs, true);
+        let mut blanked = dirty.clone();
+        let mut nb = NoiseBlanker::new(fs as f64);
+        for block in blanked.chunks_mut(4096) { nb.process(block); }
+        let improvement = 10.0 * (error_power(&dirty, &clean) / error_power(&blanked, &clean)).log10();
+        assert!(improvement >= 10.0, "impulse error improved only {improvement:.1} dB");
+
+        let (_, mut untouched) = impulse_case(fs, false);
+        let before = power_at(&untouched, fs, 1500.0);
+        let mut nb = NoiseBlanker::new(fs as f64);
+        for block in untouched.chunks_mut(4096) { nb.process(block); }
+        let harm = (10.0 * (before / power_at(&untouched, fs, 1500.0)).log10()).abs();
+        assert!(harm < 0.2, "clean tone changed by {harm:.2} dB");
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_noise_blanker() {
+        let fs = 48_000.0;
+        let (clean, dirty) = impulse_case(fs, true);
+        let mut blanked = dirty.clone();
+        let mut nb = NoiseBlanker::new(fs as f64);
+        for block in blanked.chunks_mut(4096) { nb.process(block); }
+        let improvement = 10.0 * (error_power(&dirty, &clean) / error_power(&blanked, &clean)).log10();
+        println!("wideband impulse blanker: {improvement:.1} dB error-power improvement, {} blanks/s", nb.blanks_per_second());
     }
 
     /// The DC offset is what forces the LO bins to be blanked, so removing it

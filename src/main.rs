@@ -1701,6 +1701,10 @@ fn run_app<B: Backend>(
                             SMOOTH_LABELS[app.smooth_idx]
                         ));
                     }
+                    KeyCode::Char('j') => {
+                        let level = app.front.cycle_blanker();
+                        app.log(format!("noise blanker: {level}"));
+                    }
                     KeyCode::Char('l') => {
                         app.rx_filter = app.rx_filter.next();
                         app.apply_rx_filter();
@@ -2979,6 +2983,14 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         spans2.push(Span::styled(
             format!("{:.0}%", dc * 100.0),
             Style::default().fg(if dc > 0.15 { Color::Yellow } else { Color::Gray }),
+        ));
+    }
+    let (nb_level, blanks) = app.front.blanker_status();
+    if nb_level != "off" {
+        spans2.push(lbl("  nb "));
+        spans2.push(Span::styled(
+            format!("{blanks}/s"),
+            Style::default().fg(if blanks > 0 { Color::LightCyan } else { Color::Gray }),
         ));
     }
     spans2.extend([
@@ -4706,6 +4718,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  f / F       FFT size (frequency resolution)"),
         Line::from("  a           AGC: soft hang → hardware → off   + / - gain"),
         Line::from("  e           spectrum smoothing (light / medium / heavy)"),
+        Line::from("  j           impulse blanker (off / gentle / normal / aggressive)"),
         Line::from("  l           RX bandpass (auto / 80 / 200 / 500 / 1.5k / 3k)"),
         Line::from("  k           squelch on/off  , / .   squelch threshold"),
         Line::from("  t           toggle bias-T (external preamp power)"),

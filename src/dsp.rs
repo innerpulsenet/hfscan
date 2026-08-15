@@ -1488,3 +1488,87 @@ mod window_bench {
         }
     }
 }
+
+#[cfg(test)]
+mod frontend_audit {
+    use super::frontend_tests::*;
+    use super::*;
+
+    /// SNR of a weak tone measured against the broadband floor around it.
+    fn tone_snr_db(iq: &[Complex32], fs: f32, hz: f32) -> f32 {
+        let sig = power_at(iq, fs, hz);
+        // Floor sampled well away from the tone and its image, avoiding DC.
+        let probes = [hz + 3000.0, hz + 5000.0, hz - 4000.0, hz + 7000.0];
+        let n: f32 = probes.iter().map(|&f| power_at(iq, fs, f)).sum::<f32>()
+            / probes.len() as f32;
+        10.0 * (sig / n.max(1e-30)).log10()
+    }
+
+    /// Does the front end cost a weak signal anything?
+    ///
+    /// Each stage is exercised on its own so a loss can be attributed. The
+    /// image corrector is the one under suspicion: it round-trips every 4096
+    /// samples through an FFT, edits bins, and inverse-transforms with no
+    /// window and no overlap, which is a circular convolution and rings at
+    /// the block seams.
+    #[test]
+    #[ignore]
+    fn bench_frontend_weak_signal_cost() {
+        let fs = 192_000.0f32;
+        let hz = 12_000.0f32;
+        for (label, gain_err, phase_err, dc) in [
+            ("clean input      ", 1.0f32, 0.0f32, Complex32::new(0.0, 0.0)),
+            ("1% gain imbalance", 1.01, 0.005, Complex32::new(0.0, 0.0)),
+            ("5% gain imbalance", 1.05, 0.03, Complex32::new(0.01, -0.007)),
+        ] {
+            let mut rng = 0x1357_9bdfu32;
+            let n = (fs * 4.0) as usize;
+            // A weak tone in noise, then the receiver's imperfections on top.
+            let raw: Vec<Complex32> = (0..n)
+                .map(|i| {
+                    let ph = 2.0 * PI * hz * i as f32 / fs;
+                    let clean = Complex32::from_polar(0.004, ph)
+                        + Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.05;
+                    let q = clean.im * gain_err + clean.re * phase_err;
+                    Complex32::new(clean.re, q) + dc
+                })
+                .collect();
+            let before = tone_snr_db(&raw[raw.len() * 3 / 4..], fs, hz);
+            let after = tone_snr_db(&run_frontend(&raw, fs), fs, hz);
+            println!(
+                "  {label}: {before:6.2} dB in -> {after:6.2} dB out   ({:+.2} dB)",
+                after - before
+            );
+        }
+    }
+
+    /// The blanker is on by default at "normal". On a band with no impulse
+    /// noise it should be doing nothing at all.
+    #[test]
+    #[ignore]
+    fn bench_blanker_on_quiet_band() {
+        let fs = 192_000.0f32;
+        let hz = 12_000.0f32;
+        let mut rng = 0x2468_ace0u32;
+        let n = (fs * 4.0) as usize;
+        let raw: Vec<Complex32> = (0..n)
+            .map(|i| {
+                let ph = 2.0 * PI * hz * i as f32 / fs;
+                Complex32::from_polar(0.004, ph)
+                    + Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.05
+            })
+            .collect();
+        let mut nb = NoiseBlanker::new(fs as f64);
+        let mut out = raw.clone();
+        for chunk in out.chunks_mut(16_384) {
+            nb.process(chunk);
+        }
+        let before = tone_snr_db(&raw[raw.len() * 3 / 4..], fs, hz);
+        let after = tone_snr_db(&out[out.len() * 3 / 4..], fs, hz);
+        println!(
+            "  blanker 'normal' on clean noise: {before:6.2} -> {after:6.2} dB  ({:+.2} dB), {} blanks/s",
+            after - before,
+            nb.blanks_per_second()
+        );
+    }
+}

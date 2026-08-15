@@ -848,14 +848,11 @@ pub struct FrontEnd {
     fs: f64,
     dc: Complex32,
     dc_a: f32,
-    /// Running estimates for the imbalance solve.
-    ii: f32,
-    qq: f32,
-    iq: f32,
-    est_a: f32,
-    /// Applied correction, updated slowly from the estimates.
-    gain: f32,
-    cross: f32,
+    iq_fft: Arc<dyn Fft<f32>>,
+    iq_ifft: Arc<dyn Fft<f32>>,
+    iq_buf: Vec<Complex32>,
+    iq_orig: Vec<Complex32>,
+    image: [Complex32; 12],
     /// Samples seen, against the number needed before correcting at all.
     warm: u32,
     settle: u32,
@@ -865,6 +862,7 @@ pub struct FrontEnd {
 impl FrontEnd {
     pub fn new(fs: f64) -> Self {
         let fsf = fs as f32;
+        let mut planner = FftPlanner::new();
         Self {
             fs,
             dc: Complex32::new(0.0, 0.0),
@@ -872,14 +870,11 @@ impl FrontEnd {
             // than a filter, so it cannot touch a signal even a few tens of
             // hertz off the LO — the region worth recovering in the first place.
             dc_a: 1.0 - (-2.0 * PI * 2.0 / fsf).exp(),
-            ii: 1.0,
-            qq: 1.0,
-            iq: 0.0,
-            // ~1 Hz: imbalance is a property of the hardware and drifts with
-            // temperature, not with the traffic on the band.
-            est_a: 1.0 - (-2.0 * PI * 1.0 / fsf).exp(),
-            gain: 1.0,
-            cross: 0.0,
+            iq_fft: planner.plan_fft_forward(4096),
+            iq_ifft: planner.plan_fft_inverse(4096),
+            iq_buf: vec![Complex32::new(0.0, 0.0); 4096],
+            iq_orig: vec![Complex32::new(0.0, 0.0); 4096],
+            image: [Complex32::new(0.0, 0.0); 12],
             warm: 0,
             // Two time constants of the estimator above.
             settle: (2.0 * fs) as u32,
@@ -896,9 +891,9 @@ impl FrontEnd {
     /// The correction currently being applied, for display: DC magnitude and
     /// image rejection in dB (higher is better; ~100 means nothing to correct).
     pub fn status(&self) -> (f32, f32) {
-        let err = (self.gain - 1.0).abs() + self.cross.abs();
+        let err = self.image.iter().map(|v| v.norm()).fold(0.0f32, f32::max);
         let rej = if err > 1e-6 {
-            -20.0 * (err / 2.0).log10()
+            -20.0 * err.log10()
         } else {
             100.0
         };
@@ -919,43 +914,64 @@ impl FrontEnd {
             self.dc += (*s - self.dc) * self.dc_a;
             let v = *s - self.dc;
 
-            // --- IQ imbalance: the band is noise-like in aggregate, so the
-            // true signal has equal power in I and Q and no correlation
-            // between them. Whatever departs from that is the front end.
-            self.ii += (v.re * v.re - self.ii) * self.est_a;
-            self.qq += (v.im * v.im - self.qq) * self.est_a;
-            self.iq += (v.re * v.im - self.iq) * self.est_a;
-
-            // Q' = g * (Q + c * I): orthogonalise against I, then match its
-            // power. The cross term is inside the gain, not beside it.
-            *s = Complex32::new(v.re, self.gain * (v.im + self.cross * v.re));
+            *s = v;
         }
 
-        // Solved once per block, not per sample: `ii`/`qq`/`iq` already carry
-        // a one-second time constant, so the solution is smooth without any
-        // further filtering — and filtering it again per *block* made the
-        // correction converge at a rate that depended on how the caller
-        // happened to chunk its input, which is no rate at all.
         self.warm = self.warm.saturating_add(iq.len() as u32);
+        self.correct_images(iq);
         self.blanker.process(iq);
-        if self.warm < self.settle {
-            // Nothing is corrected until the estimators have seen enough to
-            // be estimates; a correction derived from a tenth of a second of
-            // one loud carrier is worse than none.
-            return;
-        }
-        if self.ii > 1e-20 && self.qq > 1e-20 {
-            let cross = -self.iq / self.ii;
-            let resid = self.qq - self.iq * self.iq / self.ii;
-            if resid > 1e-20 {
-                let gain = (self.ii / resid).sqrt();
-                // Clamped hard: a real front end is within a few percent, and
-                // a band dominated by one strong carrier can briefly look
-                // correlated in a way that is the signal, not the hardware.
-                if (0.8..=1.25).contains(&gain) && cross.abs() < 0.25 {
-                    self.gain = gain;
-                    self.cross = cross;
+    }
+
+    fn correct_images(&mut self, iq: &mut [Complex32]) {
+        const N: usize = 4096;
+        const K: usize = 12;
+        for block in iq.chunks_exact_mut(N) {
+            self.iq_buf.copy_from_slice(block);
+            self.iq_fft.process(&mut self.iq_buf);
+            self.iq_orig.copy_from_slice(&self.iq_buf);
+            let mut cross = [Complex32::new(0.0, 0.0); K];
+            let mut paired = [0.0f32; K];
+            for k in 1..N {
+                let shifted = (k + N / 2) % N;
+                let band = (shifted * K / N).min(K - 1);
+                let mirror = (N - k) % N;
+                cross[band] += self.iq_orig[k] * self.iq_orig[mirror];
+                paired[band] += self.iq_orig[k].norm_sqr() + self.iq_orig[mirror].norm_sqr();
+            }
+            let alpha = (N as f32 / (self.fs as f32 * 2.0)).clamp(0.002, 0.2);
+            let mut estimate = [None; K];
+            let max_power = paired.iter().copied().fold(0.0f32, f32::max);
+            for b in 0..K {
+                if paired[b] > (max_power * 1e-3).max(1e-12) {
+                    let v = cross[b] / paired[b];
+                    if v.norm() < 0.25 {
+                        estimate[b] = Some(v);
+                    }
                 }
+            }
+            for b in 0..K {
+                if let Some(mut target) = estimate[b] {
+                    let mut weight = 1.0;
+                    for neighbour in [b.checked_sub(1), (b + 1 < K).then_some(b + 1)].into_iter().flatten() {
+                        if let Some(v) = estimate[neighbour] {
+                            target += v * 0.25;
+                            weight += 0.25;
+                        }
+                    }
+                    target /= weight;
+                    self.image[b] += (target - self.image[b]) * alpha;
+                }
+            }
+            if self.warm >= self.settle {
+                for k in 1..N {
+                    let shifted = (k + N / 2) % N;
+                    let band = (shifted * K / N).min(K - 1);
+                    let a = self.image[band];
+                    let mirror = (N - k) % N;
+                    self.iq_buf[k] = self.iq_orig[k] - a * self.iq_orig[mirror].conj();
+                }
+                self.iq_ifft.process(&mut self.iq_buf);
+                for (dst, src) in block.iter_mut().zip(&self.iq_buf) { *dst = *src / N as f32; }
             }
         }
     }
@@ -1104,6 +1120,60 @@ pub(crate) mod frontend_tests {
             sig > power_at(&iq, fs, 400.0) * 0.5,
             "the wanted signal was attenuated"
         );
+    }
+
+    fn frequency_dependent_case(fs: f32) -> (Vec<Complex32>, [f32; 2]) {
+        let hz = [4687.5, 16406.25]; // exact 4096-point bins
+        let a = [Complex32::new(0.09, 0.025), Complex32::new(-0.065, 0.045)];
+        let iq = (0..(fs * 10.0) as usize).map(|i| {
+            let mut x = Complex32::new(0.0, 0.0);
+            for j in 0..2 {
+                let s = Complex32::from_polar(0.35, 2.0 * PI * hz[j] * i as f32 / fs);
+                x += s + a[j] * s.conj();
+            }
+            x
+        }).collect();
+        (iq, hz)
+    }
+
+    fn worst_rejection(iq: &[Complex32], fs: f32, hz: [f32; 2]) -> f32 {
+        hz.into_iter().map(|f| 10.0 * (power_at(iq, fs, f) / power_at(iq, fs, -f).max(1e-30)).log10())
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    fn run_subband_only(iq: &[Complex32], fs: f32) -> Vec<Complex32> {
+        let mut fe = FrontEnd::new(fs as f64);
+        fe.blanker.level = 0;
+        let mut out = Vec::new();
+        for chunk in iq.chunks(16_384) {
+            let mut block = chunk.to_vec();
+            fe.process(&mut block);
+            out.extend(block);
+        }
+        out.split_off(out.len() * 3 / 4)
+    }
+
+    #[test]
+    fn subband_iq_correction_beats_a_scalar_solve() {
+        let fs = 48_000.0;
+        let (iq, hz) = frequency_dependent_case(fs);
+        let scalar_a = Complex32::new(0.0125, 0.035);
+        let scalar: Vec<_> = iq.iter().map(|&x| x - scalar_a * x.conj()).collect();
+        let scalar_rej = worst_rejection(&scalar, fs, hz);
+        let per_band = worst_rejection(&run_subband_only(&iq, fs), fs, hz);
+        assert!(per_band >= scalar_rej + 15.0, "subbands gained only {:.1} dB ({scalar_rej:.1} -> {per_band:.1})", per_band - scalar_rej);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_frequency_dependent_iq() {
+        let fs = 48_000.0;
+        let (iq, hz) = frequency_dependent_case(fs);
+        let scalar_a = Complex32::new(0.0125, 0.035);
+        let scalar: Vec<_> = iq.iter().map(|&x| x - scalar_a * x.conj()).collect();
+        let scalar_rej = worst_rejection(&scalar, fs, hz);
+        let per_band = worst_rejection(&run_subband_only(&iq, fs), fs, hz);
+        println!("frequency-dependent IQ: worst-band scalar {scalar_rej:.1} dB, 12-band {per_band:.1} dB ({:.1} dB gain)", per_band - scalar_rej);
     }
 
     /// And clean IQ must come out unharmed — the correction has to be a

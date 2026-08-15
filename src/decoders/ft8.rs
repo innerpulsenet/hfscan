@@ -33,7 +33,7 @@ pub const FREQ_MIN: f32 = 200.0;
 /// Matches WSJT-X's default upper edge so stations at the top of the
 /// waterfall are not silently dropped.
 pub const FREQ_MAX: f32 = 3000.0;
-const MAX_CAND: usize = 200;
+const MAX_CAND: usize = 500;
 
 pub struct FtDecoder {
     ft4: bool,
@@ -68,6 +68,7 @@ impl FtDecoder {
 
         std::thread::spawn(move || {
             let mut hash = CallsignHashTable::new();
+            let mut deep = true;
             while let Ok(job) = job_rx.recv() {
                 // If slots queued up faster than we can decode them (slow
                 // CPU, busy band), keep only the freshest: stale decodes are
@@ -82,8 +83,17 @@ impl FtDecoder {
                 }
                 // One batch per slot (possibly empty), so the UI can tell
                 // "slot done, nothing heard".
+                let started = std::time::Instant::now();
+                let decoded = decode_slot(&latest.audio, ft4, &latest.my_call, &mut hash, deep);
+                let elapsed = started.elapsed().as_secs_f64();
+                if elapsed > slot_secs * 0.8 {
+                    deep = false;
+                    eprintln!("FT decode used {elapsed:.1}s ({:.0}% of slot); restoring conservative depth", elapsed / slot_secs * 100.0);
+                } else if elapsed < slot_secs * 0.5 {
+                    deep = true;
+                }
                 if res_tx
-                    .send(decode_slot(&latest.audio, ft4, &latest.my_call, &mut hash))
+                    .send(decoded)
                     .is_err()
                 {
                     return;
@@ -118,10 +128,16 @@ impl FtDecoder {
     #[cfg(test)]
     pub fn decode_audio(audio: &[i16], ft4: bool) -> Vec<String> {
         let mut hash = CallsignHashTable::new();
-        decode_slot(audio, ft4, "", &mut hash)
+        decode_slot(audio, ft4, "", &mut hash, true)
             .iter()
             .map(|m| m.format())
             .collect()
+    }
+
+    #[cfg(test)]
+    pub fn decode_audio_depth(audio: &[i16], ft4: bool, deep: bool) -> Vec<String> {
+        let mut hash = CallsignHashTable::new();
+        decode_slot(audio, ft4, "", &mut hash, deep).iter().map(|m| m.format()).collect()
     }
 
     #[cfg(test)]
@@ -200,6 +216,7 @@ fn decode_slot(
     ft4: bool,
     my_call: &str,
     hash: &mut CallsignHashTable,
+    deep: bool,
 ) -> Vec<FtMessage> {
     let stamp = slot_stamp();
     let mut out = Vec::new();
@@ -209,8 +226,9 @@ fn decode_slot(
         // strong neighbour's occupied bandwidth — the situation a hot
         // front end (bias-T + LNA) creates. Local Costas EQ flattens
         // per-tone fading before the LLRs are built.
-        let res = DecodeRequest::<Ft4>::new(audio, FREQ_MIN, FREQ_MAX, 0.9, MAX_CAND)
-            .sic_rounds(3)
+        let (sync, cand, rounds) = if deep { (0.8, MAX_CAND, 5) } else { (0.9, 200, 3) };
+        let res = DecodeRequest::<Ft4>::new(audio, FREQ_MIN, FREQ_MAX, sync, cand)
+            .sic_rounds(rounds)
             .eq_mode(EqMode::Local)
             .osd(true)
             .decode()
@@ -230,7 +248,8 @@ fn decode_slot(
         } else {
             None
         };
-        let mut req = DecodeRequest::<Ft8>::new(audio, FREQ_MIN, FREQ_MAX, 0.9, MAX_CAND)
+        let (sync, cand) = if deep { (0.8, MAX_CAND) } else { (0.9, 200) };
+        let mut req = DecodeRequest::<Ft8>::new(audio, FREQ_MIN, FREQ_MAX, sync, cand)
             .sic_early()
             .eq_mode(EqMode::Local)
             .osd(true);

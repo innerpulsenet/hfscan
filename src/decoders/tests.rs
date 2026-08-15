@@ -693,6 +693,10 @@ fn psk31_span_scout_finds_psk_and_skips_a_carrier() {
 /// audio offset above the dial, starting 0.5 s into the slot.
 #[cfg(test)]
 fn ft_roundtrip(ft4: bool, text_call: &str, grid: &str, audio_hz: f32) -> Vec<String> {
+    ft8::FtDecoder::decode_audio(&ft_audio(ft4, text_call, grid, audio_hz), ft4)
+}
+
+fn ft_audio(ft4: bool, text_call: &str, grid: &str, audio_hz: f32) -> Vec<i16> {
     use mfsk_core::msg::wsjt77::pack77;
 
     let slot_secs = if ft4 { 7.5 } else { 15.0 };
@@ -716,7 +720,7 @@ fn ft_roundtrip(ft4: bool, text_call: &str, grid: &str, audio_hz: f32) -> Vec<St
             audio[start + i] = s;
         }
     }
-    ft8::FtDecoder::decode_audio(&audio, ft4)
+    audio
 }
 
 #[test]
@@ -726,6 +730,17 @@ fn ft8_decodes_a_slot() {
         out.iter().any(|l| l.contains("CQ JA1ABC PM95")),
         "expected the message back, got {out:?}"
     );
+}
+
+#[test]
+#[ignore]
+fn bench_ft8_decode_depth() {
+    let audio = ft_audio(false, "JA1ABC", "PM95", 1500.0);
+    for deep in [false, true] {
+        let at = std::time::Instant::now();
+        let out = ft8::FtDecoder::decode_audio_depth(&audio, false, deep);
+        println!("FT8 {} depth: {} decode(s), {:.2}s", if deep { "deep" } else { "conservative" }, out.len(), at.elapsed().as_secs_f64());
+    }
 }
 
 /// A weak signal parked next to a much stronger one must still decode: the

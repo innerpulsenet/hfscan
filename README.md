@@ -84,6 +84,21 @@ and finds the knee — the setting where the noise floor stops being the
 receiver's own and starts following the band's. Past that point more gain buys
 intermodulation and lost headroom, not sensitivity.
 
+Run it after any antenna change: the knee follows band noise, and on this
+receiver the quiet bands wanted 16 dB more gain than the loud ones.
+
+| band | IFGR | | band | IFGR | | band | IFGR |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 160m | 56 | | 40m | 56 | | 15m | 48 |
+| 80m | 52 | | 30m | 56 | | 12m | 48 |
+| 60m | 56 | | 20m | 48 | | 10m | 40 |
+| 17m | 48 | | 6m | 40 | | 2m | 56 |
+
+RFGR stays at 0 on every band. The sweeps came nowhere near overload, and RF
+gain reduction is the one that costs noise figure, so there is nothing to buy
+by raising it; the IF figure carries the whole adjustment. These load as each
+band's starting gain.
+
 It is device-agnostic. An RSP1A expresses both its gain elements as *reduction*
 (a bigger number is less gain) while an RTL-SDR's tuner gain counts the usual
 way; the sweep reads the direction off the data rather than keeping a table of

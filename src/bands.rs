@@ -40,6 +40,26 @@ pub struct Band {
     /// a receiver whose job is weak signals. Nothing needs it: the widest
     /// allocation here is 4 MHz.
     pub span: f64,
+    /// Where the gain wants to sit on this band, measured rather than chosen.
+    ///
+    /// `--bench` sweeps each band at its own centre and finds the knee: the
+    /// least gain at which the band's own noise already dominates the
+    /// receiver's. Below it the receiver is its own noise source; above it,
+    /// more gain raises the level without improving the signal-to-noise ratio
+    /// and spends headroom and intermodulation margin doing so.
+    ///
+    /// SDRplay states both as *reduction*, so bigger is less gain. The RF
+    /// figure is left at zero — the sweeps never came close to overload, and
+    /// RF gain reduction is the one that costs noise figure, so there is
+    /// nothing to buy by raising it. The IF figure carries the whole
+    /// adjustment.
+    ///
+    /// These are one antenna at one site, so they are a starting point rather
+    /// than a constant of the universe: the knee follows band noise, which is
+    /// why the quiet bands here want 16 dB more gain than the loud ones. Rerun
+    /// `--bench` after any antenna change.
+    pub rfgr: f64,
+    pub ifgr: f64,
 }
 
 /// Band the app opens on when nothing says otherwise. An index rather than a
@@ -48,19 +68,19 @@ pub struct Band {
 pub const DEFAULT_BAND: usize = 5; // 20m
 
 pub const BANDS: &[Band] = &[
-    Band { name: "160m", start: 1_800_000.0,   end: 2_000_000.0,   default: 1_900_000.0,   span: 384_000.0 },
-    Band { name: "80m",  start: 3_500_000.0,   end: 4_000_000.0,   default: 3_750_000.0,   span: 768_000.0 },
-    Band { name: "60m",  start: 5_330_000.0,   end: 5_405_000.0,   default: 5_367_500.0,   span: 192_000.0 },
-    Band { name: "40m",  start: 7_000_000.0,   end: 7_300_000.0,   default: 7_150_000.0,   span: 768_000.0 },
-    Band { name: "30m",  start: 10_100_000.0,  end: 10_150_000.0,  default: 10_125_000.0,  span: 192_000.0 },
-    Band { name: "20m",  start: 14_000_000.0,  end: 14_350_000.0,  default: 14_175_000.0,  span: 768_000.0 },
-    Band { name: "17m",  start: 18_068_000.0,  end: 18_168_000.0,  default: 18_118_000.0,  span: 192_000.0 },
-    Band { name: "15m",  start: 21_000_000.0,  end: 21_450_000.0,  default: 21_225_000.0,  span: 768_000.0 },
-    Band { name: "12m",  start: 24_890_000.0,  end: 24_990_000.0,  default: 24_940_000.0,  span: 192_000.0 },
-    Band { name: "10m",  start: 28_000_000.0,  end: 29_700_000.0,  default: 28_850_000.0,  span: 5_016_000.0 },
-    Band { name: "6m",   start: 50_000_000.0,  end: 54_000_000.0,  default: 52_000_000.0,  span: 5_016_000.0 },
-    Band { name: "2m",   start: 144_000_000.0, end: 148_000_000.0, default: 146_000_000.0, span: 5_016_000.0 },
-    Band { name: "WWV",  start: 4_990_000.0,   end: 15_010_000.0,  default: 10_000_000.0,  span: 192_000.0 },
+    Band { name: "160m", start: 1_800_000.0,   end: 2_000_000.0,   default: 1_900_000.0,   span: 384_000.0, rfgr: 0.0, ifgr: 56.0 },
+    Band { name: "80m",  start: 3_500_000.0,   end: 4_000_000.0,   default: 3_750_000.0,   span: 768_000.0, rfgr: 0.0, ifgr: 52.0 },
+    Band { name: "60m",  start: 5_330_000.0,   end: 5_405_000.0,   default: 5_367_500.0,   span: 192_000.0, rfgr: 0.0, ifgr: 56.0 },
+    Band { name: "40m",  start: 7_000_000.0,   end: 7_300_000.0,   default: 7_150_000.0,   span: 768_000.0, rfgr: 0.0, ifgr: 56.0 },
+    Band { name: "30m",  start: 10_100_000.0,  end: 10_150_000.0,  default: 10_125_000.0,  span: 192_000.0, rfgr: 0.0, ifgr: 56.0 },
+    Band { name: "20m",  start: 14_000_000.0,  end: 14_350_000.0,  default: 14_175_000.0,  span: 768_000.0, rfgr: 0.0, ifgr: 48.0 },
+    Band { name: "17m",  start: 18_068_000.0,  end: 18_168_000.0,  default: 18_118_000.0,  span: 192_000.0, rfgr: 0.0, ifgr: 48.0 },
+    Band { name: "15m",  start: 21_000_000.0,  end: 21_450_000.0,  default: 21_225_000.0,  span: 768_000.0, rfgr: 0.0, ifgr: 48.0 },
+    Band { name: "12m",  start: 24_890_000.0,  end: 24_990_000.0,  default: 24_940_000.0,  span: 192_000.0, rfgr: 0.0, ifgr: 48.0 },
+    Band { name: "10m",  start: 28_000_000.0,  end: 29_700_000.0,  default: 28_850_000.0,  span: 5_016_000.0, rfgr: 0.0, ifgr: 40.0 },
+    Band { name: "6m",   start: 50_000_000.0,  end: 54_000_000.0,  default: 52_000_000.0,  span: 5_016_000.0, rfgr: 0.0, ifgr: 40.0 },
+    Band { name: "2m",   start: 144_000_000.0, end: 148_000_000.0, default: 146_000_000.0, span: 5_016_000.0, rfgr: 0.0, ifgr: 56.0 },
+    Band { name: "WWV",  start: 4_990_000.0,   end: 15_010_000.0,  default: 10_000_000.0,  span: 192_000.0, rfgr: 0.0, ifgr: 48.0 },
 ];
 
 pub struct Marker {
@@ -325,6 +345,35 @@ mod tests {
                 width / 1000.0
             );
         }
+    }
+
+    /// The measured gain has to be inside what the tuner accepts, and it has
+    /// to actually vary — a table where every band carried the same number
+    /// would mean the sweep was never run, which is the state this replaced.
+    #[test]
+    fn per_band_gain_is_measured_and_in_range() {
+        for b in BANDS {
+            assert!(
+                (0.0..=9.0).contains(&b.rfgr),
+                "{}: RFGR {} outside the tuner's 0..9",
+                b.name,
+                b.rfgr
+            );
+            assert!(
+                (20.0..=59.0).contains(&b.ifgr),
+                "{}: IFGR {} outside the tuner's 20..59",
+                b.name,
+                b.ifgr
+            );
+        }
+        let quiet = BANDS.iter().find(|b| b.name == "10m").unwrap();
+        let loud = BANDS.iter().find(|b| b.name == "40m").unwrap();
+        assert!(
+            quiet.ifgr < loud.ifgr,
+            "a quiet band needs more gain than a noisy one; 10m {} vs 40m {}",
+            quiet.ifgr,
+            loud.ifgr
+        );
     }
 
     /// A span the device cannot produce gets silently clamped by the driver,

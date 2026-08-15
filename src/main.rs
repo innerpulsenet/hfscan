@@ -843,8 +843,11 @@ impl App {
             external_noise_dominant: false,
             band_idx: 0,
             band_gains: vec![36.0; bands::BANDS.len()],
-            band_rfgr: vec![3.0; bands::BANDS.len()],
-            band_ifgr: vec![40.0; bands::BANDS.len()],
+            // Measured per band by `--bench`, not one constant for all of
+            // them: the knee follows band noise, and the quiet bands here
+            // want 16 dB more gain than the loud ones.
+            band_rfgr: bands::BANDS.iter().map(|b| b.rfgr).collect(),
+            band_ifgr: bands::BANDS.iter().map(|b| b.ifgr).collect(),
             spectrum: Vec::new(),
             noise_tracker: dsp::NoiseFloor::new(),
             noise_floor: Vec::new(),
@@ -2764,6 +2767,22 @@ fn apply_radio_event(app: &mut App, event: radio::Event) {
                 "receiver: {} / {} ({model})",
                 app.radio_driver, app.radio_hardware
             ));
+            // The measured gain for the band we came up on. This waits for the
+            // capabilities rather than happening at startup, because until
+            // they arrive there is no knowing whether this receiver even has
+            // the split RF/IF controls the band table's figures are in.
+            if matches!(app.gain_control, radio::GainControl::Sdrplay { .. })
+                && let Some(b) = bands::BANDS.get(app.band_idx)
+            {
+                app.rfgr = b.rfgr;
+                app.ifgr = b.ifgr;
+                app.pending_rfgr = Some(b.rfgr);
+                app.pending_ifgr = Some(b.ifgr);
+                app.log(format!(
+                    "gain: RFGR {:.0} / IFGR {:.0} — measured knee for {}",
+                    b.rfgr, b.ifgr, b.name
+                ));
+            }
         }
         radio::Event::State(s) => {
             if let Some(v) = s.agc {
@@ -3066,7 +3085,9 @@ fn mode_scan_key(app: &mut App, radio: &radio::Radio) {
 }
 
 fn retune(app: &mut App, radio: &radio::Radio, freq: f64) {
-    let freq = freq.clamp(100_000.0, 30_000_000.0);
+    // The RSP1A tunes to 2 GHz; this used to stop at 30 MHz, which silently
+    // pinned every jump to 6m or 2m at the top of HF.
+    let freq = freq.clamp(100_000.0, 2_000_000_000.0);
     if app.band_idx < app.band_gains.len() {
         app.band_gains[app.band_idx] = app.gain;
         app.band_rfgr[app.band_idx] = app.rfgr;

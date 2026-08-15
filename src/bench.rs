@@ -249,30 +249,51 @@ pub fn run(device_args: &str, sweep_freq: f64) -> Result<()> {
         );
     }
 
-    println!("\n== noise floor vs gain @ {:.3} MHz ==", sweep_freq / 1e6);
-    println!("  antenna must be connected, and the frequency clear of any strong signal");
-    let points = sweep_gain(&dev, sweep_freq)?;
-    for p in &points {
-        println!("  {:>6.1} dB  ->  {:>7.2} dBFS", p.gain_db, p.floor_dbfs);
-    }
-    let sense = if control_is_reduction(&points) {
-        "gain reduction (higher = less gain)"
-    } else {
-        "gain (higher = more gain)"
-    };
-    println!("  control reads as {sense}");
-    match find_gain_knee(&points) {
-        Some(k) => println!(
-            "\n  knee at {:.1} dB, floor {:.1} dBFS.\n  \
-             Past this the floor follows the control, so the band's noise already\n  \
-             dominates: more gain buys intermodulation and lost headroom, not\n  \
-             sensitivity. Less, and the receiver becomes its own noise source.",
-            k.gain_db, k.floor_dbfs
-        ),
-        None => println!(
-            "\n  no knee found — the floor never tracked gain, so the receiver is still\n  \
-             the dominant noise source at every setting. Check the antenna."
-        ),
+    let _ = sweep_freq;
+    println!("\n== gain knee per band ==");
+    println!("  antenna connected; each band is swept at its own centre and span");
+    println!(
+        "  {:>5} {:>9} {:>9} {:>7} {:>7}  {}",
+        "band", "knee", "floor", "RFGR", "IFGR", "note"
+    );
+    for b in bands::BANDS {
+        if b.name == "WWV" {
+            continue;
+        }
+        let points = match sweep_gain(&dev, b.default, b.span) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("  {:>5}  sweep failed: {e}", b.name);
+                continue;
+            }
+        };
+        if std::env::var("HFSCAN_BENCH_CURVES").is_ok() {
+            let c: Vec<String> = points
+                .iter()
+                .map(|p| format!("{:.0}:{:.1}", p.gain_db, p.floor_dbfs))
+                .collect();
+            println!("  {:>5} curve {}", b.name, c.join("  "));
+        }
+        match find_gain_knee(&points) {
+            Some(k) => {
+                dev.set_gain(Rx, 0, k.gain_db)?;
+                let rfgr = dev.gain_element(Rx, 0, "RFGR").unwrap_or(f64::NAN);
+                let ifgr = dev.gain_element(Rx, 0, "IFGR").unwrap_or(f64::NAN);
+                let span = points
+                    .iter()
+                    .map(|p| p.floor_dbfs)
+                    .fold(f32::MIN, f32::max)
+                    - points.iter().map(|p| p.floor_dbfs).fold(f32::MAX, f32::min);
+                println!(
+                    "  {:>5} {:>8.1}dB {:>8.1}dB {:>7.0} {:>7.0}  {:.0} dB of travel",
+                    b.name, k.gain_db, k.floor_dbfs, rfgr, ifgr, span
+                );
+            }
+            None => println!(
+                "  {:>5}       —         —       —       —  no knee: band quieter than the receiver",
+                b.name
+            ),
+        }
     }
 
     if failures > 0 {
@@ -281,10 +302,10 @@ pub fn run(device_args: &str, sweep_freq: f64) -> Result<()> {
     Ok(())
 }
 
-fn sweep_gain(dev: &soapysdr::Device, freq: f64) -> Result<Vec<GainPoint>> {
+fn sweep_gain(dev: &soapysdr::Device, freq: f64, span: f64) -> Result<Vec<GainPoint>> {
     dev.set_frequency(Rx, 0, freq, ())?;
-    dev.set_sample_rate(Rx, 0, 192_000.0)?;
-    let _ = dev.set_bandwidth(Rx, 0, 192_000.0);
+    dev.set_sample_rate(Rx, 0, span)?;
+    let _ = dev.set_bandwidth(Rx, 0, span);
     let _ = dev.set_gain_mode(Rx, 0, false);
 
     let range = dev.gain_range(Rx, 0).context("no overall gain range")?;

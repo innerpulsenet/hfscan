@@ -311,6 +311,10 @@ fn gen_rtty(text: &str, baud: f32, shift: f32) -> Vec<Complex32> {
 }
 
 fn gen_rtty_snr(text: &str, baud: f32, shift: f32, snr_scale: f32) -> Vec<Complex32> {
+    gen_rtty_faded(text, baud, shift, snr_scale, 1.0, 1.0)
+}
+
+fn gen_rtty_faded(text: &str, baud: f32, shift: f32, snr_scale: f32, mark_amp: f32, space_amp: f32) -> Vec<Complex32> {
     let sps = FS as f32 / baud;
     let mut bits: Vec<bool> = Vec::new();
     // idle mark so the decoder starts in a known state
@@ -347,13 +351,36 @@ fn gen_rtty_snr(text: &str, baud: f32, shift: f32, snr_scale: f32) -> Vec<Comple
             let f = if mark { shift / 2.0 } else { -shift / 2.0 };
             phase += 2.0 * PI * f / FS as f32;
             let _ = n;
+            let amp = if mark { mark_amp } else { space_amp };
             out.push(
-                Complex32::from_polar(1.0, phase)
+                Complex32::from_polar(amp, phase)
                     + Complex32::new(noise(&mut rng), noise(&mut rng)) * snr_scale,
             );
         }
     }
     out
+}
+
+#[test]
+fn rtty_matched_filters_survive_selective_fading() {
+    let sig = gen_rtty_faded("RYRY RYRY CQ DE TEST TEST", 45.45, 170.0, 0.025, 1.0, 0.1);
+    let mut d = rtty::RttyDecoder::new(FS);
+    let mut out = String::new();
+    for chunk in sig.chunks(4096) { out.push_str(&d.process(chunk)); }
+    assert!(out.contains("TEST"), "-20 dB space fade was not copyable: {out:?} ({})", d.status());
+}
+
+#[test]
+#[ignore]
+fn bench_rtty_matched_filter_fade() {
+    for fade_db in [0.0f32, -10.0, -20.0] {
+        let amp = 10f32.powf(fade_db / 20.0);
+        let sig = gen_rtty_faded("RYRY RYRY CQ DE TEST TEST", 45.45, 170.0, 0.025, 1.0, amp);
+        let mut d = rtty::RttyDecoder::new(FS);
+        let mut out = String::new();
+        for chunk in sig.chunks(4096) { out.push_str(&d.process(chunk)); }
+        println!("RTTY matched filters, space {fade_db:+.0} dB: {} chars, TEST={}", out.len(), out.contains("TEST"));
+    }
 }
 
 #[test]

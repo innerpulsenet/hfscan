@@ -11,7 +11,6 @@
 //! stop bit a mark — wins; `r` still forces it either way.
 
 use super::Decoder;
-use crate::dsp::OnePole;
 use num_complex::Complex32;
 
 /// Good frames one polarity must lead the other by before it is believed.
@@ -33,9 +32,12 @@ pub struct RttyDecoder {
     fs: f32,
     baud: f32,
     shift: f32,
-    prev: Complex32,
-    disc: OnePole,
     samples_per_bit: f32,
+    tone_phase: f32,
+    mark_acc: Complex32,
+    space_acc: Complex32,
+    mark_peak: f32,
+    space_peak: f32,
     /// Normal and reversed slicings of the same discriminator output. Which
     /// one is right is decided by which one frames, not assumed.
     framers: [Framer; 2],
@@ -43,13 +45,7 @@ pub struct RttyDecoder {
     polarity: Option<usize>,
     /// Whether the polarity is still being worked out, or the user has said.
     auto: bool,
-    /// Discriminator extremes (fast attack, slow decay); the slicer sits
-    /// midway, which is what makes an off-centre tuning still decode.
-    fmax: f32,
-    fmin: f32,
-    thr: f32,
-    track_fast: f32,
-    track_slow: f32,
+    afc_hz: f32,
 }
 
 #[derive(PartialEq)]
@@ -216,18 +212,16 @@ impl RttyDecoder {
             fs,
             baud,
             shift: 170.0,
-            prev: Complex32::new(0.0, 0.0),
-            // smooth the discriminator over about a third of a bit
-            disc: OnePole::new(fs / baud / 3.0),
             samples_per_bit: fs / baud,
+            tone_phase: 0.0,
+            mark_acc: Complex32::new(0.0, 0.0),
+            space_acc: Complex32::new(0.0, 0.0),
+            mark_peak: 1e-6,
+            space_peak: 1e-6,
             framers: [Framer::new(false), Framer::new(true)],
             polarity: None,
             auto: true,
-            fmax: 0.0,
-            fmin: 0.0,
-            thr: 0.0,
-            track_fast: 1.0 - (-1.0f32 / (0.004 * fs)).exp(),
-            track_slow: 1.0 - (-1.0f32 / (1.5 * fs)).exp(),
+            afc_hz: 0.0,
         }
     }
 
@@ -249,7 +243,6 @@ impl RttyDecoder {
     pub fn set_baud(&mut self, baud: f32) {
         self.baud = baud;
         self.samples_per_bit = self.fs / baud;
-        self.disc = OnePole::new(self.samples_per_bit / 3.0);
     }
 
     pub fn set_shift(&mut self, shift: f32) {
@@ -269,35 +262,24 @@ impl Decoder for RttyDecoder {
 
     fn process(&mut self, samples: &[Complex32]) -> String {
         for &s in samples {
-            // Instantaneous frequency via the phase difference between samples.
-            let d = s * self.prev.conj();
-            self.prev = s;
-            let f = if d.norm() > 1e-12 {
-                d.arg() * self.fs / (2.0 * std::f32::consts::PI)
-            } else {
-                0.0
-            };
-            let f = self.disc.process(f);
-
-            // Follow the tone extremes (fast out, slow back) and slice midway
-            // between them. Only trust the midpoint once the spread looks
-            // like a real FSK pair, so noise alone does not drag it around.
-            if f > self.fmax {
-                self.fmax += (f - self.fmax) * self.track_fast;
-            } else {
-                self.fmax += (f - self.fmax) * self.track_slow;
-            }
-            if f < self.fmin {
-                self.fmin += (f - self.fmin) * self.track_fast;
-            } else {
-                self.fmin += (f - self.fmin) * self.track_slow;
-            }
-            if self.fmax - self.fmin > 0.35 * self.shift {
-                self.thr = 0.5 * (self.fmax + self.fmin);
-            }
+            let (sin, cos) = self.tone_phase.sin_cos();
+            let mark_mix = s * Complex32::new(cos, -sin);
+            let space_mix = s * Complex32::new(cos, sin);
+            let a = (3.0 / self.samples_per_bit).min(1.0);
+            self.mark_acc += (mark_mix - self.mark_acc) * a;
+            self.space_acc += (space_mix - self.space_acc) * a;
+            let em = self.mark_acc.norm_sqr();
+            let es = self.space_acc.norm_sqr();
+            let decay = 1.0 - 1.0 / (self.fs * 1.5);
+            self.mark_peak = (self.mark_peak * decay).max(em);
+            self.space_peak = (self.space_peak * decay).max(es);
+            let f = em / self.mark_peak.max(1e-9) - es / self.space_peak.max(1e-9);
+            let step = 2.0 * std::f32::consts::PI * (self.shift * 0.5 + self.afc_hz) / self.fs;
+            self.tone_phase += step;
+            if self.tone_phase > std::f32::consts::PI { self.tone_phase -= 2.0 * std::f32::consts::PI; }
 
             // Both polarities are framed; only one of them is the station.
-            let (thr, spb) = (self.thr, self.samples_per_bit);
+            let (thr, spb) = (0.0, self.samples_per_bit);
             for fr in self.framers.iter_mut() {
                 fr.feed(f, thr, spb);
             }
@@ -348,8 +330,8 @@ impl Decoder for RttyDecoder {
         } else {
             0.0
         };
-        let off = if self.thr.abs() > 5.0 {
-            format!(" {:+.0}Hz", self.thr)
+        let off = if self.afc_hz.abs() > 5.0 {
+            format!(" {:+.0}Hz", self.afc_hz)
         } else {
             String::new()
         };
@@ -386,9 +368,11 @@ impl Decoder for RttyDecoder {
         if self.auto {
             self.polarity = None;
         }
-        self.fmax = 0.0;
-        self.fmin = 0.0;
-        self.thr = 0.0;
+        self.tone_phase = 0.0;
+        self.mark_acc = Complex32::new(0.0, 0.0);
+        self.space_acc = Complex32::new(0.0, 0.0);
+        self.mark_peak = 1e-6;
+        self.space_peak = 1e-6;
     }
 }
 

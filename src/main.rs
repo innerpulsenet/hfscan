@@ -140,10 +140,21 @@ impl WfRes {
     }
 }
 
-/// Most decoders one span can carry. Each is a tuning chain plus a decoder;
-/// the chains alone measure well under 1% of a core each, but the transcript
-/// stops being readable long before the CPU runs out.
-const MAX_AUTO_SLOTS: usize = 10;
+/// Most narrowband decoders one span can carry.
+///
+/// A slot costs about 0.65% of a core — 6.5 ms per second of IQ, measured flat
+/// from 10 to 40 of them by `bench_slot_cost` — so 24 of them is around 16%,
+/// on top of roughly 20% for the two scouts. The old limit of 10 was set for
+/// transcript readability rather than for CPU, which was the wrong thing to
+/// ration: a busy CW segment holds far more than ten simultaneous QSOs, the
+/// transcript is scrollable and the rows sort themselves, and since these
+/// decoders started feeding pskreporter, one that never gets a slot is a
+/// station nobody hears about.
+///
+/// FT8 and FT4 do not count against this. Their slots are pinned to calling
+/// frequencies, there are only ever a handful in a span, and charging them to
+/// the narrowband budget quietly shrank it on every band that has them.
+const MAX_AUTO_SLOTS: usize = 24;
 /// Drop a narrowband slot whose signal the classifier has not seen for this
 /// long. FT8/FT4 slots are pinned to their calling frequencies instead.
 const AUTO_IDLE: Duration = Duration::from_secs(25);
@@ -1403,7 +1414,7 @@ impl App {
                 s.last_seen = now;
                 continue;
             }
-            if self.auto.len() >= MAX_AUTO_SLOTS {
+            if !pinned && self.auto.iter().filter(|s| !s.pinned).count() >= MAX_AUTO_SLOTS {
                 continue;
             }
             if let Some(slot) = AutoSlot::new(kind, dial, self.center, self.rate, pinned, shift) {
@@ -3829,6 +3840,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             s.sent.to_string(),
             Style::default().fg(Color::Green),
         ));
+        // The per-mode split goes in the activity pane's title, not here.
+        // This line is already full at 80 columns — it clips before the end —
+        // and the health detail below is what has to survive that.
         let mut detail = Vec::new();
         if s.queued > 0 {
             detail.push(format!("{} queued", s.queued));
@@ -3866,11 +3880,25 @@ fn draw_activity(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .filter(|i| i.kind != identify::Kind::Unknown)
         .count();
-    let title = if app.heard.is_empty() {
+    // Spots broken down by mode. It belongs here rather than on the status
+    // line, which is already full at 80 columns: this title has the room, and
+    // it sits next to the chips and the messages it is about. The status line
+    // keeps the running total and the reporter's health.
+    let spots = app
+        .reporter
+        .as_ref()
+        .map(|r| r.stats().by_mode)
+        .filter(|m| !m.is_empty())
+        .map(|m| {
+            let per: Vec<String> = m.iter().map(|(mode, n)| format!("{mode} {n}")).collect();
+            format!("  ·  spots {}", per.join(" "))
+        })
+        .unwrap_or_default();
+    let title = if app.heard.is_empty() && spots.is_empty() {
         " activity ".to_string()
     } else {
         format!(
-            " activity  {} heard{} ",
+            " activity  {} heard{}{spots} ",
             app.heard.len(),
             if live_n > 0 {
                 format!(" · {live_n} live")
@@ -5738,6 +5766,10 @@ mod tests {
 
     /// A crowded band must not spawn decoders without limit, and the slots
     /// it does spend should go to the strongest signals.
+    ///
+    /// The cap counts narrowband decoders only. FT8 and FT4 are pinned to
+    /// calling frequencies whether or not anyone is on them, so charging them
+    /// to this budget shrank it on exactly the bands that are busiest.
     #[test]
     fn auto_caps_slots_and_prefers_strong_signals() {
         let mut app = App::new(7_100_000.0, 192_000.0, Mode::Auto);
@@ -5745,10 +5777,19 @@ mod tests {
             .map(|i| ident(identify::Kind::Cw, -80_000.0 + i as f32 * 4000.0, i as f32))
             .collect();
         app.reconcile_auto();
+        let narrow = app.auto.iter().filter(|s| !s.pinned).count();
         assert!(
-            app.auto.len() <= MAX_AUTO_SLOTS,
-            "spawned {} decoders, cap is {MAX_AUTO_SLOTS}",
-            app.auto.len()
+            narrow <= MAX_AUTO_SLOTS,
+            "spawned {narrow} narrowband decoders, cap is {MAX_AUTO_SLOTS}"
+        );
+        assert_eq!(
+            narrow, MAX_AUTO_SLOTS,
+            "40 strong signals should fill the narrowband budget"
+        );
+        assert!(
+            app.auto.iter().any(|s| s.pinned),
+            "the FT calling frequencies in this span must still be pinned, \
+             and must not have been squeezed out by the narrowband fleet"
         );
         // The strongest ident was the last one (snr 39), so it must have a slot.
         let strongest = 7_100_000.0 + (-80_000.0 + 39.0 * 4000.0);
@@ -6056,6 +6097,35 @@ mod tests {
             assert!(
                 text.contains("AGC: soft"),
                 "message lost behind the chips at {w}x{h}:\n{text}"
+            );
+        }
+    }
+
+    /// Spots broken down by mode, so a span carrying four decoders shows
+    /// which of them are actually producing. The status line has the running
+    /// total but no room for this — it already clips at 80 columns.
+    #[test]
+    fn the_activity_title_shows_spots_per_mode() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
+        app.reporter = Some(super::report::Reporter::with_tallies(&[
+            ("FT8", 30),
+            ("CW", 8),
+            ("PSK31", 4),
+        ]));
+        for w in [80u16, 120] {
+            let mut t = Terminal::new(TestBackend::new(w, 30)).unwrap();
+            t.draw(|f| super::draw(f, &app)).unwrap();
+            let buf = t.backend().buffer();
+            let title: String = (0..buf.area.width)
+                .map(|x| buf[(x, buf.area.height - 4)].symbol().chars().next().unwrap_or(' '))
+                .collect();
+            // Ordered by count, so the mode carrying the traffic reads first.
+            assert!(
+                title.contains("spots FT8 30 CW 8 PSK31 4"),
+                "per-mode spots missing from the activity title at {w} cols: {title:?}"
             );
         }
     }
@@ -7323,5 +7393,80 @@ mod band_plan_tests {
             "30 m PSK31 produced no copy; idents were {:?}",
             app.idents.iter().map(|i| i.kind.label()).collect::<Vec<_>>()
         );
+    }
+}
+
+#[cfg(test)]
+mod slot_cost {
+    use super::*;
+
+    /// What one auto slot costs per second of IQ, so `MAX_AUTO_SLOTS` is set
+    /// against a measurement rather than a guess.
+    #[test]
+    #[ignore]
+    fn bench_slot_cost() {
+        let fs = 192_000.0f64;
+        let mut rng = 0x2545_F491u32;
+        let mut noise = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            (rng as f32 / u32::MAX as f32) - 0.5
+        };
+        let secs = 4.0;
+        let n = (fs * secs) as usize;
+        // A busy CW band: keyed carriers every 800 Hz across the segment.
+        let mut iq: Vec<Complex32> = (0..n)
+            .map(|_| Complex32::new(noise(), noise()) * 0.05)
+            .collect();
+        for k in 0..40 {
+            let off = -16_000.0 + k as f64 * 800.0;
+            for (i, s) in iq.iter_mut().enumerate() {
+                let keyed = ((i as f64 / fs * 12.0) as u32) % 2 == 0;
+                if keyed {
+                    let ph = 2.0 * std::f64::consts::PI * off * i as f64 / fs;
+                    *s += Complex32::from_polar(0.35, ph as f32);
+                }
+            }
+        }
+
+        for slots in [10usize, 20, 30, 40] {
+            let mut app = App::new(14_030_000.0, fs, Mode::Auto);
+            app.agc = AgcMode::Off;
+            app.idents = (0..slots)
+                .map(|k| identify::Ident {
+                    offset_hz: -16_000.0 + k as f32 * 800.0,
+                    bw_hz: 100.0,
+                    snr_db: 20.0 - k as f32 * 0.1,
+                    kind: identify::Kind::Cw,
+                    score: 0.9,
+                    shift_hz: None,
+                })
+                .collect();
+            // Built directly, so the cap under test is not the thing
+            // limiting the measurement.
+            for k in 0..slots {
+                let dial = 14_030_000.0 - 16_000.0 + k as f64 * 800.0;
+                if let Some(sl) = AutoSlot::new(
+                    identify::Kind::Cw, dial, app.center, app.rate, false, None,
+                ) {
+                    app.auto.push(sl);
+                }
+            }
+            let built = app.auto.len();
+            let mut spec = Spectrum::new(4096);
+            let mut out = Vec::new();
+            let t = std::time::Instant::now();
+            for block in iq.chunks(16_384) {
+                app.feed(block, &mut spec, &mut out);
+            }
+            let el = t.elapsed().as_secs_f64();
+            println!(
+                "  {built:2} slots: {:6.0} ms for {secs:.0} s of IQ  ({:5.1}% of real time, {:4.1} ms/slot/s)",
+                el * 1000.0,
+                100.0 * el / secs,
+                el * 1000.0 / secs / built.max(1) as f64
+            );
+        }
     }
 }

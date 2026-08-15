@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::net::{ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEST: &str = "report.pskreporter.info:4739";
@@ -297,6 +297,7 @@ pub struct Reporter {
     last_send: Arc<AtomicU64>,
     /// Decodes recognised but already reported this hour.
     suppressed: Arc<AtomicUsize>,
+    by_mode: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 /// What the status line needs to tell "working, nothing new to say" apart
@@ -307,6 +308,10 @@ pub struct ReportStats {
     pub suppressed: usize,
     /// Seconds since the last successful send, or `None` if none yet.
     pub since_send: Option<u64>,
+    /// Spots sent per mode, most first. A single total says the reporter is
+    /// alive; this says which decoders are actually earning their slot, which
+    /// is the question worth asking when several modes share a span.
+    pub by_mode: Vec<(String, usize)>,
 }
 
 impl Reporter {
@@ -317,6 +322,7 @@ impl Reporter {
             queued: Arc::new(AtomicUsize::new(0)),
             last_send: Arc::new(AtomicU64::new(0)),
             suppressed: Arc::new(AtomicUsize::new(0)),
+            by_mode: Arc::new(Mutex::new(HashMap::new())),
         };
         let thread_counts = counts.clone();
         let call = my_call.clone();
@@ -328,6 +334,7 @@ impl Reporter {
             queued: counts.queued,
             last_send: counts.last_send,
             suppressed: counts.suppressed,
+            by_mode: counts.by_mode,
         }
     }
 
@@ -337,11 +344,38 @@ impl Reporter {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // Poisoning only means the reporter thread panicked mid-update; the
+        // tallies are a display nicety, so show what is there rather than
+        // taking the UI down with it.
+        let mut by_mode: Vec<(String, usize)> = self
+            .by_mode
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default();
+        by_mode.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         ReportStats {
             sent: self.sent.load(Ordering::Relaxed),
             queued: self.queued.load(Ordering::Relaxed),
             suppressed: self.suppressed.load(Ordering::Relaxed),
             since_send: (last > 0).then(|| now.saturating_sub(last)),
+            by_mode,
+        }
+    }
+
+    /// A reporter with known tallies and no thread behind it, so the panes
+    /// that display them can be rendered in a test.
+    #[cfg(test)]
+    pub fn with_tallies(by_mode: &[(&str, usize)]) -> Reporter {
+        Reporter {
+            tx: sync_channel::<Spot>(1).0,
+            my_call: "K1ABC".into(),
+            sent: Arc::new(AtomicUsize::new(by_mode.iter().map(|(_, n)| n).sum())),
+            queued: Arc::new(AtomicUsize::new(0)),
+            last_send: Arc::new(AtomicU64::new(0)),
+            suppressed: Arc::new(AtomicUsize::new(0)),
+            by_mode: Arc::new(Mutex::new(
+                by_mode.iter().map(|(m, n)| (m.to_string(), *n)).collect(),
+            )),
         }
     }
 
@@ -375,6 +409,20 @@ struct Counters {
     queued: Arc<AtomicUsize>,
     last_send: Arc<AtomicU64>,
     suppressed: Arc<AtomicUsize>,
+    /// Per-mode tallies. A mutex rather than more atomics because the set of
+    /// modes is not known up front, and it is touched once per datagram.
+    by_mode: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+/// Fold a sent batch into the per-mode tallies. A poisoned lock means the
+/// reporter thread died mid-update; the tallies are a display nicety, so
+/// losing one batch of them is better than taking the reporter down.
+fn tally(counts: &Counters, batch: &[Spot]) {
+    if let Ok(mut m) = counts.by_mode.lock() {
+        for s in batch {
+            *m.entry(s.mode.clone()).or_insert(0) += 1;
+        }
+    }
 }
 
 /// Tiny xorshift for the send-time jitter; avoids pulling in a rand crate.
@@ -449,6 +497,7 @@ fn run(
                     }
                     counts.sent.fetch_add(chunk.len(), Ordering::Relaxed);
                     counts.last_send.store(now as u64, Ordering::Relaxed);
+                    tally(&counts, &chunk);
                     // Say what was held back too: a run of "0 new" is the
                     // difference between a quiet band and a broken reporter.
                     let dup = std::mem::take(&mut q.suppressed);
@@ -585,6 +634,55 @@ mod tests {
             "first digit must belong to the version, got {SOFTWARE:?}"
         );
         assert!(SOFTWARE.starts_with("HFScan v"), "got {SOFTWARE:?}");
+    }
+
+    /// A per-mode tally answers the question a single total cannot: with four
+    /// decoders sharing a span, is each of them actually producing spots?
+    #[test]
+    fn spots_are_tallied_per_mode() {
+        let counts = Counters {
+            sent: Arc::new(AtomicUsize::new(0)),
+            queued: Arc::new(AtomicUsize::new(0)),
+            last_send: Arc::new(AtomicU64::new(0)),
+            suppressed: Arc::new(AtomicUsize::new(0)),
+            by_mode: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let mk = |call: &str, mode: &str| Spot {
+            call: call.into(),
+            grid: None,
+            freq_hz: 14_074_000,
+            snr_db: -5,
+            mode: mode.into(),
+            time: 1_000_000,
+        };
+        let batch = vec![
+            mk("K1ABC", "FT8"),
+            mk("W9XYZ", "FT8"),
+            mk("G4XYZ", "CW"),
+            mk("JA1ABC", "FT8"),
+            mk("VE3ABC", "RTTY"),
+        ];
+        tally(&counts, &batch);
+
+        let r = Reporter {
+            tx: sync_channel::<Spot>(1).0,
+            my_call: "K1ABC".into(),
+            sent: counts.sent.clone(),
+            queued: counts.queued.clone(),
+            last_send: counts.last_send.clone(),
+            suppressed: counts.suppressed.clone(),
+            by_mode: counts.by_mode.clone(),
+        };
+        // Ordered by count, so the mode carrying the traffic reads first, and
+        // ties broken by name so the display does not shuffle between frames.
+        assert_eq!(
+            r.stats().by_mode,
+            vec![
+                ("FT8".to_string(), 3),
+                ("CW".to_string(), 1),
+                ("RTTY".to_string(), 1),
+            ]
+        );
     }
 
     /// The reason a working reporter looks stalled: everything audible has

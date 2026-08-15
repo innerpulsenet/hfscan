@@ -162,9 +162,20 @@ busy band they arrive fast enough to bury every message worth reading. Messages
 are short and arrive in bursts, so as many as fit are shown, newest first and
 leftmost, the older ones dimmed; only the newest is ever truncated. Wheel over
 the strip to page back through earlier messages; an `↑n` marks how far back you
-are. Band scan (`s`) prints
+are. When spotting is on, the strip's title also breaks the spots down by mode
+— `spots FT8 132 CW 41 PSK31 7` — which the running total on the status line
+cannot tell you: with four decoders sharing a span, it is worth knowing that
+three of them have never produced anything. Band scan (`s`) prints
 the same tags next to each hit. Park the cursor on a chip and press `d`
 to copy it.
+
+In auto mode every classified signal gets its own decoder, up to 24 narrowband
+ones at a time, spent strongest-first when the band offers more than that. FT8
+and FT4 do not count against the limit — their slots are pinned to the calling
+frequencies whether or not anyone is on them. A slot costs about 0.65% of a
+core (`bench_slot_cost`), so the limit is set by how much of a busy CW segment
+is worth carrying rather than by CPU; a signal that never gets a slot is a
+station nobody hears about.
 
 The order the tests run in matters as much as the tests themselves, because
 the first one to confirm wins. FSK goes first: a signal alternating between

@@ -83,6 +83,31 @@ pub struct Radio {
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
+impl Radio {
+    /// A handle with no device behind it, so the parts of the app that take a
+    /// `&Radio` only to send it commands can be exercised in a test.
+    #[cfg(test)]
+    pub fn for_test() -> (Radio, Receiver<Cmd>) {
+        let (cmd, cmd_rx) = std::sync::mpsc::channel();
+        Radio::detached(cmd, 192_000.0).map(|r| (r, cmd_rx)).unwrap()
+    }
+
+    #[cfg(test)]
+    fn detached(cmd: Sender<Cmd>, rate: f64) -> Option<Radio> {
+        let (_, iq) = sync_channel(1);
+        let (_, log) = sync_channel(1);
+        let (_, events) = sync_channel(1);
+        Some(Radio {
+            cmd,
+            iq,
+            log,
+            events,
+            rate,
+            worker: None,
+        })
+    }
+}
+
 impl Drop for Radio {
     fn drop(&mut self) {
         let _ = self.cmd.send(Cmd::Quit);

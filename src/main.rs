@@ -932,6 +932,11 @@ impl App {
         // Each mode wants its own audio rate, so the chain is rebuilt.
         self.chain = DecodeChain::new(self.rate, 3000.0, mode.audio_rate());
         self.decoder = mode.make(self.chain.fs_out());
+        // The passband the reading is taken over is the mode's, so the old
+        // number does not describe the new mode.
+        // The passband the reading is taken over is the mode's, so the old
+        // number does not describe the new mode.
+        self.cursor_snr = 0.0;
         // Auto rebuilds its fleet from the next classify pass.
         self.auto.clear();
         self.soft_agc = SoftAgc::new(mode.audio_rate());
@@ -1670,33 +1675,41 @@ impl App {
             self.ident_at = Instant::now();
         }
 
-        // Signal-to-noise inside the decoder's passband, used for the squelch
-        // and the status line. Once PSK31 is locked, measure a tight window
-        // on the carrier rather than the whole search band.
-        if let Some(d) = &self.decoder {
-            let n = self.detect_spec.len();
-            if n > 0 {
-                let bin_hz = self.rate / n as f64;
-                let (centre_hz, half_hz) = if matches!(self.mode, Mode::Psk31 | Mode::Cw)
-                    && d.locked()
-                {
-                    (self.cursor + d.lock_hz() as f64, 40.0)
-                } else {
-                    (self.cursor, self.rx_bandwidth() as f64 / 2.0)
-                };
-                let half = (half_hz / bin_hz).ceil().max(1.0) as isize;
-                let centre = (n as f64 / 2.0 + centre_hz / bin_hz) as isize;
-                let lo = (centre - half).clamp(0, n as isize - 1) as usize;
-                let hi = (centre + half).clamp(0, n as isize - 1) as usize;
-                let peak = self.detect_spec[lo..=hi.max(lo)]
-                    .iter()
-                    .cloned()
-                    .fold(f32::MIN, f32::max);
-                let floor = self.noise_floor.get(lo..=hi.max(lo))
-                    .and_then(|v| v.iter().copied().reduce(f32::max))
-                    .unwrap_or(sorted[sorted.len() / 2]);
-                self.cursor_snr = peak - floor;
-            }
+        // Signal-to-noise in the cursor's passband, for the squelch and the
+        // status line. Once PSK31 or CW is locked, measure a tight window on
+        // the carrier rather than the whole search band.
+        //
+        // This used to sit behind `if let Some(d) = &self.decoder`, which is
+        // `None` in both AUTO and OFF — so in the mode the app is mostly used
+        // in, the reading never updated. It held whatever it last computed in
+        // a single-decoder mode, through retunes and band changes, which is a
+        // stale number presented as a live one.
+        let n = self.detect_spec.len();
+        if n > 0 {
+            let lock = self
+                .decoder
+                .as_ref()
+                .filter(|d| matches!(self.mode, Mode::Psk31 | Mode::Cw) && d.locked())
+                .map(|d| d.lock_hz());
+            let (centre_hz, half_hz) = match lock {
+                Some(hz) => (self.cursor + hz as f64, 40.0),
+                None => (self.cursor, self.rx_bandwidth() as f64 / 2.0),
+            };
+            let bin_hz = self.rate / n as f64;
+            let half = (half_hz / bin_hz).ceil().max(1.0) as isize;
+            let centre = (n as f64 / 2.0 + centre_hz / bin_hz) as isize;
+            let lo = (centre - half).clamp(0, n as isize - 1) as usize;
+            let hi = (centre + half).clamp(0, n as isize - 1) as usize;
+            let peak = self.detect_spec[lo..=hi.max(lo)]
+                .iter()
+                .cloned()
+                .fold(f32::MIN, f32::max);
+            let floor = self
+                .noise_floor
+                .get(lo..=hi.max(lo))
+                .and_then(|v| v.iter().copied().reduce(f32::max))
+                .unwrap_or(sorted[sorted.len() / 2]);
+            self.cursor_snr = peak - floor;
         }
 
         if self.agc == AgcMode::Soft {
@@ -3135,6 +3148,11 @@ fn retune(app: &mut App, radio: &radio::Radio, freq: f64) {
     app.wf_accum.clear();
     app.floor_db = -90.0;
     app.ceil_db = -20.0;
+    // A reading from the last frequency is worse than no reading: it looks
+    // live and is not. Zero until the next block measures the new one.
+    // A reading from the last frequency is worse than no reading: it looks
+    // live and is not. Zero until the next block measures the new one.
+    app.cursor_snr = 0.0;
     app.psk_hits.clear();
     app.cw_hits.clear();
     app.idents.clear();
@@ -6496,6 +6514,70 @@ mod tests {
             changed.contains("bias-T (external preamp power)              on"),
             "bias-T did not update:\n{changed}"
         );
+    }
+
+    /// The cursor SNR has to be recomputed in the mode the app is mostly used
+    /// in. It used to sit behind `if let Some(d) = &self.decoder`, which is
+    /// `None` in both AUTO and OFF — so it froze at whatever a single-decoder
+    /// mode last measured and held that through retunes and band changes,
+    /// presenting a stale number as a live one.
+    #[test]
+    fn cursor_snr_is_measured_in_auto_and_off() {
+        let fs = 192_000.0f64;
+        let mut rng = 0x1234_9876u32;
+        let n = (fs * 1.5) as usize;
+        let iq: Vec<Complex32> = (0..n)
+            .map(|i| {
+                let ph = 2.0 * std::f32::consts::PI * 3_000.0 * i as f32 / fs as f32;
+                Complex32::from_polar(0.3, ph)
+                    + Complex32::new(
+                        super::dsp::frontend_tests::noise(&mut rng),
+                        super::dsp::frontend_tests::noise(&mut rng),
+                    ) * 0.02
+            })
+            .collect();
+
+        for mode in [Mode::Auto, Mode::Off] {
+            let mut app = App::new(14_060_000.0, fs, mode);
+            app.agc = super::AgcMode::Off;
+            app.cursor = 3_000.0;
+            assert!(
+                app.decoder.is_none(),
+                "{mode:?} has no single decoder — that is the premise here"
+            );
+            // The value the user actually saw stuck on screen.
+            app.cursor_snr = 86.0;
+
+            let mut spec = super::Spectrum::new(4096);
+            let mut out = Vec::new();
+            for block in iq.chunks(16_384) {
+                app.feed(block, &mut spec, &mut out);
+            }
+            assert_ne!(
+                app.cursor_snr, 86.0,
+                "{mode:?} never recomputed the cursor SNR"
+            );
+            assert!(
+                app.cursor_snr.is_finite() && (-10.0..=120.0).contains(&app.cursor_snr),
+                "{mode:?} produced an implausible SNR: {}",
+                app.cursor_snr
+            );
+        }
+    }
+
+    /// ...and a reading from the last frequency must not survive the move to
+    /// a new one, which is how a stale value looked live across band changes.
+    #[test]
+    fn cursor_snr_does_not_survive_a_retune() {
+        let mut app = App::new(14_060_000.0, 192_000.0, Mode::Auto);
+        app.cursor_snr = 86.0;
+        app.set_mode(Mode::Cw);
+        assert_eq!(app.cursor_snr, 0.0, "a mode change kept the old reading");
+
+        app.cursor_snr = 86.0;
+        let (radio, _rx) = super::radio::Radio::for_test();
+        super::retune(&mut app, &radio, 21_060_000.0);
+        assert_eq!(app.cursor_snr, 0.0, "a retune kept the old reading");
     }
 
     /// A slot spent on an SSB signal is a slot not spent on a decodable one.

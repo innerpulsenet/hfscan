@@ -548,17 +548,27 @@ fn set_bandwidth(
     cover_hz: f64,
     log_tx: &SyncSender<String>,
 ) -> Result<()> {
-    let mut options: Vec<f64> = dev
-        .bandwidth_range(Rx, 0)
-        .unwrap_or_default()
+    // Drivers report discrete filter widths as degenerate ranges, one per
+    // width. A driver that instead reports one continuous range must not be
+    // read as "two choices, 200 kHz or 8 MHz" — picking an endpoint there
+    // would be far worse than the rounding this is meant to fix, so a
+    // continuous range is honoured by asking for what is actually wanted.
+    let ranges = dev.bandwidth_range(Rx, 0).unwrap_or_default();
+    let continuous = ranges
         .iter()
-        .flat_map(|r| [r.minimum, r.maximum])
-        .filter(|v| *v > 0.0)
-        .collect();
-    options.sort_by(f64::total_cmp);
-    options.dedup();
-
-    let want = choose_bandwidth(&options, rate, cover_hz);
+        .find(|r| r.maximum > r.minimum + r.minimum.abs().max(1.0) * 1e-6);
+    let want = if let Some(r) = continuous {
+        cover_hz.max(r.minimum).min(rate.min(r.maximum))
+    } else {
+        let mut options: Vec<f64> = ranges
+            .iter()
+            .map(|r| r.maximum)
+            .filter(|v| *v > 0.0)
+            .collect();
+        options.sort_by(f64::total_cmp);
+        options.dedup();
+        choose_bandwidth(&options, rate, cover_hz)
+    };
 
     dev.set_bandwidth(Rx, 0, want)?;
     let actual = dev.bandwidth(Rx, 0).unwrap_or(want);

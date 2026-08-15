@@ -22,7 +22,7 @@ Options:
 | flag | default | meaning |
 | --- | --- | --- |
 | `--freq` | 14070000 | starting centre frequency, Hz |
-| `--rate` | 192000 | sample rate, and therefore the width of the spectrum view |
+| `--rate` | per band | sample rate, and therefore the width of the spectrum view; band presets set their own |
 | `--low-if` | off | request the SDRplay 250 kS/s low-IF acquisition path (not used for FT modes) |
 | `--ppm` | 0 | receiver frequency correction in parts per million |
 | `--mode` | off | start with a decoder running: `off`, `cw`, `rtty`, `psk31`, `ft8`, `ft4` |
@@ -31,9 +31,34 @@ Options:
 | `--call` | — | your callsign, for pskreporter spotting |
 | `--grid` | — | your Maidenhead grid locator, for pskreporter spotting |
 
-The RSP1A also supports 62500, 96000, 125000, 250000, 384000, 500000 and
-1000000. FT8/FT4 need a rate that divides evenly by 12 kHz, so selecting them
-switches the radio to 192 kHz automatically if the current rate will not do.
+### Band spans
+
+Each band preset carries its own sample rate, chosen so the whole allocation
+fits in one view — 30 m is 50 kHz wide and 6 m is 4 MHz, and a fixed span
+either wastes the converter on empty spectrum or shows a slice of the band and
+calls it the band. `b` / `B` set it along with the frequency.
+
+| band | span | | band | span |
+| --- | --- | --- | --- | --- |
+| 160m | 240 kHz | | 15m | 528 kHz |
+| 80m | 600 kHz | | 12m | 192 kHz |
+| 60m | 192 kHz | | 10m | 1.92 MHz |
+| 40m | 360 kHz | | 6m | 4.32 MHz |
+| 30m | 192 kHz | | 2m | 4.32 MHz |
+| 20m | 432 kHz | | 17m | 192 kHz |
+
+Two constraints set those numbers. Nothing exceeds **6 MS/s**: the RSP1A's
+converter holds 14 bits to about there and drops to 12, 10 and 8 as the rate
+climbs toward 10.66, so a wider view past that point is bought with dynamic
+range — the wrong trade for a receiver whose job is weak signals. And every
+span is a multiple of **24 kHz**, the lowest common multiple of the 8 kHz and
+12 kHz audio clocks, so FT8 and FT4 keep an exact divisor and stay usable at
+full-band width instead of forcing a retune down to 192 kHz.
+
+`--rate` still overrides for a single run. The narrowband scouts walk their
+whole buffer once per candidate, so their cost tracks the sample rate; above
+2 MS/s the rescan interval stretches in proportion, holding their share of a
+core flat rather than letting a wide span starve the waterfall.
 
 ## Keys
 
@@ -111,6 +136,12 @@ The spectrum is a Welch periodogram (50 % hop) with a binomial frequency
 smooth that keeps carriers sharp, then a slow time average. `e` cycles
 light / medium / heavy. The colour scale tracks the noise floor slowly so
 it does not flicker.
+
+`e` is a display control only. The classifier, both narrowband scouts, the band
+scanner and the cursor SNR read a separate copy of the spectrum at fixed
+smoothing — otherwise a cosmetic preference becomes a detection parameter,
+since "heavy" broadens every peak, merges CW signals sitting close together,
+and slows the response to a station coming up.
 
 AGC defaults to a *hang* loop on the decoder path: it ducks quickly when
 the audio is hot, holds for ~0.8 s, then creeps gain back only if the

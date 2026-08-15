@@ -1211,6 +1211,20 @@ impl App {
         self.note_scroll = 0;
     }
 
+    /// How often the narrowband scouts may run.
+    ///
+    /// They walk the whole scout buffer once per candidate peak, so their cost
+    /// climbs with the sample rate: measured at 14% of an 800 ms budget at
+    /// 192 kS/s, 43% at 1.2 MS/s and 70% at 2 MS/s by `bench_scout_cost_vs_rate`.
+    /// Full-band spans go to 4.32 MS/s, where a fixed 800 ms would put them
+    /// over budget and the waterfall would stutter. Stretching the interval in
+    /// proportion holds their share of a core roughly constant instead — a
+    /// wide band is rescanned less often, which is the right thing to give up.
+    fn scout_interval(&self) -> Duration {
+        let scale = (self.rate / 2_000_000.0).max(1.0);
+        Duration::from_millis((800.0 * scale) as u64)
+    }
+
     fn tuned_freq(&self) -> f64 {
         self.center + self.cursor
     }
@@ -1598,7 +1612,7 @@ impl App {
             let drain = self.scout_iq.len() - max;
             self.scout_iq.drain(..drain);
         }
-        if self.scout_at.elapsed() >= Duration::from_millis(800) {
+        if self.scout_at.elapsed() >= self.scout_interval() {
             match self.mode {
                 Mode::Psk31 => refresh_psk_hits(self),
                 Mode::Cw => refresh_cw_hits(self),
@@ -2028,15 +2042,11 @@ fn run_app<B: Backend>(
                     }
                     KeyCode::Char('b') => {
                         app.band_idx = (app.band_idx + 1) % bands::BANDS.len();
-                        let f = bands::BANDS[app.band_idx].default;
-                        app.cursor = 0.0;
-                        retune(app, radio, f);
+                        go_to_band(app, radio);
                     }
                     KeyCode::Char('B') => {
                         app.band_idx = (app.band_idx + bands::BANDS.len() - 1) % bands::BANDS.len();
-                        let f = bands::BANDS[app.band_idx].default;
-                        app.cursor = 0.0;
-                        retune(app, radio, f);
+                        go_to_band(app, radio);
                     }
                     KeyCode::Char('d') => {
                         let next = app.mode.next();
@@ -2669,6 +2679,24 @@ fn cycle_rf_notch(app: &mut App, radio: &radio::Radio) {
         ));
     }
     let _ = radio.cmd.send(radio::Cmd::RfNotch(app.rf_notch));
+}
+
+/// Jump to `app.band_idx`: its centre, and the span that shows the whole of it.
+///
+/// The rate moves with the band because the bands are not the same width — 30 m
+/// is 50 kHz and 6 m is 4 MHz, and a fixed span either wastes the converter on
+/// empty spectrum or shows a slice of the band and calls it the band. Changing
+/// rate restarts the stream and clears the spectrum history, so it is only done
+/// when the band actually asks for a different one.
+fn go_to_band(app: &mut App, radio: &radio::Radio) {
+    let band = &bands::BANDS[app.band_idx];
+    let (freq, span) = (band.default, band.span);
+    app.cursor = 0.0;
+    if (app.rate - span).abs() >= 1.0 {
+        set_radio_rate(app, radio, span);
+        app.log(format!("span {:.0} kHz — {} end to end", span / 1000.0, band.name));
+    }
+    retune(app, radio, freq);
 }
 
 fn set_radio_rate(app: &mut App, radio: &radio::Radio, rate: f64) {
@@ -6130,6 +6158,52 @@ mod tests {
                 "message lost behind the chips at {w}x{h}:\n{text}"
             );
         }
+    }
+
+    /// A band jump has to land on a span that shows the whole band, at a rate
+    /// the converter still gives full resolution at.
+    #[test]
+    fn band_spans_cover_their_bands_within_the_converter_limit() {
+        for b in super::bands::BANDS {
+            if b.name == "WWV" {
+                continue;
+            }
+            let app = App::new(b.default, b.span, Mode::Auto);
+            // view_range is relative to the centre.
+            let (lo, hi) = app.view_range();
+            let (lo, hi) = (app.center + lo, app.center + hi);
+            assert!(
+                lo <= b.start && hi >= b.end,
+                "{}: view {:.3}-{:.3} MHz misses part of {:.3}-{:.3}",
+                b.name, lo / 1e6, hi / 1e6, b.start / 1e6, b.end / 1e6
+            );
+            // FT modes must not be forced off a full-band span.
+            assert!(
+                super::rate_ok_for_ft(b.span),
+                "{} span {:.0} Hz would kick FT8/FT4 back to 192 kS/s",
+                b.name, b.span
+            );
+        }
+    }
+
+    /// The scouts walk the whole buffer per candidate, so their cost tracks
+    /// the rate. Their share of a core has to stay put as the span widens or
+    /// a full-band view starves the waterfall.
+    #[test]
+    fn scout_interval_holds_its_share_as_the_span_widens() {
+        let at = |rate: f64| App::new(14_060_000.0, rate, Mode::Auto).scout_interval();
+        assert_eq!(at(192_000.0), at(2_000_000.0), "narrow spans keep the base interval");
+        let wide = at(4_320_000.0);
+        assert!(
+            wide > at(2_000_000.0),
+            "a 4.32 MS/s span must not be rescanned as often as a 2 MS/s one"
+        );
+        // Proportional, so cost per unit time is flat rather than merely lower.
+        let ratio = wide.as_secs_f64() / at(2_000_000.0).as_secs_f64();
+        assert!(
+            (ratio - 2.16).abs() < 0.05,
+            "interval scaled by {ratio:.2}, expected to track the rate"
+        );
     }
 
     /// How the operator likes the waterfall to look must not change what the

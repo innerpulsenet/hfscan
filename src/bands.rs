@@ -15,11 +15,11 @@ pub struct Band {
     /// that. Parking on the dial frequency put exactly that region on the
     /// bottom of the sub-band people work.
     ///
-    /// Bands whose `span` covers the whole allocation are centred on it, which
-    /// puts the LO in the middle of the phone segment and well clear of every
-    /// marker. The four narrow ones already fit inside the 192 kHz default, so
-    /// they sit ~10 kHz below their digital segment instead: the whole segment
-    /// then lands at a clean positive offset.
+    /// Every band is centred on its allocation. That keeps the band edges an
+    /// equal distance from Nyquist — where the analog filter corner lives, and
+    /// where the waterfall shows the view falling away — and as it happens it
+    /// also puts the LO in the phone segment, at least 10 kHz from the nearest
+    /// calling frequency on every band here.
     pub default: f64,
     /// Sample rate to run at on this band, which is also the width of the
     /// spectrum view — chosen so the whole allocation fits in one span.
@@ -45,18 +45,18 @@ pub struct Band {
 pub const DEFAULT_BAND: usize = 5; // 20m
 
 pub const BANDS: &[Band] = &[
-    Band { name: "160m", start: 1_800_000.0,   end: 2_000_000.0,   default: 1_900_000.0,   span: 240_000.0 },
-    Band { name: "80m",  start: 3_500_000.0,   end: 4_000_000.0,   default: 3_750_000.0,   span: 600_000.0 },
-    Band { name: "60m",  start: 5_330_000.0,   end: 5_405_000.0,   default: 5_347_000.0,   span: 192_000.0 },
-    Band { name: "40m",  start: 7_000_000.0,   end: 7_300_000.0,   default: 7_150_000.0,   span: 360_000.0 },
-    Band { name: "30m",  start: 10_100_000.0,  end: 10_150_000.0,  default: 10_126_000.0,  span: 192_000.0 },
-    Band { name: "20m",  start: 14_000_000.0,  end: 14_350_000.0,  default: 14_175_000.0,  span: 432_000.0 },
-    Band { name: "17m",  start: 18_068_000.0,  end: 18_168_000.0,  default: 18_090_000.0,  span: 192_000.0 },
-    Band { name: "15m",  start: 21_000_000.0,  end: 21_450_000.0,  default: 21_225_000.0,  span: 528_000.0 },
-    Band { name: "12m",  start: 24_890_000.0,  end: 24_990_000.0,  default: 24_905_000.0,  span: 192_000.0 },
-    Band { name: "10m",  start: 28_000_000.0,  end: 29_700_000.0,  default: 28_850_000.0,  span: 1_920_000.0 },
-    Band { name: "6m",   start: 50_000_000.0,  end: 54_000_000.0,  default: 52_000_000.0,  span: 4_320_000.0 },
-    Band { name: "2m",   start: 144_000_000.0, end: 148_000_000.0, default: 146_000_000.0, span: 4_320_000.0 },
+    Band { name: "160m", start: 1_800_000.0,   end: 2_000_000.0,   default: 1_900_000.0,   span: 264_000.0 },
+    Band { name: "80m",  start: 3_500_000.0,   end: 4_000_000.0,   default: 3_750_000.0,   span: 648_000.0 },
+    Band { name: "60m",  start: 5_330_000.0,   end: 5_405_000.0,   default: 5_367_500.0,   span: 192_000.0 },
+    Band { name: "40m",  start: 7_000_000.0,   end: 7_300_000.0,   default: 7_150_000.0,   span: 384_000.0 },
+    Band { name: "30m",  start: 10_100_000.0,  end: 10_150_000.0,  default: 10_125_000.0,  span: 192_000.0 },
+    Band { name: "20m",  start: 14_000_000.0,  end: 14_350_000.0,  default: 14_175_000.0,  span: 456_000.0 },
+    Band { name: "17m",  start: 18_068_000.0,  end: 18_168_000.0,  default: 18_118_000.0,  span: 192_000.0 },
+    Band { name: "15m",  start: 21_000_000.0,  end: 21_450_000.0,  default: 21_225_000.0,  span: 576_000.0 },
+    Band { name: "12m",  start: 24_890_000.0,  end: 24_990_000.0,  default: 24_940_000.0,  span: 192_000.0 },
+    Band { name: "10m",  start: 28_000_000.0,  end: 29_700_000.0,  default: 28_850_000.0,  span: 2_136_000.0 },
+    Band { name: "6m",   start: 50_000_000.0,  end: 54_000_000.0,  default: 52_000_000.0,  span: 5_016_000.0 },
+    Band { name: "2m",   start: 144_000_000.0, end: 148_000_000.0, default: 146_000_000.0, span: 5_016_000.0 },
     Band { name: "WWV",  start: 4_990_000.0,   end: 15_010_000.0,  default: 10_000_000.0,  span: 192_000.0 },
 ];
 
@@ -248,6 +248,27 @@ mod tests {
     fn no_span_exceeds_the_converters_full_resolution_rate() {
         for b in BANDS {
             assert!(b.span <= 6_000_000.0, "{} asks for {:.1} MS/s", b.name, b.span / 1e6);
+        }
+    }
+
+    /// The band edges must not sit up against Nyquist, where the tuner's
+    /// analog filter corner lives. This is the margin the waterfall shows as
+    /// the edges of the view falling away, and with a span sized to a band
+    /// those edges are the band edges.
+    #[test]
+    fn every_band_has_room_between_its_edges_and_nyquist() {
+        for b in BANDS {
+            if b.name == "WWV" {
+                continue;
+            }
+            let reach = ((b.end - b.default).abs()).max((b.default - b.start).abs());
+            let frac = reach / (b.span / 2.0);
+            assert!(
+                frac <= 0.81,
+                "{} puts its band edge at {:.0}% of Nyquist",
+                b.name,
+                frac * 100.0
+            );
         }
     }
 

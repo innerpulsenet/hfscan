@@ -116,7 +116,7 @@ pub fn spawn(args: String, rate: f64, freq: f64) -> Result<Radio> {
             rate, actual_rate
         ));
     }
-    if let Err(e) = set_bandwidth(&dev, actual_rate, &log_tx) {
+    if let Err(e) = set_bandwidth(&dev, actual_rate, cover_for(freq), &log_tx) {
         let _ = log_tx.try_send(format!("analog bandwidth unavailable: {e}"));
     }
     dev.set_frequency(Rx, 0, freq, ())
@@ -173,6 +173,7 @@ pub fn spawn(args: String, rate: f64, freq: f64) -> Result<Radio> {
             dev,
             caps,
             actual_rate,
+            freq,
             cmd_rx,
             iq_tx,
             log_tx.clone(),
@@ -292,6 +293,7 @@ fn run(
     dev: soapysdr::Device,
     caps: Capabilities,
     mut rate: f64,
+    mut tuned: f64,
     cmd_rx: Receiver<Cmd>,
     iq_tx: SyncSender<Vec<Complex32>>,
     log_tx: SyncSender<String>,
@@ -312,7 +314,10 @@ fn run(
                     let _ = stream.deactivate(None);
                     return Ok(());
                 }
-                Ok(Cmd::Tune(f)) => set_and_log(&log_tx, "tune", dev.set_frequency(Rx, 0, f, ())),
+                Ok(Cmd::Tune(f)) => {
+                    tuned = f;
+                    set_and_log(&log_tx, "tune", dev.set_frequency(Rx, 0, f, ()))
+                }
                 Ok(Cmd::Gain(g)) => {
                     let _ = dev.set_gain_mode(Rx, 0, false);
                     set_and_log(&log_tx, "gain", dev.set_gain(Rx, 0, g))
@@ -355,14 +360,10 @@ fn run(
                         let _ = log_tx.try_send(format!("rate failed: {e}"));
                     } else {
                         rate = dev.sample_rate(Rx, 0).unwrap_or(requested);
-                        if let Err(e) = dev.set_bandwidth(Rx, 0, rate) {
+                        if let Err(e) = set_bandwidth(&dev, rate, cover_for(tuned), &log_tx) {
                             let _ = log_tx.try_send(format!("analog bandwidth unchanged: {e}"));
                         }
-                        let bw = dev.bandwidth(Rx, 0).unwrap_or(rate);
-                        let _ = log_tx.try_send(format!(
-                            "sample rate {:.0} Hz, analog bandwidth {:.0} Hz",
-                            rate, bw
-                        ));
+                        let _ = log_tx.try_send(format!("sample rate {rate:.0} Hz"));
                     }
                     stream = dev.rx_stream::<Complex32>(&[0])?;
                     stream.activate(None)?;
@@ -505,19 +506,126 @@ fn publish_state(dev: &soapysdr::Device, caps: &Capabilities, tx: &SyncSender<Ev
     let _ = tx.try_send(Event::State(state));
 }
 
-/// Keep the tuner's analog IF no wider than the digitised span and verify the
-/// value the driver selected. A startup failure is material: silently running
-/// a wide analog filter costs both headroom and alias rejection.
-fn set_bandwidth(dev: &soapysdr::Device, rate: f64, log_tx: &SyncSender<String>) -> Result<()> {
-    dev.set_bandwidth(Rx, 0, rate)?;
-    let actual = dev.bandwidth(Rx, 0).unwrap_or(rate);
+/// Pick the tuner's analog IF filter, and verify what the driver selected.
+///
+/// Asking for a bandwidth equal to the sample rate is the obvious thing and
+/// the wrong one. These tuners offer a handful of discrete filter widths, so
+/// the driver rounds the request to one of them — and rounding *down* puts the
+/// filter corner inside the digitised span, which is visible on the waterfall
+/// as the span's outer edges falling away. When the span is sized to a ham
+/// band, those edges are the band edges.
+///
+/// So the choice is made against the width that has to stay flat rather than
+/// against the span: the narrowest filter that still covers it. The span is
+/// the upper bound, not the target — a filter wider than what is digitised
+/// costs alias rejection, which is why the request was tied to the rate in the
+/// first place. Where nothing on offer can do both, alias rejection wins and
+/// the shortfall is logged rather than left to be discovered on the display.
+/// The width that must stay flat at `freq`: the amateur allocation it sits in,
+/// since that is what the span was sized around. Outside a band there is no
+/// such requirement and the span itself is the only constraint.
+fn cover_for(freq: f64) -> f64 {
+    crate::bands::band_for(freq).map_or(0.0, |b| b.end - b.start)
+}
+
+/// The narrowest offered filter that covers `cover_hz` without exceeding
+/// `rate`; failing that the widest that fits under `rate`, since alias
+/// rejection is worth more than the last decibel at the band edge.
+fn choose_bandwidth(options: &[f64], rate: f64, cover_hz: f64) -> f64 {
+    let fits = |w: &&f64| **w <= rate * 1.001;
+    options
+        .iter()
+        .filter(fits)
+        .find(|w| **w >= cover_hz)
+        .or_else(|| options.iter().filter(fits).next_back())
+        .copied()
+        .unwrap_or(rate)
+}
+
+fn set_bandwidth(
+    dev: &soapysdr::Device,
+    rate: f64,
+    cover_hz: f64,
+    log_tx: &SyncSender<String>,
+) -> Result<()> {
+    let mut options: Vec<f64> = dev
+        .bandwidth_range(Rx, 0)
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|r| [r.minimum, r.maximum])
+        .filter(|v| *v > 0.0)
+        .collect();
+    options.sort_by(f64::total_cmp);
+    options.dedup();
+
+    let want = choose_bandwidth(&options, rate, cover_hz);
+
+    dev.set_bandwidth(Rx, 0, want)?;
+    let actual = dev.bandwidth(Rx, 0).unwrap_or(want);
     let _ = log_tx.try_send(format!("analog bandwidth {:.0} Hz", actual));
+    if cover_hz > 0.0 && actual < cover_hz * 0.999 {
+        let _ = log_tx.try_send(format!(
+            "analog filter is {:.0} kHz but {:.0} kHz needs to stay flat — band edges will roll off",
+            actual / 1000.0,
+            cover_hz / 1000.0
+        ));
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The MSi001's discrete filter widths, as the driver reports them.
+    const RSP1A: [f64; 8] = [
+        200_000.0, 300_000.0, 600_000.0, 1_536_000.0, 5_000_000.0, 6_000_000.0, 7_000_000.0,
+        8_000_000.0,
+    ];
+
+    /// Requesting a filter as wide as the span is what made the band edges
+    /// fall away: the driver rounds to one of a handful of widths, and
+    /// rounding down puts the corner inside the digitised span.
+    #[test]
+    fn the_filter_covers_the_band_rather_than_matching_the_span() {
+        // 20m is 350 kHz in a 456 kHz span. Matching the span rounds down to
+        // 300 kHz and clips 25 kHz off each end of the band; 600 kHz is wider
+        // than the span, so 300 is still the honest answer here and the caller
+        // is told. What must not happen is silently choosing 200.
+        assert_eq!(choose_bandwidth(&RSP1A, 456_000.0, 350_000.0), 300_000.0);
+        // Give it a span that can hold the 600 kHz filter and it takes it.
+        assert_eq!(choose_bandwidth(&RSP1A, 648_000.0, 350_000.0), 600_000.0);
+        // 80m: 500 kHz of band, and a span with room for the filter that fits.
+        assert_eq!(choose_bandwidth(&RSP1A, 648_000.0, 500_000.0), 600_000.0);
+        // 6m: 4 MHz of band in a 5.016 MS/s span.
+        assert_eq!(choose_bandwidth(&RSP1A, 5_016_000.0, 4_000_000.0), 5_000_000.0);
+        // A narrow band in a wide span takes the narrowest filter that covers
+        // it, not the widest that fits, or alias rejection is thrown away.
+        assert_eq!(choose_bandwidth(&RSP1A, 648_000.0, 50_000.0), 200_000.0);
+        // At the 192 kHz span the narrow bands use, nothing on offer is that
+        // narrow, so the request falls through to the span and the driver
+        // rounds up to its 200 kHz filter — 4% wider than Nyquist, which
+        // costs far less than clipping the band would.
+        assert_eq!(choose_bandwidth(&RSP1A, 192_000.0, 50_000.0), 192_000.0);
+    }
+
+    /// Alias rejection outranks the band edge when nothing can do both.
+    #[test]
+    fn a_filter_never_exceeds_what_is_digitised() {
+        for (rate, cover) in [(456_000.0, 350_000.0), (192_000.0, 200_000.0), (1_920_000.0, 1_700_000.0)] {
+            let got = choose_bandwidth(&RSP1A, rate, cover);
+            assert!(
+                got <= rate * 1.001,
+                "chose a {got:.0} Hz filter for a {rate:.0} Hz span"
+            );
+        }
+    }
+
+    /// With nothing to go on, fall back to the span rather than guessing.
+    #[test]
+    fn no_reported_options_falls_back_to_the_span() {
+        assert_eq!(choose_bandwidth(&[], 432_000.0, 350_000.0), 432_000.0);
+    }
 
     #[test]
     fn gain_control_documents_reduction_direction() {

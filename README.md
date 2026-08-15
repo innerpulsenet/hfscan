@@ -40,14 +40,24 @@ calls it the band. `b` / `B` set it along with the frequency.
 
 | band | span | | band | span |
 | --- | --- | --- | --- | --- |
-| 160m | 240 kHz | | 15m | 528 kHz |
-| 80m | 600 kHz | | 12m | 192 kHz |
-| 60m | 192 kHz | | 10m | 1.92 MHz |
-| 40m | 360 kHz | | 6m | 4.32 MHz |
-| 30m | 192 kHz | | 2m | 4.32 MHz |
-| 20m | 432 kHz | | 17m | 192 kHz |
+| 160m | 264 kHz | | 15m | 576 kHz |
+| 80m | 648 kHz | | 12m | 192 kHz |
+| 60m | 192 kHz | | 10m | 2.14 MHz |
+| 40m | 384 kHz | | 6m | 5.02 MHz |
+| 30m | 192 kHz | | 2m | 5.02 MHz |
+| 20m | 456 kHz | | 17m | 192 kHz |
 
-Two constraints set those numbers. Nothing exceeds **6 MS/s**: the RSP1A's
+Each is 25% wider than the allocation and centred on it, so the band edges land
+at 80% of the way to Nyquist rather than up against it. That margin is not
+cosmetic. The tuner's analog IF filter comes in a handful of discrete widths
+and the driver rounds a request to one of them, so a span sized tightly to the
+band leaves the filter corner *inside* the view — which is what makes the edges
+of the waterfall fall away, and with a band-sized span those are the band
+edges. hfscan asks the driver what widths it offers and picks the narrowest
+that covers the whole allocation without exceeding the span; where nothing can
+do both, alias rejection wins and it says so in the message row.
+
+Three constraints set those numbers. Nothing exceeds **6 MS/s**: the RSP1A's
 converter holds 14 bits to about there and drops to 12, 10 and 8 as the rate
 climbs toward 10.66, so a wider view past that point is bought with dynamic
 range — the wrong trade for a receiver whose job is weak signals. And every

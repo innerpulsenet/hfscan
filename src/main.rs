@@ -6198,10 +6198,14 @@ mod tests {
         assert!(lo <= target.start && hi >= target.end, "band not fully in view");
     }
 
-    /// A band jump has to land on a span that shows the whole band, at a rate
-    /// the converter still gives full resolution at.
+    /// Whatever a band jump lands on, the digital segment has to be in the
+    /// view it produces and FT8/FT4 have to still work there. Bands narrow
+    /// enough to be shown whole are, and the rest keep their digital segment.
+    ///
+    /// This goes through `App` rather than the table so it exercises the
+    /// zoom-aware view maths, which is what the display actually uses.
     #[test]
-    fn band_spans_cover_their_bands_within_the_converter_limit() {
+    fn a_band_jump_lands_with_its_digital_segment_on_screen() {
         for b in super::bands::BANDS {
             if b.name == "WWV" {
                 continue;
@@ -6210,12 +6214,25 @@ mod tests {
             // view_range is relative to the centre.
             let (lo, hi) = app.view_range();
             let (lo, hi) = (app.center + lo, app.center + hi);
-            assert!(
-                lo <= b.start && hi >= b.end,
-                "{}: view {:.3}-{:.3} MHz misses part of {:.3}-{:.3}",
-                b.name, lo / 1e6, hi / 1e6, b.start / 1e6, b.end / 1e6
-            );
-            // FT modes must not be forced off a full-band span.
+
+            for m in super::bands::MARKERS {
+                if m.label == "WWV" || m.freq < b.start || m.freq > b.end {
+                    continue;
+                }
+                assert!(
+                    m.freq > lo && m.freq + 3_000.0 < hi,
+                    "{}: view {:.3}-{:.3} MHz leaves the {} marker at {:.3} outside",
+                    b.name, lo / 1e6, hi / 1e6, m.label, m.freq / 1e6
+                );
+            }
+            if b.end - b.start <= b.span {
+                assert!(
+                    lo <= b.start && hi >= b.end,
+                    "{}: view {:.3}-{:.3} MHz misses part of {:.3}-{:.3}",
+                    b.name, lo / 1e6, hi / 1e6, b.start / 1e6, b.end / 1e6
+                );
+            }
+            // A band jump must never be the reason FT decoding stops.
             assert!(
                 super::rate_ok_for_ft(b.span),
                 "{} span {:.0} Hz would kick FT8/FT4 back to 192 kS/s",

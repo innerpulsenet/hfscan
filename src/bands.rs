@@ -15,11 +15,14 @@ pub struct Band {
     /// that. Parking on the dial frequency put exactly that region on the
     /// bottom of the sub-band people work.
     ///
-    /// Every band is centred on its allocation. That keeps the band edges an
-    /// equal distance from Nyquist — where the analog filter corner lives, and
-    /// where the waterfall shows the view falling away — and as it happens it
-    /// also puts the LO in the phone segment, at least 10 kHz from the nearest
-    /// calling frequency on every band here.
+    /// Bands that fit inside their span are centred on the allocation, which
+    /// keeps both edges an equal distance from Nyquist. The rest are centred
+    /// so their *digital* segment sits comfortably inside the view: on nearly
+    /// every band the modes this decodes live in the bottom tens of kHz, so
+    /// when something has to be cut it is the top of the phone segment.
+    ///
+    /// Either way the LO lands at least 10 kHz from the nearest calling
+    /// frequency, since a zero-IF spike sits on top of whatever it lands on.
     pub default: f64,
     /// Sample rate to run at on this band, which is also the width of the
     /// spectrum view — chosen so the whole allocation fits in one span.
@@ -45,18 +48,18 @@ pub struct Band {
 pub const DEFAULT_BAND: usize = 5; // 20m
 
 pub const BANDS: &[Band] = &[
-    Band { name: "160m", start: 1_800_000.0,   end: 2_000_000.0,   default: 1_900_000.0,   span: 264_000.0 },
-    Band { name: "80m",  start: 3_500_000.0,   end: 4_000_000.0,   default: 3_750_000.0,   span: 648_000.0 },
+    Band { name: "160m", start: 1_800_000.0,   end: 2_000_000.0,   default: 1_900_000.0,   span: 384_000.0 },
+    Band { name: "80m",  start: 3_500_000.0,   end: 4_000_000.0,   default: 3_610_000.0,   span: 384_000.0 },
     Band { name: "60m",  start: 5_330_000.0,   end: 5_405_000.0,   default: 5_367_500.0,   span: 192_000.0 },
     Band { name: "40m",  start: 7_000_000.0,   end: 7_300_000.0,   default: 7_150_000.0,   span: 384_000.0 },
     Band { name: "30m",  start: 10_100_000.0,  end: 10_150_000.0,  default: 10_125_000.0,  span: 192_000.0 },
-    Band { name: "20m",  start: 14_000_000.0,  end: 14_350_000.0,  default: 14_175_000.0,  span: 456_000.0 },
+    Band { name: "20m",  start: 14_000_000.0,  end: 14_350_000.0,  default: 14_175_000.0,  span: 384_000.0 },
     Band { name: "17m",  start: 18_068_000.0,  end: 18_168_000.0,  default: 18_118_000.0,  span: 192_000.0 },
-    Band { name: "15m",  start: 21_000_000.0,  end: 21_450_000.0,  default: 21_225_000.0,  span: 576_000.0 },
+    Band { name: "15m",  start: 21_000_000.0,  end: 21_450_000.0,  default: 21_160_000.0,  span: 384_000.0 },
     Band { name: "12m",  start: 24_890_000.0,  end: 24_990_000.0,  default: 24_940_000.0,  span: 192_000.0 },
-    Band { name: "10m",  start: 28_000_000.0,  end: 29_700_000.0,  default: 28_850_000.0,  span: 2_136_000.0 },
-    Band { name: "6m",   start: 50_000_000.0,  end: 54_000_000.0,  default: 52_000_000.0,  span: 5_016_000.0 },
-    Band { name: "2m",   start: 144_000_000.0, end: 148_000_000.0, default: 146_000_000.0, span: 5_016_000.0 },
+    Band { name: "10m",  start: 28_000_000.0,  end: 29_700_000.0,  default: 28_125_000.0,  span: 384_000.0 },
+    Band { name: "6m",   start: 50_000_000.0,  end: 54_000_000.0,  default: 50_330_000.0,  span: 384_000.0 },
+    Band { name: "2m",   start: 144_000_000.0, end: 148_000_000.0, default: 144_190_000.0, span: 384_000.0 },
     Band { name: "WWV",  start: 4_990_000.0,   end: 15_010_000.0,  default: 10_000_000.0,  span: 192_000.0 },
 ];
 
@@ -220,24 +223,79 @@ mod tests {
         }
     }
 
-    /// Every band is viewable whole. This is the point of the per-band span:
-    /// jumping to a band should show the band, not a slice of it.
+    /// The one guarantee that must never break: whatever else is cut, the
+    /// digital calling frequencies stay in view. This is exactly what broke
+    /// when spans the receiver could not produce were clamped underneath a
+    /// centre chosen for the width that was asked for — 20m came up showing
+    /// 14.079 upwards, with FT8 at 14.074 just off the left edge and no
+    /// decodes at all.
     #[test]
-    fn every_band_fits_inside_its_own_span() {
+    fn the_digital_segment_is_always_in_view() {
+        const EDGE: f64 = 5_000.0; // discarded edge bins
+        const PASSBAND: f64 = 3_000.0; // USB audio above the dial
         for b in BANDS {
             if b.name == "WWV" {
                 continue;
             }
             let half = b.span / 2.0;
-            let (lo, hi) = (b.default - half, b.default + half);
+            let mut seen = false;
+            for m in MARKERS {
+                if m.label == "WWV" || m.freq < b.start || m.freq > b.end {
+                    continue;
+                }
+                seen = true;
+                let off = m.freq - b.default;
+                assert!(
+                    off > -(half - EDGE) && off + PASSBAND < half - EDGE,
+                    "{}: the {} marker at {:.3} MHz is {off:+.0} Hz from centre, \
+                     outside a {:.0} kHz span",
+                    b.name,
+                    m.label,
+                    m.freq / 1e6,
+                    b.span / 1000.0
+                );
+            }
+            assert!(seen, "{} has no markers to check", b.name);
+        }
+    }
+
+    /// Bands narrow enough to fit are shown whole. The rest cannot be, at any
+    /// rate this receiver offers that also keeps FT8 working.
+    #[test]
+    fn bands_that_can_be_shown_whole_are() {
+        for b in BANDS {
+            if b.name == "WWV" {
+                continue;
+            }
+            let half = b.span / 2.0;
+            let fits = b.end - b.start <= b.span;
+            let covered = b.default - half <= b.start && b.default + half >= b.end;
+            if fits {
+                assert!(
+                    covered,
+                    "{} is {:.0} kHz inside a {:.0} kHz span but is not centred to show it",
+                    b.name,
+                    (b.end - b.start) / 1000.0,
+                    b.span / 1000.0
+                );
+            }
+        }
+    }
+
+    /// A span the device cannot produce gets silently clamped by the driver,
+    /// which is how the digital segment ended up off-screen.
+    #[test]
+    fn spans_are_rates_the_receiver_offers() {
+        const SUPPORTED: [f64; 8] = [
+            62_500.0, 96_000.0, 125_000.0, 192_000.0, 250_000.0, 384_000.0, 500_000.0,
+            1_000_000.0,
+        ];
+        for b in BANDS {
             assert!(
-                lo <= b.start && hi >= b.end,
-                "{} spans {:.3}-{:.3} MHz but the band is {:.3}-{:.3}",
+                SUPPORTED.contains(&b.span),
+                "{} asks for {:.0} Hz, which the receiver does not offer",
                 b.name,
-                lo / 1e6,
-                hi / 1e6,
-                b.start / 1e6,
-                b.end / 1e6
+                b.span
             );
         }
     }
@@ -251,24 +309,34 @@ mod tests {
         }
     }
 
-    /// The band edges must not sit up against Nyquist, where the tuner's
-    /// analog filter corner lives. This is the margin the waterfall shows as
-    /// the edges of the view falling away, and with a span sized to a band
-    /// those edges are the band edges.
+    /// The digital segment must sit in the flat part of the span, not out
+    /// where the analog filter corner is — that rolloff is what shows on the
+    /// waterfall as the edges of the view falling away.
+    ///
+    /// This is about the markers, not the band edges. 20m at 384 kHz reaches
+    /// its band edges at 91% of Nyquist and there is no FT-safe rate this
+    /// receiver offers that would do better; what matters is that its digital
+    /// segment sits at 55%, where the response is flat. When something has to
+    /// be given up at the extremes it is the top of the phone segment.
     #[test]
-    fn every_band_has_room_between_its_edges_and_nyquist() {
+    fn the_digital_segment_sits_in_the_flat_part_of_the_span() {
         for b in BANDS {
             if b.name == "WWV" {
                 continue;
             }
-            let reach = ((b.end - b.default).abs()).max((b.default - b.start).abs());
-            let frac = reach / (b.span / 2.0);
-            assert!(
-                frac <= 0.81,
-                "{} puts its band edge at {:.0}% of Nyquist",
-                b.name,
-                frac * 100.0
-            );
+            for m in MARKERS {
+                if m.label == "WWV" || m.freq < b.start || m.freq > b.end {
+                    continue;
+                }
+                let frac = (m.freq + 3_000.0 - b.default).abs() / (b.span / 2.0);
+                assert!(
+                    frac <= 0.70,
+                    "{}: the {} marker sits at {:.0}% of Nyquist, in the filter skirt",
+                    b.name,
+                    m.label,
+                    frac * 100.0
+                );
+            }
         }
     }
 

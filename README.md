@@ -33,42 +33,49 @@ Options:
 
 ### Band spans
 
-Each band preset carries its own sample rate, chosen so the whole allocation
-fits in one view — 30 m is 50 kHz wide and 6 m is 4 MHz, and a fixed span
-either wastes the converter on empty spectrum or shows a slice of the band and
-calls it the band. `b` / `B` set it along with the frequency.
+Each band preset carries its own sample rate, applied by `b` / `B`, chosen so
+the digital segment is always well inside the view and the band is shown whole
+wherever that is possible.
 
-| band | span | | band | span |
-| --- | --- | --- | --- | --- |
-| 160m | 264 kHz | | 15m | 576 kHz |
-| 80m | 648 kHz | | 12m | 192 kHz |
-| 60m | 192 kHz | | 10m | 2.14 MHz |
-| 40m | 384 kHz | | 6m | 5.02 MHz |
-| 30m | 192 kHz | | 2m | 5.02 MHz |
-| 20m | 456 kHz | | 17m | 192 kHz |
+| band | span | shown | | band | span | shown |
+| --- | --- | --- | --- | --- | --- | --- |
+| 160m | 384 kHz | whole band | | 15m | 384 kHz | digital + CW |
+| 80m | 384 kHz | digital + CW | | 12m | 192 kHz | whole band |
+| 60m | 192 kHz | whole band | | 10m | 384 kHz | digital segment |
+| 40m | 384 kHz | whole band | | 6m | 384 kHz | digital segment |
+| 30m | 192 kHz | whole band | | 2m | 384 kHz | digital segment |
+| 20m | 384 kHz | whole band | | 17m | 192 kHz | whole band |
 
-Each is 25% wider than the allocation and centred on it, so the band edges land
-at 80% of the way to Nyquist rather than up against it. That margin is not
-cosmetic. The tuner's analog IF filter comes in a handful of discrete widths
-and the driver rounds a request to one of them, so a span sized tightly to the
-band leaves the filter corner *inside* the view — which is what makes the edges
-of the waterfall fall away, and with a band-sized span those are the band
-edges. hfscan asks the driver what widths it offers and picks the narrowest
-that covers the whole allocation without exceeding the span; where nothing can
-do both, alias rejection wins and it says so in the message row.
+Three constraints pin those numbers, and the first is the one that bites.
 
-Three constraints set those numbers. Nothing exceeds **6 MS/s**: the RSP1A's
-converter holds 14 bits to about there and drops to 12, 10 and 8 as the rate
-climbs toward 10.66, so a wider view past that point is bought with dynamic
-range — the wrong trade for a receiver whose job is weak signals. And every
-span is a multiple of **24 kHz**, the lowest common multiple of the 8 kHz and
-12 kHz audio clocks, so FT8 and FT4 keep an exact divisor and stay usable at
-full-band width instead of forcing a retune down to 192 kHz.
+**Only rates the receiver actually offers.** The RSP1A gives 62.5, 96, 125,
+192, 250, 384, 500 and 1000 kS/s. Ask for anything else and the driver clamps
+silently — and a band centred for a width it never got can end up with its
+digital segment off the edge of the view, which means no waterfall and no
+decodes there at all.
+
+**Only rates that keep the audio clocks exact.** Of those, 96, 192 and 384 kHz
+divide by both 8 kHz and 12 kHz, so 384 kS/s is the widest span that leaves
+FT8 and FT4 working. Everything wider would force a retune back to 192 kHz the
+moment an FT mode was selected.
+
+**The digital segment before the band.** 384 kHz covers 160m, 40m and 20m end
+to end, and 192 kHz covers the four narrow bands. 80m, 15m, 10m, 6m and 2m are
+wider than any FT-safe rate this receiver has, so they are centred on their
+digital segments instead — on nearly every band the modes this decodes live in
+the bottom tens of kHz, so what gets cut is the top of the phone segment.
+
+The analog IF filter is chosen against the width that has to stay flat rather
+than against the span. These tuners offer a handful of discrete filter widths
+and the driver rounds a request to one of them; rounding down puts the corner
+*inside* the view, which is what makes the edges of the waterfall fall away.
+hfscan asks the driver what it offers and picks the narrowest that covers the
+segment without exceeding Nyquist, and says so in the message row when nothing
+can do both.
 
 `--rate` still overrides for a single run. The narrowband scouts walk their
 whole buffer once per candidate, so their cost tracks the sample rate; above
-2 MS/s the rescan interval stretches in proportion, holding their share of a
-core flat rather than letting a wide span starve the waterfall.
+2 MS/s the rescan interval stretches in proportion.
 
 ## Keys
 

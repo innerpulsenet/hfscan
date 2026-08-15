@@ -147,7 +147,7 @@ enough to find the knee and not enough to put a number in dBm on it.
 | `t` | toggle the bias-T (external preamp power) |
 | `o` | station settings: your callsign and grid locator |
 | `x` | clear the decode pane |
-| `?` / `q` | help / quit |
+| `?` / `q` | help / quit — the help lists every key with its **current setting** in yellow |
 
 ### Zoom is the tuning control
 

@@ -1444,7 +1444,12 @@ impl App {
         }
 
         // Narrowband modes go wherever the classifier saw them, strongest
-        // first so a crowded span spends its slots on the best signals.
+        // first so a crowded span spends its slots on the best signals — but
+        // only inside the stretch of the band those modes are worked in. A
+        // span sized to the digital segment can still reach a little way into
+        // the phone portion, and a slot spent trying to read CW out of an SSB
+        // signal is a slot not spent on the one below it.
+        let decoded = bands::band_for(self.center).map(|b| (b.dig_start, b.dig_end));
         let mut found: Vec<&identify::Ident> = self
             .idents
             .iter()
@@ -1453,6 +1458,10 @@ impl App {
                     i.kind,
                     identify::Kind::Cw | identify::Kind::Rtty | identify::Kind::Psk31
                 )
+            })
+            .filter(|i| {
+                let hz = self.center + i.offset_hz as f64;
+                decoded.is_none_or(|(lo, hi)| hz >= lo && hz <= hi)
             })
             .collect();
         found.sort_by(|a, b| {
@@ -3589,7 +3598,7 @@ fn draw(f: &mut Frame, app: &App) {
     if let Some(ed) = &app.settings {
         draw_settings(f, f.area(), ed);
     } else if app.show_help {
-        draw_help(f, f.area());
+        draw_help(f, f.area(), app);
     }
 }
 
@@ -5692,55 +5701,178 @@ fn draw_ft_stations(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
-    let text = vec![
-        Line::from("  hfscan key bindings"),
-        Line::from(""),
-        Line::from("  ← →         tune by one step   (shift: 10 steps)"),
-        Line::from("  ↑ / ↓       scroll the decode transcript (shift: 10 lines)"),
-        Line::from("  V           auto decode view: held rows / chronological log"),
-        Line::from("              rows hold one signal each, copy building in place;"),
-        Line::from("              signals that go quiet sink to the bottom of the list"),
-        Line::from("  wheel       scroll the pane under the mouse (waterfall too)"),
-        Line::from("  z / Z       zoom in / out — also sets the tuning step"),
-        Line::from("  n / N       next / previous signal (CW/PSK31: confirmed)"),
-        Line::from("  p           CW/PSK31: lock next in span, or scan the band"),
-        Line::from("  u / i       CW/PSK31: fine-tune lock −2 / +2 Hz"),
-        Line::from("  g           CW/PSK31: centre the cursor on the lock"),
-        Line::from("  [ ]         retune centre ±10 kHz"),
-        Line::from("  PgUp/PgDn   retune centre ± half span"),
-        Line::from("  c           centre the radio on the cursor"),
-        Line::from("  b / B       next / previous band preset"),
-        Line::from("  d           decoder: off → CW → RTTY → PSK31 → FT8 → FT4 → AUTO"),
-        Line::from("              AUTO decodes every digital signal in the span at once —"),
-        Line::from("              FT8/FT4 on their calling frequencies, CW/RTTY/PSK31"),
-        Line::from("              wherever found. Each line is tagged with its frequency."),
-        Line::from("  r           force RTTY shift polarity (it is detected"),
-        Line::from("              automatically; this overrides that)"),
-        Line::from("              PSK31 auto-locks to a nearby carrier (AFC)"),
-        Line::from("  s           scan the current band; results are labelled"),
-        Line::from("              spectrum chips + bottom activity strip (heard)"),
-        Line::from("  v           enlarge the decode pane (cycles sizes)"),
-        Line::from("  w / W       waterfall speed / subcell resolution"),
-        Line::from("  f / F       FFT size (frequency resolution)"),
-        Line::from("  a           AGC: soft hang → hardware → off   + / - more/less gain"),
-        Line::from("  ;           hardware AGC setpoint: −40 / −30 / −20 dBFS"),
-        Line::from("  m           MW/FM RF notch: auto / forced on / forced off"),
-        Line::from("  D / I       toggle DAB notch / driver IQ correction"),
-        Line::from("  y / Y       frequency correction −/+ 0.1 ppm"),
-        Line::from("  h           acquisition path: 192k zero-IF / 250k low-IF"),
-        Line::from("  e           spectrum smoothing (light / medium / heavy)"),
-        Line::from("  j           impulse blanker (off / gentle / normal / aggressive)"),
-        Line::from("  l           RX bandpass (auto / 80 / 200 / 500 / 1.5k / 3k)"),
-        Line::from("  k           squelch on/off  , / .   squelch threshold"),
-        Line::from("  < / >       copy floor: hide decodes the decoder itself is"),
-        Line::from("              not confident in (the sig column, 0 = noise)"),
-        Line::from("  t           toggle bias-T (external preamp power)"),
-        Line::from("  o           station settings (callsign, grid, spotting)"),
-        Line::from("  x           clear the decode pane"),
-        Line::from("  ? / q       toggle help / quit"),
+/// One help row: the key, what it does, and — where the key cycles or toggles
+/// something — what it is set to right now.
+///
+/// The current value is the part worth colouring. A list of what a key cycles
+/// through does not say where in that list you are, and half these settings
+/// are invisible on the main display, so the help was the natural place to
+/// look and the one place that could not answer.
+fn help_row(key: &str, desc: &str, now: Option<String>) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(
+            format!("  {key:<11}"),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(desc.to_string()),
     ];
-    let w = 68.min(area.width.saturating_sub(4));
+    if let Some(v) = now {
+        let pad = 44usize.saturating_sub(desc.chars().count());
+        spans.push(Span::raw(" ".repeat(pad.max(1))));
+        spans.push(Span::styled(
+            v,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn help_note(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("              {text}"),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+fn draw_help(f: &mut Frame, area: Rect, app: &App) {
+    let on_off = |b: bool| if b { "on" } else { "off" }.to_string();
+    let notch = if !app.radio_caps.as_ref().is_some_and(|c| c.rf_notch) {
+        "unavailable".to_string()
+    } else if app.rf_notch_auto {
+        format!("auto ({})", on_off(app.rf_notch))
+    } else {
+        format!("forced {}", on_off(app.rf_notch))
+    };
+    let agc = match app.agc {
+        AgcMode::Soft => "soft hang",
+        AgcMode::Hardware => "hardware",
+        AgcMode::Off => "off",
+    };
+    let gain = match app.gain_control {
+        radio::GainControl::Sdrplay { .. } => {
+            format!("RFGR {:.0} / IFGR {:.0}", app.rfgr, app.ifgr)
+        }
+        radio::GainControl::Overall { .. } => format!("{:.0} dB", app.gain),
+    };
+    let station = if app.my_call.is_empty() {
+        "not set".to_string()
+    } else if app.my_grid.is_empty() {
+        app.my_call.clone()
+    } else {
+        format!("{} {}", app.my_call, app.my_grid)
+    };
+
+    let text = vec![
+        Line::from(Span::styled(
+            "  hfscan key bindings",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "  current setting shown in yellow",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        help_row("← →", "tune by one step   (shift: 10 steps)", None),
+        help_row("↑ / ↓", "scroll the decode transcript", None),
+        help_row(
+            "V",
+            "auto decode view",
+            Some(match app.auto_view {
+                AutoView::Rows => "held rows",
+                AutoView::Log => "chronological log",
+            }
+            .into()),
+        ),
+        help_note("rows hold one signal each, copy building in place"),
+        help_row("wheel", "scroll the pane under the mouse", None),
+        help_row("z / Z", "zoom in / out — also sets the tuning step", None),
+        help_row("n / N", "next / previous signal", None),
+        help_row("p", "CW/PSK31: lock next in span, or scan the band", None),
+        help_row("u / i", "CW/PSK31: fine-tune lock −2 / +2 Hz", None),
+        help_row("g", "CW/PSK31: centre the cursor on the lock", None),
+        help_row("[ ]", "retune centre ±10 kHz", None),
+        help_row("PgUp/PgDn", "retune centre ± half span", None),
+        help_row("c", "centre the radio on the cursor", None),
+        help_row(
+            "b / B",
+            "band preset",
+            Some(format!(
+                "{} · {:.0} kHz",
+                bands::BANDS
+                    .get(app.band_idx)
+                    .map_or("—", |b| b.name),
+                app.rate / 1000.0
+            )),
+        ),
+        help_row("d", "decoder", Some(app.mode.label().into())),
+        help_note("AUTO decodes every digital signal in the span at once"),
+        help_row("r", "force RTTY shift polarity (else auto-detected)", None),
+        help_row("s", "scan the current band; results are labelled", None),
+        help_row("v", "decode pane size", Some(format!("{}", app.decode_zoom))),
+        help_row(
+            "w / W",
+            "waterfall speed / subcell",
+            // The full labels spell out both axes and do not fit; the help is
+            // a reminder of where you are, not a definition.
+            Some(format!(
+                "{} ms · {}",
+                WF_INTERVALS_MS[app.wf_idx],
+                match app.wf_res {
+                    WfRes::Time => "2x time",
+                    WfRes::Quad => "2x freq + time",
+                    WfRes::Freq => "2x freq",
+                }
+            )),
+        ),
+        help_row("f / F", "FFT size", Some(format!("{}", app.fft_size()))),
+        help_row("a", "AGC   (+ / - more/less gain)", Some(agc.into())),
+        help_row("", "current gain", Some(gain)),
+        help_row(
+            ";",
+            "hardware AGC setpoint",
+            Some(format!("{} dBFS", app.agc_setpoint)),
+        ),
+        help_row("m", "MW/FM RF notch", Some(notch)),
+        help_row("D", "DAB notch", Some(on_off(app.dab_notch))),
+        help_row("I", "driver IQ correction", Some(on_off(app.iq_correction))),
+        help_row("y / Y", "frequency correction", Some(format!("{:+.1} ppm", app.ppm))),
+        help_row(
+            "h",
+            "acquisition path",
+            Some(if app.low_if { "250k low-IF" } else { "zero-IF" }.into()),
+        ),
+        help_row(
+            "e",
+            "spectrum smoothing (display only)",
+            Some(SMOOTH_LABELS[app.smooth_idx].into()),
+        ),
+        help_row(
+            "j",
+            "impulse blanker",
+            Some(app.front.blanker_status().0.into()),
+        ),
+        help_row(
+            "l",
+            "RX bandpass",
+            Some(format!("{} ({:.0} Hz)", app.rx_filter.label(), app.rx_bandwidth())),
+        ),
+        help_row(
+            "k",
+            "squelch   (, / . threshold)",
+            Some(format!("{} · {:.0} dB", on_off(app.squelch), app.squelch_db)),
+        ),
+        help_row(
+            "< / >",
+            "copy floor",
+            Some(format!("{:.0}%", app.copy_floor * 100.0)),
+        ),
+        help_note("hides decodes the decoder itself is not confident in"),
+        help_row("t", "bias-T (external preamp power)", Some(on_off(app.biast))),
+        help_row("o", "station settings", Some(station)),
+        help_row("x", "clear the decode pane", None),
+        help_row("? / q", "toggle help / quit", None),
+    ];
+    let w = 84.min(area.width.saturating_sub(4));
     let h = (text.len() as u16 + 2).min(area.height);
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
@@ -5891,9 +6023,12 @@ mod tests {
     /// to this budget shrank it on exactly the bands that are busiest.
     #[test]
     fn auto_caps_slots_and_prefers_strong_signals() {
-        let mut app = App::new(7_100_000.0, 192_000.0, Mode::Auto);
+        // Inside 40m's decoded stretch, since signals above it are now left
+        // to the phone operators who put them there.
+        let b = super::bands::BANDS.iter().find(|b| b.name == "40m").unwrap();
+        let mut app = App::new(b.default, b.span, Mode::Auto);
         app.idents = (0..40)
-            .map(|i| ident(identify::Kind::Cw, -80_000.0 + i as f32 * 4000.0, i as f32))
+            .map(|i| ident(identify::Kind::Cw, -45_000.0 + i as f32 * 2250.0, i as f32))
             .collect();
         app.reconcile_auto();
         let narrow = app.auto.iter().filter(|s| !s.pinned).count();
@@ -5911,7 +6046,7 @@ mod tests {
              and must not have been squeezed out by the narrowband fleet"
         );
         // The strongest ident was the last one (snr 39), so it must have a slot.
-        let strongest = 7_100_000.0 + (-80_000.0 + 39.0 * 4000.0);
+        let strongest = b.default + (-45_000.0 + 39.0 * 2250.0);
         assert!(
             app.auto.iter().any(|s| (s.dial_hz - strongest).abs() < 200.0),
             "cap dropped the strongest signal"
@@ -6293,6 +6428,111 @@ mod tests {
                 b.name, b.span
             );
         }
+    }
+
+    /// The help lists what each key cycles through but could not say where in
+    /// that list you were, and half these settings show up nowhere on the main
+    /// display. It reports the current value now.
+    #[test]
+    fn the_help_shows_the_current_setting() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(14_060_000.0, 192_000.0, Mode::Auto);
+        app.show_help = true;
+        app.my_call = "KQ2Y".into();
+        app.my_grid = "FN30".into();
+        app.squelch_db = 12.0;
+        app.gain_control = super::radio::GainControl::Sdrplay {
+            rfgr_min: 0.0,
+            rfgr_max: 9.0,
+            ifgr_min: 20.0,
+            ifgr_max: 59.0,
+        };
+        app.rfgr = 0.0;
+        app.ifgr = 48.0;
+
+        let render = |app: &App| {
+            let mut t = Terminal::new(TestBackend::new(100, 60)).unwrap();
+            t.draw(|f| super::draw(f, app)).unwrap();
+            let buf = t.backend().buffer();
+            let mut out = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    out.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+                }
+                out.push('\n');
+            }
+            out
+        };
+
+        let shown = render(&app);
+        for want in [
+            "held rows",        // V
+            "AUTO",             // d
+            "soft hang",        // a
+            "RFGR 0 / IFGR 48", // the gain it is actually running
+            "normal",           // j, the impulse blanker's default
+            "medium",           // e
+            "40%",              // copy floor
+            "KQ2Y FN30",        // o
+        ] {
+            assert!(shown.contains(want), "help does not report {want:?}:\n{shown}");
+        }
+
+        // ...and it has to follow the setting, not print a constant.
+        app.smooth_idx = 2;
+        app.squelch = false;
+        app.biast = true;
+        let changed = render(&app);
+        assert!(changed.contains("heavy"), "smoothing did not update:\n{changed}");
+        assert!(
+            changed.contains("off · 12 dB"),
+            "squelch did not update:\n{changed}"
+        );
+        // bias-T reads "on" now, where before it was the only "off" alongside
+        // the DAB notch; check the row rather than the bare word.
+        assert!(
+            changed.contains("bias-T (external preamp power)              on"),
+            "bias-T did not update:\n{changed}"
+        );
+    }
+
+    /// A slot spent on an SSB signal is a slot not spent on a decodable one.
+    /// The span reaches a little past the digital segment on most bands, so
+    /// the phone portion is in view — it must not be in the fleet.
+    #[test]
+    fn auto_does_not_spend_slots_on_the_phone_segment() {
+        // 12m: a 40 kHz digital stretch inside a 192 kHz span, so there is
+        // plenty of phone portion in view to be wrongly picked up.
+        let b = super::bands::BANDS
+            .iter()
+            .find(|b| b.name == "12m")
+            .unwrap();
+        let mut app = App::new(b.default, b.span, Mode::Auto);
+        // One signal inside the digital stretch, one above it in phone. Both
+        // are inside the span, and the classifier called both CW.
+        let inside = b.dig_end - 20_000.0;
+        let phone = b.dig_end + 20_000.0;
+        assert!(
+            phone < b.default + b.span / 2.0,
+            "the phone signal has to be in view for this test to mean anything"
+        );
+        app.idents = [inside, phone]
+            .iter()
+            .map(|hz| ident(identify::Kind::Cw, (hz - b.default) as f32, 20.0))
+            .collect();
+        app.reconcile_auto();
+
+        let dials: Vec<f64> = app.auto.iter().filter(|s| !s.pinned).map(|s| s.dial_hz).collect();
+        assert!(
+            dials.iter().any(|d| (d - inside).abs() < 500.0),
+            "the signal in the digital segment should have a decoder: {dials:?}"
+        );
+        assert!(
+            !dials.iter().any(|d| (d - phone).abs() < 500.0),
+            "a signal in the phone segment should not: {dials:?}"
+        );
     }
 
     /// Every band must be affordable. The decode fleet costs time in
@@ -7730,7 +7970,7 @@ mod receiver_control_tests {
     #[test]
     fn sdrplay_manual_gain_uses_reduction_in_the_right_direction() {
         let mut app = App::new(14_070_000.0, FT_SAFE_RATE, Mode::Off);
-        app.gain_control = radio::GainControl::Sdrplay {
+        app.gain_control = super::radio::GainControl::Sdrplay {
             rfgr_min: 0.0,
             rfgr_max: 9.0,
             ifgr_min: 20.0,

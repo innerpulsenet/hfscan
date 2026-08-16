@@ -17,7 +17,7 @@
 //! framed in parallel and the one that actually frames — start bit a space,
 //! stop bit a mark — wins; `r` still forces it either way.
 
-use super::callscan::{utc_hhmmss, CallScanner};
+use super::callscan::{CallScanner, utc_hhmmss};
 use super::{Decoder, FtMessage};
 use crate::dsp::Rotator;
 use num_complex::Complex32;
@@ -136,7 +136,9 @@ impl ToneCorr {
     }
 
     fn reset(&mut self) {
-        self.hist.iter_mut().for_each(|s| *s = Complex32::new(0.0, 0.0));
+        self.hist
+            .iter_mut()
+            .for_each(|s| *s = Complex32::new(0.0, 0.0));
         self.pos = 0;
         self.sum = Complex32::new(0.0, 0.0);
         self.since_refresh = 0;
@@ -289,7 +291,7 @@ impl Framer {
                 self.text.push(' ');
             }
             0x08 => self.text.push('\n'), // CR
-            0x02 => {}                     // LF (CR already breaks the line)
+            0x02 => {}                    // LF (CR already breaks the line)
             0x00 => {}
             _ => {
                 let table = if self.figs { FIGS } else { LTRS };
@@ -391,7 +393,10 @@ impl RttyDecoder {
         }
         // A pair has to stand out of the passband, or there is nothing to
         // tune to and the last centre is as good a guess as a noise peak.
-        let mut floor: Vec<f32> = (0..n).step_by(7).map(|i| self.fft_buf[i].norm_sqr()).collect();
+        let mut floor: Vec<f32> = (0..n)
+            .step_by(7)
+            .map(|i| self.fft_buf[i].norm_sqr())
+            .collect();
         floor.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let med = floor[floor.len() / 2].max(1e-20);
         if best.0 > 6.0 * med {
@@ -506,10 +511,16 @@ impl Decoder for RttyDecoder {
                     *level += (v - *level) * pa;
                 }
             }
-            let dominant = if em > es { (self.mark_acc, old_mark) } else { (self.space_acc, old_space) };
+            let dominant = if em > es {
+                (self.mark_acc, old_mark)
+            } else {
+                (self.space_acc, old_space)
+            };
             if dominant.0.norm_sqr() > 1e-8 && dominant.1.norm_sqr() > 1e-8 {
-                let residual = (dominant.0 * dominant.1.conj()).arg() * self.fs / (2.0 * std::f32::consts::PI);
-                self.afc_hz = (self.afc_hz + 0.00005 * residual.clamp(-20.0, 20.0)).clamp(-10.0, 10.0);
+                let residual =
+                    (dominant.0 * dominant.1.conj()).arg() * self.fs / (2.0 * std::f32::consts::PI);
+                self.afc_hz =
+                    (self.afc_hz + 0.00005 * residual.clamp(-20.0, 20.0)).clamp(-10.0, 10.0);
             }
 
             // Both polarities are framed; only one of them is the station.
@@ -688,7 +699,9 @@ impl Decoder for RttyDecoder {
         self.mark.reset();
         self.space.reset();
         self.centre_hz = 0.0;
-        self.acq_buf.iter_mut().for_each(|s| *s = Complex32::new(0.0, 0.0));
+        self.acq_buf
+            .iter_mut()
+            .for_each(|s| *s = Complex32::new(0.0, 0.0));
         self.acq_pos = 0;
         self.acq_fill = 0;
         self.mark_acc = Complex32::new(0.0, 0.0);

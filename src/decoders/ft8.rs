@@ -23,8 +23,15 @@ use mfsk_core::msg::hash_table::CallsignHashTable;
 use mfsk_core::msg::wsjt77::{is_plausible_message, unpack77_with_hash};
 use mfsk_core::{Ft4, Ft8};
 use num_complex::Complex32;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Test hook: the next worker slot panics once, then clears. Used to prove
+/// a dead worker does not permanently silence Auto FT8 (band-switch used
+/// to be the only way to get a new thread).
+static PANIC_NEXT_SLOT: AtomicBool = AtomicBool::new(false);
 
 pub const AUDIO_RATE: f64 = 12_000.0;
 /// Audio passband centre; signals live at 200-3000 Hz above the dial.
@@ -59,47 +66,78 @@ struct SlotJob {
     my_call: String,
 }
 
+fn spawn_worker(ft4: bool, slot_secs: f64) -> (Sender<SlotJob>, Receiver<Vec<FtMessage>>) {
+    let (jobs, job_rx) = channel::<SlotJob>();
+    let (res_tx, results) = channel::<Vec<FtMessage>>();
+    let _ = std::thread::Builder::new()
+        .name(if ft4 { "ft4-decode" } else { "ft8-decode" }.into())
+        .spawn(move || worker_loop(ft4, slot_secs, job_rx, res_tx));
+    (jobs, results)
+}
+
+fn worker_loop(
+    ft4: bool,
+    slot_secs: f64,
+    job_rx: Receiver<SlotJob>,
+    res_tx: Sender<Vec<FtMessage>>,
+) {
+    let mut hash = CallsignHashTable::new();
+    let mut deep = true;
+    while let Ok(job) = job_rx.recv() {
+        // If slots queued up faster than we can decode them (slow
+        // CPU, busy band), keep only the freshest: stale decodes are
+        // worth less than current ones, and the queue must stay
+        // bounded.
+        let mut latest = job;
+        while let Ok(newer) = job_rx.try_recv() {
+            latest = newer;
+        }
+        if !latest.my_call.is_empty() {
+            hash.insert(&latest.my_call);
+        }
+        // One batch per slot (possibly empty), so the UI can tell
+        // "slot done, nothing heard". A panic in mfsk-core used to
+        // kill this thread; Auto then stayed silent until a retune
+        // built a new decoder. Catch the slot and keep listening.
+        let started = std::time::Instant::now();
+        let decoded = catch_unwind(AssertUnwindSafe(|| {
+            if PANIC_NEXT_SLOT.swap(false, Ordering::SeqCst) {
+                panic!("injected FT decode panic");
+            }
+            decode_slot(&latest.audio, ft4, &latest.my_call, &mut hash, deep)
+        }));
+        let decoded = match decoded {
+            Ok(v) => v,
+            Err(_) => {
+                hash = CallsignHashTable::new();
+                if !latest.my_call.is_empty() {
+                    hash.insert(&latest.my_call);
+                }
+                eprintln!("FT decode panicked; skipping this slot");
+                Vec::new()
+            }
+        };
+        let elapsed = started.elapsed().as_secs_f64();
+        if elapsed > slot_secs * 0.8 {
+            deep = false;
+            eprintln!(
+                "FT decode used {elapsed:.1}s ({:.0}% of slot); restoring conservative depth",
+                elapsed / slot_secs * 100.0
+            );
+        } else if elapsed < slot_secs * 0.5 {
+            deep = true;
+        }
+        if res_tx.send(decoded).is_err() {
+            return;
+        }
+    }
+}
+
 impl FtDecoder {
     pub fn new(fs: f64, ft4: bool) -> Self {
         let slot_secs = if ft4 { 7.5 } else { 15.0 };
         let nmax = (slot_secs * AUDIO_RATE) as usize;
-        let (jobs, job_rx) = channel::<SlotJob>();
-        let (res_tx, results) = channel::<Vec<FtMessage>>();
-
-        std::thread::spawn(move || {
-            let mut hash = CallsignHashTable::new();
-            let mut deep = true;
-            while let Ok(job) = job_rx.recv() {
-                // If slots queued up faster than we can decode them (slow
-                // CPU, busy band), keep only the freshest: stale decodes are
-                // worth less than current ones, and the queue must stay
-                // bounded.
-                let mut latest = job;
-                while let Ok(newer) = job_rx.try_recv() {
-                    latest = newer;
-                }
-                if !latest.my_call.is_empty() {
-                    hash.insert(&latest.my_call);
-                }
-                // One batch per slot (possibly empty), so the UI can tell
-                // "slot done, nothing heard".
-                let started = std::time::Instant::now();
-                let decoded = decode_slot(&latest.audio, ft4, &latest.my_call, &mut hash, deep);
-                let elapsed = started.elapsed().as_secs_f64();
-                if elapsed > slot_secs * 0.8 {
-                    deep = false;
-                    eprintln!("FT decode used {elapsed:.1}s ({:.0}% of slot); restoring conservative depth", elapsed / slot_secs * 100.0);
-                } else if elapsed < slot_secs * 0.5 {
-                    deep = true;
-                }
-                if res_tx
-                    .send(decoded)
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        });
+        let (jobs, results) = spawn_worker(ft4, slot_secs);
 
         let mut nco = Nco::new();
         // Shift the passband back down so the dial sits at 0 Hz.
@@ -123,6 +161,16 @@ impl FtDecoder {
         }
     }
 
+    /// The worker thread died (panic that escaped, or the channel closed).
+    /// Build a new one so the next slot is not silently dropped — that is
+    /// what a band change already did, accidentally.
+    fn restart_worker(&mut self) {
+        let (jobs, results) = spawn_worker(self.ft4, self.slot_secs);
+        self.jobs = jobs;
+        self.results = results;
+        self.pending = false;
+    }
+
     /// Decode one prepared slot directly, returning transcript lines. Used by
     /// the tests, which cannot wait on the wall clock.
     #[cfg(test)]
@@ -137,7 +185,10 @@ impl FtDecoder {
     #[cfg(test)]
     pub fn decode_audio_depth(audio: &[i16], ft4: bool, deep: bool) -> Vec<String> {
         let mut hash = CallsignHashTable::new();
-        decode_slot(audio, ft4, "", &mut hash, deep).iter().map(|m| m.format()).collect()
+        decode_slot(audio, ft4, "", &mut hash, deep)
+            .iter()
+            .map(|m| m.format())
+            .collect()
     }
 
     #[cfg(test)]
@@ -149,6 +200,38 @@ impl FtDecoder {
     #[cfg(test)]
     pub fn audio_buffer(&self) -> Vec<i16> {
         quantize(&self.buf, self.nmax)
+    }
+
+    #[cfg(test)]
+    pub fn force_flush(&mut self) {
+        // Bypass the 75% fill gate so a short test buffer still queues.
+        if self.buf.is_empty() {
+            self.buf.resize(self.nmax, 0.0);
+        } else if self.buf.len() < self.nmax * 3 / 4 {
+            self.buf.resize(self.nmax, 0.0);
+        }
+        self.flush_slot();
+    }
+
+    #[cfg(test)]
+    pub fn take_results_deadline(&mut self, deadline: std::time::Instant) -> bool {
+        while std::time::Instant::now() < deadline {
+            match self.results.try_recv() {
+                Ok(batch) => {
+                    self.pending = false;
+                    self.msgs.extend(batch);
+                    return true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.restart_worker();
+                    return false;
+                }
+            }
+        }
+        false
     }
 
     /// Convert complex baseband from the tuning chain into USB audio (real
@@ -172,10 +255,16 @@ impl FtDecoder {
         if self.buf.len() >= self.nmax * 3 / 4 {
             let audio = quantize(&self.buf, self.nmax);
             self.pending = true;
-            let _ = self.jobs.send(SlotJob {
+            let job = SlotJob {
                 audio,
                 my_call: self.my_call.clone(),
-            });
+            };
+            if let Err(failed) = self.jobs.send(job) {
+                self.restart_worker();
+                if self.jobs.send(failed.0).is_err() {
+                    self.pending = false;
+                }
+            }
         }
         self.buf.clear();
         self.buf.reserve(self.nmax + 4096);
@@ -226,7 +315,11 @@ fn decode_slot(
         // strong neighbour's occupied bandwidth — the situation a hot
         // front end (bias-T + LNA) creates. Local Costas EQ flattens
         // per-tone fading before the LLRs are built.
-        let (sync, cand, rounds) = if deep { (0.75, MAX_CAND, 5) } else { (0.9, 200, 3) };
+        let (sync, cand, rounds) = if deep {
+            (0.75, MAX_CAND, 5)
+        } else {
+            (0.9, 200, 3)
+        };
         let res = DecodeRequest::<Ft4>::new(audio, FREQ_MIN, FREQ_MAX, sync, cand)
             .sic_rounds(rounds)
             .eq_mode(EqMode::Local)
@@ -303,11 +396,7 @@ fn slot_stamp() -> String {
 
 impl Decoder for FtDecoder {
     fn name(&self) -> &'static str {
-        if self.ft4 {
-            "FT4"
-        } else {
-            "FT8"
-        }
+        if self.ft4 { "FT4" } else { "FT8" }
     }
 
     fn bandwidth(&self) -> f32 {
@@ -387,5 +476,37 @@ impl Decoder for FtDecoder {
 
     fn set_station(&mut self, call: &str, _grid: &str) {
         self.my_call = call.to_string();
+    }
+}
+
+#[cfg(test)]
+mod resiliency_tests {
+    use super::*;
+
+    /// A panic in one slot used to kill the worker; Auto then sat silent
+    /// until a band change built a new decoder. The next slot must still
+    /// come back.
+    #[test]
+    fn a_panicking_slot_does_not_silence_the_decoder() {
+        let mut dec = FtDecoder::new(AUDIO_RATE, false);
+        PANIC_NEXT_SLOT.store(true, Ordering::SeqCst);
+        dec.force_flush();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        assert!(
+            dec.take_results_deadline(deadline),
+            "panicking slot never returned"
+        );
+        assert!(
+            !PANIC_NEXT_SLOT.load(Ordering::SeqCst),
+            "panic hook was not consumed"
+        );
+
+        dec.force_flush();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        assert!(
+            dec.take_results_deadline(deadline),
+            "the slot after a panic never came back — this is the band-switch bug"
+        );
+        assert!(!dec.pending);
     }
 }

@@ -89,7 +89,9 @@ impl Radio {
     #[cfg(test)]
     pub fn for_test() -> (Radio, Receiver<Cmd>) {
         let (cmd, cmd_rx) = std::sync::mpsc::channel();
-        Radio::detached(cmd, 192_000.0).map(|r| (r, cmd_rx)).unwrap()
+        Radio::detached(cmd, 192_000.0)
+            .map(|r| (r, cmd_rx))
+            .unwrap()
     }
 
     #[cfg(test)]
@@ -614,7 +616,13 @@ mod tests {
 
     /// The MSi001's discrete filter widths, as the driver reports them.
     const RSP1A: [f64; 8] = [
-        200_000.0, 300_000.0, 600_000.0, 1_536_000.0, 5_000_000.0, 6_000_000.0, 7_000_000.0,
+        200_000.0,
+        300_000.0,
+        600_000.0,
+        1_536_000.0,
+        5_000_000.0,
+        6_000_000.0,
+        7_000_000.0,
         8_000_000.0,
     ];
 
@@ -633,7 +641,10 @@ mod tests {
         // 80m: 500 kHz of band, and a span with room for the filter that fits.
         assert_eq!(choose_bandwidth(&RSP1A, 648_000.0, 500_000.0), 600_000.0);
         // 6m: 4 MHz of band in a 5.016 MS/s span.
-        assert_eq!(choose_bandwidth(&RSP1A, 5_016_000.0, 4_000_000.0), 5_000_000.0);
+        assert_eq!(
+            choose_bandwidth(&RSP1A, 5_016_000.0, 4_000_000.0),
+            5_000_000.0
+        );
         // A narrow band in a wide span takes the narrowest filter that covers
         // it, not the widest that fits, or alias rejection is thrown away.
         assert_eq!(choose_bandwidth(&RSP1A, 648_000.0, 50_000.0), 200_000.0);
@@ -647,7 +658,11 @@ mod tests {
     /// Alias rejection outranks the band edge when nothing can do both.
     #[test]
     fn a_filter_never_exceeds_what_is_digitised() {
-        for (rate, cover) in [(456_000.0, 350_000.0), (192_000.0, 200_000.0), (1_920_000.0, 1_700_000.0)] {
+        for (rate, cover) in [
+            (456_000.0, 350_000.0),
+            (192_000.0, 200_000.0),
+            (1_920_000.0, 1_700_000.0),
+        ] {
             let got = choose_bandwidth(&RSP1A, rate, cover);
             assert!(
                 got <= rate * 1.001,

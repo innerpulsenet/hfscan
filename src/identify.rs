@@ -7,10 +7,10 @@
 //! CW, PSK31, RTTY, an FT8/FT4 pile-up, SSB voice, and AM without
 //! running every decoder on every hertz.
 
+use crate::bands;
 use crate::decoders::cw;
 use crate::decoders::psk31;
-use crate::bands;
-use crate::dsp::mix_decim;
+use crate::dsp::mix_decim_into;
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::f32::consts::PI;
@@ -86,17 +86,16 @@ impl Ident {
 }
 
 /// Classify occupied regions in `spectrum` using a short IQ buffer.
-pub fn classify_span(
-    iq: &[Complex32],
-    fs: f64,
-    spectrum: &[f32],
-    abs_center: f64,
-) -> Vec<Ident> {
+pub fn classify_span(iq: &[Complex32], fs: f64, spectrum: &[f32], abs_center: f64) -> Vec<Ident> {
     if iq.len() < (fs * 0.25) as usize || spectrum.len() < 16 {
         return Vec::new();
     }
     let mut occ = occupancies(spectrum, fs);
-    occ.sort_by(|a, b| b.snr_db.partial_cmp(&a.snr_db).unwrap_or(std::cmp::Ordering::Equal));
+    occ.sort_by(|a, b| {
+        b.snr_db
+            .partial_cmp(&a.snr_db)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     occ.truncate(20);
 
     let mut fft = Psd::new();
@@ -104,8 +103,9 @@ pub fn classify_span(
     let decim = (fs / AUDIO as f64).round().max(1.0) as usize;
     // The achieved audio rate; only equals AUDIO when fs is a multiple.
     let fs_a = (fs / decim as f64) as f32;
+    let mut audio = Vec::with_capacity(iq.len() / decim + 1);
     for o in occ {
-        let audio = mix_decim(iq, fs as f32, o.offset_hz, decim);
+        mix_decim_into(iq, fs as f32, o.offset_hz, decim, &mut audio);
         // The PSD needs a whole FFT frame; on less it would come back flat
         // and every feature computed from it would be garbage.
         if audio.len() < PSD_N {
@@ -152,7 +152,11 @@ pub fn classify_span(
     // strongest-occupancy-first and would just as happily let a mark tone's
     // PSK31 verdict suppress the RTTY ident that explains it. Two tones
     // alternating is the stronger claim whichever arrived first.
-    let spans: Vec<Ident> = out.iter().filter(|i| i.kind == Kind::Rtty).cloned().collect();
+    let spans: Vec<Ident> = out
+        .iter()
+        .filter(|i| i.kind == Kind::Rtty)
+        .cloned()
+        .collect();
     out.retain(|i| i.kind == Kind::Rtty || !spans.iter().any(|r| r.covers(i.offset_hz)));
     cluster_ft(out)
 }
@@ -238,13 +242,13 @@ fn classify_one(
     // looks like a carrier / CW / a 170 Hz neighbour pair (RTTY).
     //
     // Except where the band plan puts a narrowband sub-band inside an FT
-    // window, which it does in five places: FT4 shares a dial frequency with
-    // 30 m PSK31 and with 20 m RTTY, and sits 500 Hz above 40 m RTTY. Vetoing
-    // those outright means those sub-bands can never be classified as
-    // anything, so 30 m PSK31 and 20 m RTTY were simply invisible. The
-    // confirmations are strong enough to be trusted there: a real FT8 message
-    // rendered as complex baseband neither confirms as PSK31 nor frames as
-    // Baudot (see the tests of exactly that).
+    // window, which it does in several places: FT4 shares a dial with 30 m
+    // PSK31 and 20 m RTTY, sits 500 Hz above 40 m RTTY, and 17 m FT8 shares
+    // 18.100 with PSK31 and RTTY. Vetoing those outright means those
+    // sub-bands can never be classified as anything, so 30 m PSK31 and 20 m
+    // RTTY were simply invisible. The confirmations are strong enough to be
+    // trusted there: a real FT8 message rendered as complex baseband neither
+    // confirms as PSK31 nor frames as Baudot (see the tests of exactly that).
     let shared = bands::narrow_mode(abs_hz).is_some();
 
     // FSK first, because it is the one narrowband mode that announces itself.
@@ -258,7 +262,11 @@ fn classify_one(
         // FT8/FT4 window only the band plan's own narrowband sub-bands may
         // claim to be something else.
         if shared || !matches!(ft, Some(Kind::Ft8) | Some(Kind::Ft4)) {
-            return (Kind::Rtty, (0.60 + 0.35 * share).min(0.95), Some((sep, mid)));
+            return (
+                Kind::Rtty,
+                (0.60 + 0.35 * share).min(0.95),
+                Some((sep, mid)),
+            );
         }
     }
 
@@ -315,11 +323,7 @@ fn classify_one(
     }
 
     let wide = coarse_bw.max(fine.obw_hz);
-    if (1200.0..3600.0).contains(&wide)
-        && !fine.carrier
-        && fine.n_peaks < 8
-        && fine.speech > 0.35
-    {
+    if (1200.0..3600.0).contains(&wide) && !fine.carrier && fine.n_peaks < 8 && fine.speech > 0.35 {
         return (Kind::Ssb, 0.62 + 0.2 * fine.speech.min(1.0), None);
     }
     if (1200.0..3600.0).contains(&wide) && !fine.carrier && fine.tonality < 8.0 {
@@ -339,14 +343,11 @@ pub fn cluster_ft(idents: Vec<Ident>) -> Vec<Ident> {
         .into_iter()
         .partition(|i| matches!(i.kind, Kind::Ft8 | Kind::Ft4));
     ft.sort_by(|a, b| {
-        a.kind
-            .label()
-            .cmp(b.kind.label())
-            .then(
-                a.offset_hz
-                    .partial_cmp(&b.offset_hz)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
+        a.kind.label().cmp(b.kind.label()).then(
+            a.offset_hz
+                .partial_cmp(&b.offset_hz)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
     let mut i = 0;
     while i < ft.len() {
@@ -537,14 +538,20 @@ fn fsk_shift(audio: &[Complex32], fs: f32) -> Option<(f32, f32, f32)> {
             .sum()
     };
     let top = (0..nbins).max_by(|&a, &b| {
-        hist[a].partial_cmp(&hist[b]).unwrap_or(std::cmp::Ordering::Equal)
+        hist[a]
+            .partial_cmp(&hist[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
     })?;
     let a_hz = bin_hz(top);
     // The second tone has to be a separate mode, not the shoulder of the
     // first, so anything within 80 Hz of the winner is the same tone.
     let second = (0..nbins)
         .filter(|&b| (bin_hz(b) - a_hz).abs() > 80.0)
-        .max_by(|&x, &y| hist[x].partial_cmp(&hist[y]).unwrap_or(std::cmp::Ordering::Equal))?;
+        .max_by(|&x, &y| {
+            hist[x]
+                .partial_cmp(&hist[y])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
     let b_hz = bin_hz(second);
     let (ma, mb) = (mass(a_hz), mass(b_hz));
     // Bins are 20 Hz; the centroid inside each mode recovers the real tone
@@ -745,7 +752,6 @@ mod tests {
         spec
     }
 
-
     /// Realistic RTTY: idle mark, Baudot characters, 45.45 baud / 170 Hz.
     ///
     /// The existing `classifies_rtty_tone_pair` fixture alternates mark and
@@ -759,7 +765,9 @@ mod tests {
         let sps = fs / 45.45;
         let mut bits: Vec<bool> = vec![true; 60];
         for c in text.chars().take(if idle_only { 0 } else { usize::MAX }) {
-            let Some(code) = LTRS.chars().position(|x| x == c) else { continue };
+            let Some(code) = LTRS.chars().position(|x| x == c) else {
+                continue;
+            };
             bits.push(false);
             for b in 0..5 {
                 bits.push(code as u8 & (1 << b) != 0);
@@ -785,15 +793,13 @@ mod tests {
             for _ in 0..sps as usize {
                 phase += 2.0 * PI * f / fs;
                 out.push(
-                    Complex32::from_polar(1.0, phase)
-                        + Complex32::new(noise(), noise()) * snr,
+                    Complex32::from_polar(1.0, phase) + Complex32::new(noise(), noise()) * snr,
                 );
             }
             i += 1;
         }
         out
     }
-
 
     /// The reported failure: RTTY on the waterfall, labelled PSK31, with a
     /// decoder attached producing nonsense.
@@ -828,7 +834,9 @@ mod tests {
             assert!(
                 hits.is_empty(),
                 "PSK31 confirmed at {probe} Hz on an RTTY signal: {:?}",
-                hits.iter().map(|h| (h.offset_hz, h.quality)).collect::<Vec<_>>()
+                hits.iter()
+                    .map(|h| (h.offset_hz, h.quality))
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -841,7 +849,10 @@ mod tests {
         let rtty = real_rtty(8000.0, 3.0, 0.05, 0.0, false);
         let (sep, mid, _) = fsk_shift(&rtty, 8000.0).expect("170 Hz RTTY is FSK");
         assert!((sep - 170.0).abs() < 25.0, "shift measured as {sep:.0} Hz");
-        assert!(mid.abs() < 40.0, "mid-shift offset {mid:.0} Hz should be near zero");
+        assert!(
+            mid.abs() < 40.0,
+            "mid-shift offset {mid:.0} Hz should be near zero"
+        );
 
         // A station idling on mark is a carrier, and saying so is correct.
         assert!(fsk_shift(&real_rtty(8000.0, 3.0, 0.05, 0.0, true), 8000.0).is_none());
@@ -869,9 +880,8 @@ mod tests {
     #[test]
     fn wide_shifts_are_measured_not_assumed() {
         for want in [425.0f32, 850.0] {
-            let sig = crate::decoders::tests::gen_rtty_at(
-                "CQ DE W1AW ", 8000.0, 0.0, want, 0.03, 3.0,
-            );
+            let sig =
+                crate::decoders::tests::gen_rtty_at("CQ DE W1AW ", 8000.0, 0.0, want, 0.03, 3.0);
             let (sep, _, _) = fsk_shift(&sig, 8000.0)
                 .unwrap_or_else(|| panic!("{want:.0} Hz shift RTTY not seen as FSK"));
             assert!(
@@ -916,11 +926,13 @@ mod tests {
         spec[120] = -50.0;
         let ids = classify_span(&sig, 8000.0, &spec, 14_200_000.0);
         assert!(
-            ids.iter().any(|i| i.kind == Kind::Ssb || i.kind == Kind::Unknown),
+            ids.iter()
+                .any(|i| i.kind == Kind::Ssb || i.kind == Kind::Unknown),
             "SSB-like should not look like CW/PSK, got {ids:?}"
         );
         assert!(
-            !ids.iter().any(|i| i.kind == Kind::Cw || i.kind == Kind::Psk31),
+            !ids.iter()
+                .any(|i| i.kind == Kind::Cw || i.kind == Kind::Psk31),
             "SSB misread as digital: {ids:?}"
         );
     }
@@ -999,7 +1011,8 @@ mod tests {
             "a tone in the FT8 USB window should be FT8, got {ids:?}"
         );
         assert!(
-            !ids.iter().any(|i| i.kind == Kind::Carrier || i.kind == Kind::Rtty),
+            !ids.iter()
+                .any(|i| i.kind == Kind::Carrier || i.kind == Kind::Rtty),
             "must not call FT8 traffic CAR/RTTY: {ids:?}"
         );
     }
@@ -1051,8 +1064,16 @@ mod tests {
             },
         ]);
         let ft: Vec<_> = ids.iter().filter(|i| i.kind == Kind::Ft8).collect();
-        assert_eq!(ft.len(), 1, "two close FT8 blobs should be one pile-up: {ids:?}");
-        assert!(ft[0].bw_hz > 200.0, "cluster should span both, bw={}", ft[0].bw_hz);
+        assert_eq!(
+            ft.len(),
+            1,
+            "two close FT8 blobs should be one pile-up: {ids:?}"
+        );
+        assert!(
+            ft[0].bw_hz > 200.0,
+            "cluster should span both, bw={}",
+            ft[0].bw_hz
+        );
         assert!(ids.iter().any(|i| i.kind == Kind::Cw));
     }
 

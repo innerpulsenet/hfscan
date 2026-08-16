@@ -15,7 +15,7 @@ use crate::decoders::FtMessage;
 use std::collections::HashMap;
 use std::net::{ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -72,7 +72,9 @@ pub fn is_callsign(tok: &str) -> bool {
     }
     // Signal report: optional leading R, then only digits and signs.
     let r = tok.strip_prefix('R').unwrap_or(tok);
-    if r.bytes().all(|c| c == b'+' || c == b'-' || c.is_ascii_digit()) {
+    if r.bytes()
+        .all(|c| c == b'+' || c == b'-' || c.is_ascii_digit())
+    {
         return false;
     }
     tok != "RR73"
@@ -250,7 +252,11 @@ impl SpotQueue {
 
     /// True when the spot was queued, false when the hourly rule suppressed it.
     fn accept(&mut self, spot: Spot) -> bool {
-        let key = (spot.call.clone(), spot.freq_hz / 1_000_000, spot.mode.clone());
+        let key = (
+            spot.call.clone(),
+            spot.freq_hz / 1_000_000,
+            spot.mode.clone(),
+        );
         let fresh = self
             .seen
             .get(&key)
@@ -451,13 +457,11 @@ fn run(
             return;
         }
     };
-    let mut rng = Rng(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
-            .unwrap_or(0x9e3779b9)
-            | 1,
-    );
+    let mut rng = Rng(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+        .unwrap_or(0x9e3779b9)
+        | 1);
     let session = rng.next() as u32;
     let mut seq: u32 = 0; // counts records, per the spec
     let mut packets: u32 = 0;
@@ -485,7 +489,9 @@ fn run(
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
         let chunk = q.take_batch();
-        let pkt = build_packet(&my_call, &my_grid, SOFTWARE, &chunk, seq, session, now, templates);
+        let pkt = build_packet(
+            &my_call, &my_grid, SOFTWARE, &chunk, seq, session, now, templates,
+        );
         let dest = DEST.to_socket_addrs().ok().and_then(|mut a| a.next());
         match dest {
             Some(addr) => match sock.send_to(&pkt, addr) {
@@ -507,10 +513,8 @@ fn run(
                     } else {
                         String::new()
                     };
-                    let _ = log.try_send(format!(
-                        "pskreporter: {} spot(s) sent{held}",
-                        chunk.len()
-                    ));
+                    let _ =
+                        log.try_send(format!("pskreporter: {} spot(s) sent{held}", chunk.len()));
                 }
                 Err(e) => {
                     // Keep the spots for the next attempt, bounded.
@@ -571,7 +575,16 @@ mod tests {
     /// pskreporter.info/pskdev.html (N1DQ, FN42hn, "Homebrew v5.6").
     #[test]
     fn receiver_record_matches_the_spec() {
-        let pkt = build_packet("N1DQ", "FN42hn", "Homebrew v5.6", &[], 1, 0, 1200960114, false);
+        let pkt = build_packet(
+            "N1DQ",
+            "FN42hn",
+            "Homebrew v5.6",
+            &[],
+            1,
+            0,
+            1200960114,
+            false,
+        );
         let mut want = vec![
             0x00, 0x0A, 0x00, 0x00, // version, length (patched below)
             0x47, 0x95, 0x32, 0x72, // time
@@ -743,10 +756,7 @@ mod tests {
         assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]) as usize, pkt.len());
         // Both template set headers and both data block headers are present.
         for magic in [[0x00, 0x03], [0x00, 0x02], [0x9A, 0x92], [0x9A, 0x93]] {
-            assert!(
-                pkt.windows(2).any(|w| w == magic),
-                "missing {magic:02X?}"
-            );
+            assert!(pkt.windows(2).any(|w| w == magic), "missing {magic:02X?}");
         }
     }
 }

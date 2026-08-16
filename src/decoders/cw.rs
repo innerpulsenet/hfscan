@@ -6,9 +6,9 @@
 //! garbage. A passband scout (FFT + keyed-envelope score) finds CW tones
 //! near the cursor and mixes the best one to DC; `n` hops to the next.
 
-use super::callscan::{utc_hhmmss, CallScanner};
+use super::callscan::{CallScanner, utc_hhmmss};
 use super::{CwView, Decoder, FtMessage};
-use crate::dsp::{mix_decim, OnePole, Rotator};
+use crate::dsp::{OnePole, Rotator, mix_decim_into};
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::collections::VecDeque;
@@ -23,8 +23,8 @@ const SCAN_AUDIO: f32 = 8000.0;
 const MARK_HIST: usize = 24;
 /// Envelope history for the scope pane (~0.7 s at 1 kHz).
 const ENV_HIST: usize = 700;
-/// 5–70 WPM. Below that is not Morse; above it the 4 ms envelope lags.
-const DIT_MIN_S: f32 = 0.017; // ~70 WPM
+/// 5–50 WPM. Below that is not Morse; above it noise ripples chop.
+const DIT_MIN_S: f32 = 0.024; // ~50 WPM
 const DIT_MAX_S: f32 = 0.24; // ~5 WPM
 /// Marks held before the clock is trusted and the copy starts flowing.
 /// Enough to cluster a dit and a dah from — about two characters — without
@@ -127,8 +127,8 @@ impl NarrowLpf {
 /// difference between copy and the letters that noise spells.
 ///
 /// Returns `(dit, dah)` in envelope samples.
-fn morse_clock(marks: &[f32]) -> Option<(f32, f32)> {
-    if marks.len() < 4 {
+fn morse_clock(marks: &[f32], gaps: &[f32]) -> Option<(f32, f32)> {
+    if marks.len() < 3 {
         return None;
     }
     let mut v: Vec<f32> = marks.to_vec();
@@ -142,6 +142,17 @@ fn morse_clock(marks: &[f32]) -> Option<(f32, f32)> {
         }
         let near = v.iter().filter(|&&x| (x - med).abs() <= 0.35 * med).count();
         if near * 10 >= v.len() * 7 {
+            // Disambiguate all-dits vs all-dahs using inter-element gaps if available:
+            if gaps.len() >= 2 {
+                let mut g = gaps.to_vec();
+                g.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let short_gap = g[g.len() / 4];
+                if short_gap > 0.0 && short_gap <= 0.55 * med {
+                    // Marks are dahs (~3 dits), inter-element gaps are dits (~1 dit)
+                    let dit = (med / 3.0).max(short_gap);
+                    return Some((dit, med));
+                }
+            }
             return Some((med, 3.0 * med));
         }
     }
@@ -179,7 +190,12 @@ fn morse_clock(marks: &[f32]) -> Option<(f32, f32)> {
         .iter()
         .filter(|&&x| {
             let d = (x - short).abs().min((x - long).abs());
-            d <= 0.36 * if (x - short).abs() < (x - long).abs() { short } else { long }
+            d <= 0.38
+                * if (x - short).abs() < (x - long).abs() {
+                    short
+                } else {
+                    long
+                }
         })
         .count();
     if near * 10 < v.len() * 7 {
@@ -190,7 +206,7 @@ fn morse_clock(marks: &[f32]) -> Option<(f32, f32)> {
 
 /// Whether the gaps between marks are keyed by the same clock as the marks.
 fn gaps_match_clock(gaps: &[f32], dit: f32) -> bool {
-    if gaps.len() < 3 || dit <= 0.0 {
+    if gaps.len() < 2 || dit <= 0.0 {
         return true;
     }
     let mut v: Vec<f32> = gaps.to_vec();
@@ -198,7 +214,7 @@ fn gaps_match_clock(gaps: &[f32], dit: f32) -> bool {
     // The inter-element gap is the commonest, so the lower half of the
     // distribution is the one to compare against a dit.
     let short = v[v.len() / 4];
-    (0.40..=2.6).contains(&(short / dit))
+    (0.35..=2.8).contains(&(short / dit))
 }
 
 /// A CW tone found by the span scout or the in-passband searcher.
@@ -251,13 +267,6 @@ pub struct CwDecoder {
     off_thr: f32,
     tune_err: f32,
     /// Mean envelope well inside a mark, and well inside a space.
-    ///
-    /// Kept apart from `peak` and `floor`, which are slicer thresholds: those
-    /// are pulled toward each other on purpose — `peak` decays toward the
-    /// current envelope and `floor` is dragged up by the filter's tail out of
-    /// each mark — so their ratio barely moves when the band does. These two
-    /// sample only the settled middle of an element, and are the only honest
-    /// read of signal and noise the decoder has. Zero means not yet seen.
     mark_env: f32,
     space_env: f32,
     prev_mixed: Complex32,
@@ -301,8 +310,6 @@ impl CwDecoder {
         Self {
             fs,
             env_rate,
-            // ~3 ms envelope: still passes a 50 WPM dit (~24 ms) with room
-            // to spare, but follows QRQ edges better than 4 ms.
             smooth: OnePole::new(0.003 * fs),
             matched: VecDeque::new(),
             matched_sum: 0.0,
@@ -357,11 +364,7 @@ impl CwDecoder {
 
     pub fn wpm(&self) -> f32 {
         let dit_ms = self.dit / self.env_rate * 1000.0;
-        if dit_ms > 1.0 {
-            1200.0 / dit_ms
-        } else {
-            0.0
-        }
+        if dit_ms > 1.0 { 1200.0 / dit_ms } else { 0.0 }
     }
 
     fn mix(&mut self, s: Complex32) -> Complex32 {
@@ -376,11 +379,6 @@ impl CwDecoder {
     }
 
     /// Match the post-mix filter to the tracked keying speed.
-    ///
-    /// Held wide while the clock is still being learned: a filter narrowed
-    /// onto the wrong speed distorts the very envelope the speed is estimated
-    /// from, and the decoder would have no way back out of that. The 8%
-    /// hysteresis stops an idling estimator retuning the filter every mark.
     fn update_post_mix(&mut self) {
         let want = if self.warming {
             POST_MIX_HZ
@@ -402,8 +400,6 @@ impl CwDecoder {
     }
 
     /// How long the slicer must hold a new state before the edge is real.
-    /// Scales with the dit so QRQ is not smeared, floored so a single
-    /// noisy envelope sample can never key the decoder.
     fn debounce_env(&self) -> f32 {
         (0.25 * self.dit).clamp(0.006 * self.env_rate, 0.030 * self.env_rate)
     }
@@ -414,49 +410,49 @@ impl CwDecoder {
         }
         let sym = std::mem::take(&mut self.symbol);
         // Only emit symbols if there is carrier SNR
-        let snr_ok = self.peak > 2.0 * self.floor.max(1e-9);
+        let snr_ok = self.peak > 1.8 * self.floor.max(1e-9);
         if !snr_ok {
             return;
         }
-        let c = morse_lookup(&sym).unwrap_or('*');
-        self.text.push(c);
-        self.scan.push(c);
+        if let Some(c) = morse_lookup(&sym) {
+            let is_dit = sym == ".";
+            if is_dit && self.quality < 0.40 {
+                return;
+            }
+            self.text.push(c);
+            self.scan.push(c);
+        } else {
+            self.text.push('*');
+            self.scan.push('*');
+            self.quality *= 0.85;
+        }
     }
 
     fn on_mark_end(&mut self, len: f32) {
-        // Nothing in Morse is longer than a dah. A mark several dahs long is
-        // a carrier, a tuner-upper, or the channel filter and the threshold
-        // tracker settling at switch-on — classifying it prepends a phantom
-        // dah to the first real character.
-        if len > 6.0 * self.dah || len > 1.2 * self.env_rate {
+        if len > 6.0 * self.dah || len > 1.4 * self.env_rate {
             self.symbol.clear();
             self.warmup.clear();
             return;
         }
-        // While the clock is still being learned the elements are held, not
-        // classified: the dit estimate starts at 20 WPM, so a station sending
-        // anything else has its first characters decoded against the wrong
-        // ruler and comes out as garbage. Held elements are replayed once the
-        // cluster below has a speed to classify them with.
+        if !self.warming && len < 0.012 * self.env_rate {
+            // Discard sub-12ms noise glitch
+            return;
+        }
         if self.warming {
             self.warmup.push((len, true));
-            if self.warmup.iter().filter(|(_, m)| *m).count() >= WARMUP_MARKS {
+            let n_marks = self.warmup.iter().filter(|(_, m)| *m).count();
+            if n_marks >= WARMUP_MARKS {
                 self.flush_warmup();
             }
             return;
         }
         self.classify_mark(len);
 
-        // The structure check has to keep running, not just gate entry. Noise
-        // that flukes its way through one warm-up would otherwise be decoded
-        // for as long as it lasts, and on an empty frequency that is forever.
-        // A real fist stays inside `morse_clock`'s tolerance; noise does not,
-        // and dropping back to warm-up costs only the next few elements.
-        if self.marks.len() >= WARMUP_MARKS {
+        if self.marks.len() >= 12 {
             let recent: Vec<f32> = self.marks.iter().copied().collect();
-            if morse_clock(&recent).is_none() {
-                // Only drop back to warm-up if the signal has truly collapsed into noise.
-                if self.peak < 2.3 * self.floor.max(1e-9) || self.quality < 0.15 {
+            let gaps: Vec<f32> = Vec::new();
+            if morse_clock(&recent, &gaps).is_none() {
+                if self.peak < 1.5 * self.floor.max(1e-9) || self.quality < 0.05 {
                     self.symbol.clear();
                     self.warmup.clear();
                     self.warming = true;
@@ -467,11 +463,6 @@ impl CwDecoder {
     }
 
     /// Set the clock from the held elements, then replay them.
-    ///
-    /// Clustering the whole warm-up at once beats tracking through it: the
-    /// first characters get the same speed estimate as the rest of the
-    /// transmission rather than whatever the tracker had converged to by the
-    /// time it reached them.
     fn flush_warmup(&mut self) {
         let marks: Vec<f32> = self
             .warmup
@@ -485,21 +476,23 @@ impl CwDecoder {
             .filter(|(_, m)| !*m)
             .map(|(l, _)| *l)
             .collect();
-        let clock = morse_clock(&marks).filter(|(dit, _)| gaps_match_clock(&gaps, *dit));
-        let Some((dit, dah)) = clock else {
-            // These marks are not Morse — on an empty frequency the slicer
-            // keys on the band noise, because `floor` chases the envelope
-            // minima rather than its mean and the thresholds end up sitting
-            // inside the noise. Rather than emit the letters that noise
-            // spells, drop what was held and keep waiting for a real fist.
-            // The oldest mark goes so a signal starting mid-buffer can still
-            // fill the window.
-            if let Some(i) = self.warmup.iter().position(|(_, m)| *m) {
-                self.warmup.drain(..=i);
-            } else {
-                self.warmup.clear();
+        let clock = morse_clock(&marks, &gaps).filter(|(dit, _)| gaps_match_clock(&gaps, *dit));
+        let (dit, dah) = match clock {
+            Some((dit, dah)) => (dit, dah),
+            None => {
+                if marks.len() >= WARMUP_MARKS {
+                    if let Some(i) = self.warmup.iter().position(|(_, m)| *m) {
+                        self.warmup.drain(..=i);
+                    } else {
+                        self.warmup.clear();
+                    }
+                    return;
+                } else if self.dit >= DIT_MIN_S * self.env_rate {
+                    (self.dit, self.dah)
+                } else {
+                    return;
+                }
             }
-            return;
         };
         self.dit = dit;
         self.dah = dah;
@@ -510,10 +503,6 @@ impl CwDecoder {
         }
 
         let mut held: Vec<(f32, bool)> = std::mem::take(&mut self.warmup);
-        // A stray mark or two picked up off the band before the station
-        // started, separated from the real copy by more than a word space, is
-        // not part of it — and prepending the letter that noise spelled to
-        // someone's callsign is the most visible way to be wrong.
         if let Some(cut) = held.iter().position(|(l, m)| !*m && *l > 7.0 * dit)
             && held[..cut].iter().filter(|(_, m)| *m).count() <= 2
         {
@@ -532,23 +521,11 @@ impl CwDecoder {
 
     /// Classify one mark against the current clock and add it to the symbol.
     fn classify_mark(&mut self, len: f32) {
-        let mut dit = self.dit.max(1e-6);
-        let mut ratio = len / dit;
+        let dit = self.dit.max(1e-6);
+        let ratio = len / dit;
 
-        // Fast tracking on sudden speed change (>1.5x speedup or slowdown)
-        if ratio < 0.65 && len >= DIT_MIN_S * self.env_rate {
-            self.dit = 0.25 * self.dit + 0.75 * len;
-            self.dah = 0.25 * self.dah + 0.75 * (3.0 * len);
-            self.acquire = 12;
-            dit = self.dit.max(1e-6);
-            ratio = len / dit;
-        } else if ratio > 4.5 && len <= DIT_MAX_S * self.env_rate {
-            let new_dit = (len / 3.0).clamp(DIT_MIN_S * self.env_rate, DIT_MAX_S * self.env_rate);
-            self.dit = 0.25 * self.dit + 0.75 * new_dit;
-            self.dah = 0.25 * self.dah + 0.75 * len;
-            self.acquire = 12;
-            dit = self.dit.max(1e-6);
-            ratio = len / dit;
+        if ratio < 0.40 {
+            return;
         }
 
         // Classify against the midpoint of the *tracked* dit and dah, not a
@@ -563,24 +540,17 @@ impl CwDecoder {
             self.marks.pop_front();
         }
 
-        // Fast while acquiring (after idle or a speed snap), then only
-        // trust unambiguous dits and dahs so Farnsworth gaps and a
-        // mid-element speed change cannot drag the estimate.
-        let alpha = if self.acquire > 0 { 0.45 } else { 0.20 };
+        let alpha = if self.acquire > 0 { 0.20 } else { 0.08 };
         if self.acquire > 0 {
             self.acquire -= 1;
         }
-        let dah_r = (self.dah / dit).clamp(1.8, 4.8);
-        if !is_dah && ratio < 1.65 {
+        let dah_r = (self.dah / dit).clamp(2.0, 4.2);
+        if !is_dah && ratio < 1.45 && ratio > 0.60 {
             self.dit = (1.0 - alpha) * self.dit + alpha * len;
-        } else if is_dah && ratio < 5.2 {
-            let a = alpha * 0.55;
+        } else if is_dah && ratio < 4.2 && ratio > 2.0 {
+            let a = alpha * 0.5;
             self.dah = (1.0 - a) * self.dah + a * len;
-            if ratio > boundary * 1.15 {
-                // Unambiguous dah: it carries the clock too, scaled by the
-                // operator's own dah/dit ratio rather than an assumed 3.
-                self.dit = (1.0 - a) * self.dit + a * (len / dah_r);
-            }
+            self.dit = (1.0 - a) * self.dit + a * (len / dah_r);
         }
         self.clamp_dit();
 
@@ -588,15 +558,24 @@ impl CwDecoder {
             self.recluster();
         }
 
-        // Confidence: how cleanly this mark sat in a dit or dah bucket,
-        // weighted by real carrier SNR so noise cannot score high quality.
         let fit = if is_dah {
             1.0 - (len / self.dah.max(1e-6) - 1.0).abs().min(1.0)
         } else {
             1.0 - (ratio - 1.0).abs().min(1.0)
         };
         let snr_factor = ((self.peak / self.floor.max(1e-9) - 1.0) / 1.8).clamp(0.0, 1.0);
-        self.quality = 0.88 * self.quality + 0.12 * (fit * snr_factor);
+        let sample_q = fit * snr_factor;
+
+        let dah_count = self.marks.iter().filter(|&&m| m >= 1.7 * self.dit).count();
+        let dit_count = self.marks.iter().filter(|&&m| m < 1.7 * self.dit).count();
+        let coherent = if self.marks.len() >= 6 {
+            dah_count >= 1 && dit_count >= 1
+        } else {
+            true
+        };
+        let target_q = if coherent { sample_q } else { sample_q * 0.35 };
+        let q_alpha = if self.acquire > 0 { 0.28 } else { 0.12 };
+        self.quality = (1.0 - q_alpha) * self.quality + q_alpha * target_q;
     }
 
     /// Two-mean cluster of recent mark lengths. If the short cluster is a
@@ -615,13 +594,11 @@ impl CwDecoder {
             if med < 1e-6 {
                 return;
             }
-            let rel = (med - self.dit).abs() / self.dit.max(1e-6);
-            if rel > 0.28 && (med / self.dit < 0.65 || (med / self.dah - 1.0).abs() > 0.3) {
-                self.dit = 0.50 * self.dit + 0.50 * med;
-                self.dah = 3.0 * self.dit;
-                self.acquire = 8;
+            let is_dah_cluster = (med - self.dah).abs() < (med - self.dit).abs() && med > 1.8 * self.dit;
+            if is_dah_cluster {
+                self.dah = 0.75 * self.dah + 0.25 * med;
+                self.clamp_dit();
             }
-            self.clamp_dit();
             return;
         }
         let (mut c1, mut c2) = (c1_init, c2_init);
@@ -647,25 +624,32 @@ impl CwDecoder {
             }
         }
         let (short, long, n_short) = if c1 <= c2 {
-            let n = v.iter().filter(|&&x| (x - c1).abs() <= (x - c2).abs()).count();
+            let n = v
+                .iter()
+                .filter(|&&x| (x - c1).abs() <= (x - c2).abs())
+                .count();
             (c1, c2, n)
         } else {
-            let n = v.iter().filter(|&&x| (x - c2).abs() <= (x - c1).abs()).count();
+            let n = v
+                .iter()
+                .filter(|&&x| (x - c2).abs() <= (x - c1).abs())
+                .count();
             (c2, c1, n)
         };
-        if n_short < 2 || short < 1e-6 {
+        let n_long = v.len() - n_short;
+        if n_short < 2 || n_long < 1 || short < 1e-6 {
             return;
         }
         let r = long / short;
-        if !(1.75..=5.0).contains(&r) {
+        if !(1.75..=4.8).contains(&r) {
             return;
         }
         let rel = (short - self.dit).abs() / self.dit.max(1e-6);
-        if rel > 0.28 {
-            // Speed changed: adopt most of the new dit in one go.
-            self.dit = 0.40 * self.dit + 0.60 * short;
-            self.dah = 0.40 * self.dah + 0.60 * long;
-            self.acquire = 10;
+        if rel > 0.22 {
+            // Speed changed: adopt the new clock directly from the measured cluster
+            self.dit = short;
+            self.dah = long;
+            self.acquire = 8;
         } else {
             self.dit = 0.80 * self.dit + 0.20 * short;
             self.dah = 0.80 * self.dah + 0.20 * long;
@@ -674,19 +658,16 @@ impl CwDecoder {
     }
 
     fn on_space_end(&mut self, len: f32) {
-        // Held with the marks, so the gaps are read against the same clock
-        // the marks around them end up classified with.
         if self.warming {
             if !self.warmup.is_empty() {
                 self.warmup.push((len, false));
             }
             return;
         }
-        // Adaptive character boundary: 2.05 dits prevents splitting on element jitter
-        // while cleanly separating characters (>=2.05 dits) and words (>=4.8 dits).
-        if len >= 2.05 * self.dit {
+        // Adaptive character boundary: 2.1 dits cleanly separates elements (1 dit) and characters (3 dits)
+        if len >= 2.1 * self.dit {
             self.push_symbol();
-            if len >= 4.8 * self.dit {
+            if len >= 5.5 * self.dit {
                 self.scan.push(' ');
                 if !self.text.ends_with(' ') && !self.text.is_empty() {
                     self.text.push(' ');
@@ -721,10 +702,7 @@ impl CwDecoder {
         let mut peaks: Vec<(usize, f32)> = Vec::new();
         for k in 1..=max_bin {
             let v = mag(self.fft_buf[k]);
-            if v >= mag(self.fft_buf[k - 1])
-                && v >= mag(self.fft_buf[k + 1])
-                && v / med >= 4.0
-            {
+            if v >= mag(self.fft_buf[k - 1]) && v >= mag(self.fft_buf[k + 1]) && v / med >= 4.0 {
                 peaks.push((k, v / med));
             }
             let kn = n - k;
@@ -748,7 +726,10 @@ impl CwDecoder {
             };
             let hz = hz.clamp(-SEARCH_HZ, SEARCH_HZ);
             if let Some((q, _)) = score_cw(slice, self.fs, hz) {
-                if fresh.iter().any(|h: &CwHit| (h.offset_hz - hz).abs() < 40.0) {
+                if fresh
+                    .iter()
+                    .any(|h: &CwHit| (h.offset_hz - hz).abs() < 40.0)
+                {
                     continue;
                 }
                 fresh.push(CwHit {
@@ -758,7 +739,11 @@ impl CwDecoder {
                 });
             }
         }
-        fresh.sort_by(|a, b| b.quality.partial_cmp(&a.quality).unwrap_or(std::cmp::Ordering::Equal));
+        fresh.sort_by(|a, b| {
+            b.quality
+                .partial_cmp(&a.quality)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         if fresh.is_empty() {
             return;
@@ -773,8 +758,15 @@ impl CwDecoder {
                 None => self.hits.push(n),
             }
         }
-        self.hits
-            .sort_by(|a, b| b.quality.partial_cmp(&a.quality).unwrap_or(std::cmp::Ordering::Equal));
+        self.hits.sort_by(|a, b| {
+            let dist_a = (a.offset_hz - self.mix_hz).abs();
+            let dist_b = (b.offset_hz - self.mix_hz).abs();
+            let rank_a = a.quality - (dist_a / 400.0).min(0.20);
+            let rank_b = b.quality - (dist_b / 400.0).min(0.20);
+            rank_b
+                .partial_cmp(&rank_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         self.hits.truncate(8);
 
         if self.hold_tune > 0 {
@@ -806,18 +798,6 @@ impl CwDecoder {
     }
 
     /// SNR in a 2500 Hz reference bandwidth, for the spot report.
-    ///
-    /// `mark_env` and `space_env` are mean amplitudes out of the same chain, so
-    /// their ratio is a signal-to-noise ratio in this decoder's own noise
-    /// bandwidth. Three corrections turn that into the figure the reporting
-    /// convention wants. The space level is the mean of a Rayleigh envelope,
-    /// which sits at 0.886 of the noise power's square root, hence 1.05 dB.
-    /// The four-pole 150 Hz post-mix filter passes about 147 Hz of noise
-    /// against the 2500 Hz reference, hence 12.3 dB. The last is measured
-    /// rather than derived: the asymmetric averaging that keeps the ramps out
-    /// of the levels settles each one a little past the middle of its own
-    /// distribution, which reads about 3 dB high. Checked against synthesised
-    /// signals of known SNR from -1 to +25 dB, where it holds to about 1 dB.
     fn spot_snr(&self) -> f32 {
         if self.mark_env <= 0.0 || self.space_env <= 0.0 {
             return -24.0;
@@ -898,6 +878,7 @@ impl CwDecoder {
         } else {
             env > on_thr && snr_ok
         };
+
         self.on_thr = on_thr;
         self.off_thr = off_thr;
 
@@ -915,7 +896,11 @@ impl CwDecoder {
             if *level <= 0.0 {
                 *level = env;
             } else {
-                let a = if (env > *level) == clean_is_up { 0.05 } else { 0.002 };
+                let a = if (env > *level) == clean_is_up {
+                    0.05
+                } else {
+                    0.002
+                };
                 *level += (env - *level) * a;
             }
         }
@@ -938,7 +923,7 @@ impl CwDecoder {
                 self.run = self.pending;
                 self.pending = 0.0;
                 if self.key_down {
-                    if len > 0.010 * self.env_rate {
+                    if len >= 0.010 * self.env_rate {
                         self.on_mark_end(len);
                     }
                 } else if self.started {
@@ -952,15 +937,18 @@ impl CwDecoder {
 
         if !self.key_down {
             self.idle += 1.0;
-            if self.idle > 8.0 * self.dit {
+            if self.idle > 6.0 * self.dit {
                 if !self.symbol.is_empty() {
                     self.push_symbol();
                 }
-                if (self.idle - 8.0 * self.dit) <= 1.0 {
+                if (self.idle - 6.0 * self.dit) <= 1.0 {
                     self.scan.push(' ');
+                    if !self.text.ends_with(' ') && !self.text.is_empty() {
+                        self.text.push(' ');
+                    }
                 }
             }
-            if self.idle > 1.6 * self.env_rate {
+            if self.idle > 6.0 * self.env_rate {
                 self.acquire = self.acquire.max(12);
                 if !self.warming {
                     self.symbol.clear();
@@ -968,10 +956,14 @@ impl CwDecoder {
                     self.marks.clear();
                 }
             }
-            if self.warming && !self.warmup.is_empty() && self.idle > 3.0 * self.env_rate {
-                self.flush_warmup();
-                self.warming = true;
-                self.warmup.clear();
+            if self.warming && !self.warmup.is_empty() {
+                let marks_count = self.warmup.iter().filter(|(_, m)| *m).count();
+                if marks_count >= 3 && self.started && self.idle > 6.0 * self.dit {
+                    self.flush_warmup();
+                } else if self.idle > 1.5 * self.env_rate {
+                    self.warmup.clear();
+                    self.warming = true;
+                }
             }
         }
     }
@@ -1077,11 +1069,7 @@ impl Decoder for CwDecoder {
             self.search_buf.drain(..excess);
         }
         self.since_search += samples.len();
-        let interval = if self.locked {
-            FFT_SIZE * 4
-        } else {
-            FFT_SIZE
-        };
+        let interval = if self.locked { FFT_SIZE * 4 } else { FFT_SIZE };
         if self.since_search >= interval && self.search_buf.len() >= FFT_SIZE {
             self.since_search = 0;
             self.search();
@@ -1112,7 +1100,9 @@ impl Decoder for CwDecoder {
                 continue;
             }
 
-            let matched_n = (0.35 * self.dit).round().clamp(4.0, self.env_rate * DIT_MAX_S) as usize;
+            let matched_n = (0.35 * self.dit)
+                .round()
+                .clamp(4.0, self.env_rate * DIT_MAX_S) as usize;
             self.matched.push_back(raw_env);
             self.matched_sum += raw_env;
             while self.matched.len() > matched_n {
@@ -1187,9 +1177,10 @@ pub fn scan_span(iq: &[Complex32], fs: f64, peaks: &[(f64, f32)]) -> Vec<CwHit> 
     if iq.len() / decim < need {
         return Vec::new();
     }
+    let mut audio = Vec::with_capacity(iq.len() / decim + 1);
     let mut out = Vec::new();
     for &(off, _) in peaks {
-        let audio = mix_decim(iq, fs as f32, off as f32, decim);
+        mix_decim_into(iq, fs as f32, off as f32, decim, &mut audio);
         if audio.len() < need {
             continue;
         }
@@ -1288,14 +1279,16 @@ fn score_cw(buf: &[Complex32], fs: f32, hz: f32) -> Option<(f32, f32)> {
 
     let mut quality = ((snr - 2.0) / 6.0).clamp(0.2, 1.0);
     quality *= 0.55 + 0.45 * (1.0 - (duty - 0.4).abs());
-    if marks.len() >= 3 {
+    if marks.len() >= 4 {
         let mut ms = marks.clone();
         ms.sort_unstable();
         let short = ms[ms.len() / 4].max(1) as f32;
         let long = ms[ms.len() * 3 / 4] as f32;
         let r = long / short;
-        if (2.0..=5.0).contains(&r) {
+        if (1.75..=5.0).contains(&r) {
             quality = (quality + 0.25).min(1.0);
+        } else if r < 1.4 {
+            quality *= 0.70;
         }
     }
     if quality < 0.35 {
@@ -1306,20 +1299,60 @@ fn score_cw(buf: &[Complex32], fs: f32, hz: f32) -> Option<(f32, f32)> {
 
 fn morse_lookup(sym: &str) -> Option<char> {
     const TABLE: &[(&str, char)] = &[
-        (".-", 'A'), ("-...", 'B'), ("-.-.", 'C'), ("-..", 'D'), (".", 'E'),
-        ("..-.", 'F'), ("--.", 'G'), ("....", 'H'), ("..", 'I'), (".---", 'J'),
-        ("-.-", 'K'), (".-..", 'L'), ("--", 'M'), ("-.", 'N'), ("---", 'O'),
-        (".--.", 'P'), ("--.-", 'Q'), (".-.", 'R'), ("...", 'S'), ("-", 'T'),
-        ("..-", 'U'), ("...-", 'V'), (".--", 'W'), ("-..-", 'X'), ("-.--", 'Y'),
+        (".-", 'A'),
+        ("-...", 'B'),
+        ("-.-.", 'C'),
+        ("-..", 'D'),
+        (".", 'E'),
+        ("..-.", 'F'),
+        ("--.", 'G'),
+        ("....", 'H'),
+        ("..", 'I'),
+        (".---", 'J'),
+        ("-.-", 'K'),
+        (".-..", 'L'),
+        ("--", 'M'),
+        ("-.", 'N'),
+        ("---", 'O'),
+        (".--.", 'P'),
+        ("--.-", 'Q'),
+        (".-.", 'R'),
+        ("...", 'S'),
+        ("-", 'T'),
+        ("..-", 'U'),
+        ("...-", 'V'),
+        (".--", 'W'),
+        ("-..-", 'X'),
+        ("-.--", 'Y'),
         ("--..", 'Z'),
-        ("-----", '0'), (".----", '1'), ("..---", '2'), ("...--", '3'),
-        ("....-", '4'), (".....", '5'), ("-....", '6'), ("--...", '7'),
-        ("---..", '8'), ("----.", '9'),
-        (".-.-.-", '.'), ("--..--", ','), ("..--..", '?'), (".----.", '\''),
-        ("-.-.--", '!'), ("-..-.", '/'), ("-.--.", '('), ("-.--.-", ')'),
-        (".-...", '&'), ("---...", ':'), ("-.-.-.", ';'), ("-...-", '='),
-        (".-.-.", '+'), ("-....-", '-'), ("..--.-", '_'), (".-..-.", '"'),
-        ("...-..-", '$'), (".--.-.", '@'),
+        ("-----", '0'),
+        (".----", '1'),
+        ("..---", '2'),
+        ("...--", '3'),
+        ("....-", '4'),
+        (".....", '5'),
+        ("-....", '6'),
+        ("--...", '7'),
+        ("---..", '8'),
+        ("----.", '9'),
+        (".-.-.-", '.'),
+        ("--..--", ','),
+        ("..--..", '?'),
+        (".----.", '\''),
+        ("-.-.--", '!'),
+        ("-..-.", '/'),
+        ("-.--.", '('),
+        ("-.--.-", ')'),
+        (".-...", '&'),
+        ("---...", ':'),
+        ("-.-.-.", ';'),
+        ("-...-", '='),
+        (".-.-.", '+'),
+        ("-....-", '-'),
+        ("..--.-", '_'),
+        (".-..-.", '"'),
+        ("...-..-", '$'),
+        (".--.-.", '@'),
     ];
     TABLE.iter().find(|(s, _)| *s == sym).map(|(_, c)| *c)
 }

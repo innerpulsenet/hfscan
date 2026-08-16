@@ -14,13 +14,13 @@
 //! the lock to DC. Once locked, a raised-cosine matched filter, Gardner-style
 //! dump timing, and the AFC keep the demod calibrated.
 
-use super::callscan::{utc_hhmmss, CallScanner};
+use super::callscan::{CallScanner, utc_hhmmss};
 use super::{Decoder, FtMessage, PskView};
-use std::collections::VecDeque;
-use crate::dsp::{mix_decim, Rotator};
+use crate::dsp::{Rotator, mix_decim_into};
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::f32::consts::PI;
 use std::sync::Arc;
 
@@ -349,10 +349,22 @@ impl Psk31Decoder {
             }
         };
         let v0 = mag(self.fft_buf[0]);
-        consider(0, v0, mag(self.fft_buf[1]), mag(self.fft_buf[n - 1]), &mut peaks);
+        consider(
+            0,
+            v0,
+            mag(self.fft_buf[1]),
+            mag(self.fft_buf[n - 1]),
+            &mut peaks,
+        );
         for k in 1..=max_bin {
             let v = mag(self.fft_buf[k]);
-            consider(k, v, mag(self.fft_buf[k - 1]), mag(self.fft_buf[k + 1]), &mut peaks);
+            consider(
+                k,
+                v,
+                mag(self.fft_buf[k - 1]),
+                mag(self.fft_buf[k + 1]),
+                &mut peaks,
+            );
             let kn = n - k;
             let vn = mag(self.fft_buf[kn]);
             let lo = mag(self.fft_buf[(kn + n - 1) % n]);
@@ -367,7 +379,10 @@ impl Psk31Decoder {
             let hz = interp_hz(&self.fft_buf, k, n, bin_hz).clamp(-SEARCH_HZ, SEARCH_HZ);
             let hz = refine_hz(slice, self.fs, hz, self.sps);
             if let Some((q, _)) = confirm_psk(slice, self.fs, hz, self.sps) {
-                if hits.iter().any(|h: &PskHit| (h.offset_hz - hz).abs() < 12.0) {
+                if hits
+                    .iter()
+                    .any(|h: &PskHit| (h.offset_hz - hz).abs() < 12.0)
+                {
                     continue;
                 }
                 // Last and strictest: is it keying at 31.25 baud? Checked once
@@ -388,7 +403,11 @@ impl Psk31Decoder {
                 });
             }
         }
-        hits.sort_by(|a, b| b.quality.partial_cmp(&a.quality).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.quality
+                .partial_cmp(&a.quality)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         if hits.is_empty() {
             // Idle between characters often produces no fresh peak. Keep
@@ -406,8 +425,11 @@ impl Psk31Decoder {
                 None => self.hits.push(n),
             }
         }
-        self.hits
-            .sort_by(|a, b| b.quality.partial_cmp(&a.quality).unwrap_or(std::cmp::Ordering::Equal));
+        self.hits.sort_by(|a, b| {
+            b.quality
+                .partial_cmp(&a.quality)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         self.hits.truncate(8);
 
         if self.hold_tune > 0 {
@@ -549,7 +571,6 @@ impl Psk31Decoder {
             self.pending_zero = true;
         }
     }
-
 }
 
 /// True PSK31 after mixing `hz` to DC: BPSK on the real axis, a plausible
@@ -1011,11 +1032,7 @@ impl Decoder for Psk31Decoder {
             self.search_buf.drain(..excess);
         }
         self.since_search += samples.len();
-        let interval = if self.locked {
-            FFT_SIZE * 4
-        } else {
-            FFT_SIZE
-        };
+        let interval = if self.locked { FFT_SIZE * 4 } else { FFT_SIZE };
         if self.since_search >= interval && self.search_buf.len() >= FFT_SIZE {
             self.since_search = 0;
             self.search();
@@ -1101,7 +1118,11 @@ impl Decoder for Psk31Decoder {
     fn status(&self) -> String {
         let hz = self.lock_hz();
         let n = self.hits.len();
-        let more = if n > 1 { format!(" +{}", n - 1) } else { String::new() };
+        let more = if n > 1 {
+            format!(" +{}", n - 1)
+        } else {
+            String::new()
+        };
         let q = self.conf() * 100.0;
         if self.locked {
             format!("lock {hz:+.1}Hz q={q:.0}%{more}")
@@ -1137,15 +1158,18 @@ pub fn scan_span(iq: &[Complex32], fs: f64, peaks: &[(f64, f32)]) -> Vec<PskHit>
     if iq.len() / decim < need {
         return Vec::new();
     }
+    let mut audio = Vec::with_capacity(iq.len() / decim + 1);
     let mut out = Vec::new();
     for &(off, _) in peaks {
-        let audio = mix_decim(iq, fs as f32, off as f32, decim);
+        mix_decim_into(iq, fs as f32, off as f32, decim, &mut audio);
         if audio.len() < need {
             continue;
         }
         let hz = refine_hz(&audio, SCAN_AUDIO, 0.0, sps);
         if let Some((q, _)) = confirm_psk(&audio, SCAN_AUDIO, hz, sps) {
-            if out.iter().any(|h: &PskHit| (h.offset_hz - (off as f32 + hz)).abs() < 30.0)
+            if out
+                .iter()
+                .any(|h: &PskHit| (h.offset_hz - (off as f32 + hz)).abs() < 30.0)
             {
                 continue;
             }

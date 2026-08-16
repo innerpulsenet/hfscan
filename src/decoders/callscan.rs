@@ -172,7 +172,11 @@ impl CallScanner {
             Hear::AfterDeCall => {
                 // Classic idle: "DE CALL CALL". A single "DE CALL" is accepted
                 // as well — plenty of operators send it only once.
-                let call = if is_callsign(&w) { w } else { self.last.clone() };
+                let call = if is_callsign(&w) {
+                    w
+                } else {
+                    self.last.clone()
+                };
                 self.emit(call);
                 self.hear = Hear::Idle;
             }
@@ -268,8 +272,18 @@ mod tests {
         }
         // Real calls, including the awkward shapes, all still pass.
         for w in [
-            "K1ABC", "W1AW", "G4XYZ", "JA1ABC", "VE3ABC", "N0CAL", "2E0ABC", "4X4AB", "9A1CD",
-            "GB100MCM", "K1ABC/P", "VP2E/W1ABC",
+            "K1ABC",
+            "W1AW",
+            "G4XYZ",
+            "JA1ABC",
+            "VE3ABC",
+            "N0CAL",
+            "2E0ABC",
+            "4X4AB",
+            "9A1CD",
+            "GB100MCM",
+            "K1ABC/P",
+            "VP2E/W1ABC",
         ] {
             assert!(is_plausible_call(w), "{w} should read as a callsign");
         }

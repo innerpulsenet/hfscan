@@ -23,16 +23,44 @@ const RY_CQ: &str = "RYRY CQ CQ DE W1AW W1AW K ";
 
 fn morse_for(c: char) -> &'static str {
     match c {
-        'A' => ".-", 'B' => "-...", 'C' => "-.-.", 'D' => "-..", 'E' => ".",
-        'F' => "..-.", 'G' => "--.", 'H' => "....", 'I' => "..", 'J' => ".---",
-        'K' => "-.-", 'L' => ".-..", 'M' => "--", 'N' => "-.", 'O' => "---",
-        'P' => ".--.", 'Q' => "--.-", 'R' => ".-.", 'S' => "...", 'T' => "-",
-        'U' => "..-", 'V' => "...-", 'W' => ".--", 'X' => "-..-", 'Y' => "-.--",
+        'A' => ".-",
+        'B' => "-...",
+        'C' => "-.-.",
+        'D' => "-..",
+        'E' => ".",
+        'F' => "..-.",
+        'G' => "--.",
+        'H' => "....",
+        'I' => "..",
+        'J' => ".---",
+        'K' => "-.-",
+        'L' => ".-..",
+        'M' => "--",
+        'N' => "-.",
+        'O' => "---",
+        'P' => ".--.",
+        'Q' => "--.-",
+        'R' => ".-.",
+        'S' => "...",
+        'T' => "-",
+        'U' => "..-",
+        'V' => "...-",
+        'W' => ".--",
+        'X' => "-..-",
+        'Y' => "-.--",
         'Z' => "--..",
-        '0' => "-----", '1' => ".----", '2' => "..---", '3' => "...--",
-        '4' => "....-", '5' => ".....", '6' => "-....", '7' => "--...",
-        '8' => "---..", '9' => "----.",
-        '/' => "-..-.", '?' => "..--..",
+        '0' => "-----",
+        '1' => ".----",
+        '2' => "..---",
+        '3' => "...--",
+        '4' => "....-",
+        '5' => ".....",
+        '6' => "-....",
+        '7' => "--...",
+        '8' => "---..",
+        '9' => "----.",
+        '/' => "-..-.",
+        '?' => "..--..",
         _ => "",
     }
 }
@@ -260,7 +288,12 @@ fn rtty_spots_nothing_from_noise() {
 /// operator's own clusters.
 #[test]
 fn cw_decodes_a_sloppy_fist() {
-    let key = gen_cw_key("CQ CQ DE W1AW W1AW K", 20.0, 2.2, &[0.85, 1.1, 1.0, 0.9, 1.15]);
+    let key = gen_cw_key(
+        "CQ CQ DE W1AW W1AW K",
+        20.0,
+        2.2,
+        &[0.85, 1.1, 1.0, 0.9, 1.15],
+    );
     let sig = key_to_iq(&key, 0.02, CW_TONE);
     let mut d = cw::CwDecoder::new(FS);
     let mut out = String::new();
@@ -448,6 +481,99 @@ fn cw_next_lock_hops_to_the_other_signal() {
     }
 }
 
+/// All-dah mark sequences (M, O, 0, 8, 9) must not confuse the clusterer into
+/// cutting WPM in half.
+#[test]
+fn cw_decodes_all_dah_sequences_without_wpm_swings() {
+    let msg = "MMMM OOOO 000 888 999 599 001";
+    let sig = gen_cw(msg, 20.0, 0.01);
+    let mut d = cw::CwDecoder::new(FS);
+    let mut out = String::new();
+    for chunk in sig.chunks(4096) {
+        out.push_str(&d.process(chunk));
+    }
+    let wpm = d.wpm();
+    assert!(
+        (wpm - 20.0).abs() < 5.0,
+        "WPM swung on all-dah sequence, got {wpm:.1} WPM ({})",
+        d.status()
+    );
+    assert!(
+        out.contains("MM") || out.contains("OO") || out.contains("599"),
+        "all-dah sequence copy lost: {out:?}"
+    );
+}
+
+/// Multi-over QSO with 2.5-3.0 second pauses between overs must decode every over cleanly.
+#[test]
+fn cw_decodes_multi_over_qso_with_pauses() {
+    let mut d = cw::CwDecoder::new(FS);
+    let over1 = gen_cw("CQ CQ DE W1AW K", 20.0, 0.01);
+    let pause1 = vec![Complex32::new(0.0, 0.0); (2.5 * FS) as usize];
+    let over2 = gen_cw("W1AW DE G4XYZ K", 22.0, 0.01);
+    let pause2 = vec![Complex32::new(0.0, 0.0); (3.0 * FS) as usize];
+    let over3 = gen_cw("G4XYZ DE W1AW 5NN TU 73 SK", 20.0, 0.01);
+
+    let mut out1 = String::new();
+    for chunk in over1.chunks(4096) {
+        out1.push_str(&d.process(chunk));
+    }
+    for chunk in pause1.chunks(4096) {
+        let _ = d.process(chunk);
+    }
+
+    let mut out2 = String::new();
+    for chunk in over2.chunks(4096) {
+        out2.push_str(&d.process(chunk));
+    }
+    for chunk in pause2.chunks(4096) {
+        let _ = d.process(chunk);
+    }
+
+    let mut out3 = String::new();
+    for chunk in over3.chunks(4096) {
+        out3.push_str(&d.process(chunk));
+    }
+
+    assert!(
+        out1.contains("W1AW"),
+        "Over 1 lost: {out1:?} ({})",
+        d.status()
+    );
+    assert!(
+        out2.contains("G4XYZ") || out2.contains("4XYZ"),
+        "Over 2 lost after pause: {out2:?} ({})",
+        d.status()
+    );
+    assert!(
+        out3.contains("5NN") || out3.contains("73"),
+        "Over 3 lost after pause: {out3:?} ({})",
+        d.status()
+    );
+}
+
+/// Short transmissions ("K", "TU", "5NN", "73", "BK") must decode and achieve confidence >= 0.40.
+#[test]
+fn cw_decodes_short_overs_with_high_confidence() {
+    for word in ["5NN", "TU", "73", "BK", "K"] {
+        let sig = gen_cw(word, 20.0, 0.01);
+        let mut d = cw::CwDecoder::new(FS);
+        let mut out = String::new();
+        for chunk in sig.chunks(4096) {
+            out.push_str(&d.process(chunk));
+        }
+        let conf = d.confidence().unwrap_or(0.0);
+        assert!(
+            conf >= 0.40,
+            "Short over {word:?} produced low confidence {conf:.2} (needs >= 0.40 to pass copy_floor)"
+        );
+        assert!(
+            out.contains(word) || out.contains(&word[..word.len().min(2)]),
+            "Short over {word:?} lost in copy: {out:?}"
+        );
+    }
+}
+
 // ----------------------------------------------------------------- RTTY
 
 fn ita2_code(c: char) -> Option<(u8, bool)> {
@@ -457,12 +583,35 @@ fn ita2_code(c: char) -> Option<(u8, bool)> {
         return Some((i as u8, false));
     }
     let figs = [
-        ('3', 1), ('-', 3), ('\'', 5), ('8', 6), ('7', 7), ('$', 9), ('4', 10),
-        (',', 12), ('!', 13), (':', 14), ('(', 15), ('5', 16), ('"', 17),
-        (')', 18), ('2', 19), ('#', 20), ('6', 21), ('0', 22), ('1', 23),
-        ('9', 24), ('?', 25), ('&', 26), ('.', 28), ('/', 29), (';', 30),
+        ('3', 1),
+        ('-', 3),
+        ('\'', 5),
+        ('8', 6),
+        ('7', 7),
+        ('$', 9),
+        ('4', 10),
+        (',', 12),
+        ('!', 13),
+        (':', 14),
+        ('(', 15),
+        ('5', 16),
+        ('"', 17),
+        (')', 18),
+        ('2', 19),
+        ('#', 20),
+        ('6', 21),
+        ('0', 22),
+        ('1', 23),
+        ('9', 24),
+        ('?', 25),
+        ('&', 26),
+        ('.', 28),
+        ('/', 29),
+        (';', 30),
     ];
-    figs.iter().find(|(x, _)| *x == c).map(|(_, i)| (*i as u8, true))
+    figs.iter()
+        .find(|(x, _)| *x == c)
+        .map(|(_, i)| (*i as u8, true))
 }
 
 fn gen_rtty(text: &str, baud: f32, shift: f32) -> Vec<Complex32> {
@@ -473,14 +622,23 @@ fn gen_rtty_snr(text: &str, baud: f32, shift: f32, snr_scale: f32) -> Vec<Comple
     gen_rtty_faded(text, baud, shift, snr_scale, 1.0, 1.0)
 }
 
-fn gen_rtty_faded(text: &str, baud: f32, shift: f32, snr_scale: f32, mark_amp: f32, space_amp: f32) -> Vec<Complex32> {
+fn gen_rtty_faded(
+    text: &str,
+    baud: f32,
+    shift: f32,
+    snr_scale: f32,
+    mark_amp: f32,
+    space_amp: f32,
+) -> Vec<Complex32> {
     let sps = FS as f32 / baud;
     let mut bits: Vec<bool> = Vec::new();
     // idle mark so the decoder starts in a known state
     bits.extend(std::iter::repeat(true).take((baud as usize).max(20)));
     let mut figs_state = false;
     for c in text.chars() {
-        let Some((code, figs)) = ita2_code(c) else { continue };
+        let Some((code, figs)) = ita2_code(c) else {
+            continue;
+        };
         if figs != figs_state && c != ' ' {
             let shift_code = if figs { 0x1B } else { 0x1F };
             bits.push(false); // start
@@ -525,8 +683,14 @@ fn rtty_matched_filters_survive_selective_fading() {
     let sig = gen_rtty_faded("RYRY RYRY CQ DE TEST TEST", 45.45, 170.0, 0.025, 1.0, 0.1);
     let mut d = rtty::RttyDecoder::new(FS);
     let mut out = String::new();
-    for chunk in sig.chunks(4096) { out.push_str(&d.process(chunk)); }
-    assert!(out.contains("TEST"), "-20 dB space fade was not copyable: {out:?} ({})", d.status());
+    for chunk in sig.chunks(4096) {
+        out.push_str(&d.process(chunk));
+    }
+    assert!(
+        out.contains("TEST"),
+        "-20 dB space fade was not copyable: {out:?} ({})",
+        d.status()
+    );
 }
 
 /// `snr_scale` for a wanted SNR in dB measured in the bit-rate bandwidth —
@@ -583,8 +747,14 @@ fn bench_rtty_matched_filter_fade() {
         let sig = gen_rtty_faded("RYRY RYRY CQ DE TEST TEST", 45.45, 170.0, 0.025, 1.0, amp);
         let mut d = rtty::RttyDecoder::new(FS);
         let mut out = String::new();
-        for chunk in sig.chunks(4096) { out.push_str(&d.process(chunk)); }
-        println!("RTTY matched filters, space {fade_db:+.0} dB: {} chars, TEST={}", out.len(), out.contains("TEST"));
+        for chunk in sig.chunks(4096) {
+            out.push_str(&d.process(chunk));
+        }
+        println!(
+            "RTTY matched filters, space {fade_db:+.0} dB: {} chars, TEST={}",
+            out.len(),
+            out.contains("TEST")
+        );
     }
 }
 
@@ -639,7 +809,10 @@ fn rtty_reverse_shift_is_garbage_then_recovers() {
     for chunk in sig.chunks(4096) {
         out.push_str(&d.process(chunk));
     }
-    assert!(!out.contains("TEST"), "reversed shift should not decode: {out:?}");
+    assert!(
+        !out.contains("TEST"),
+        "reversed shift should not decode: {out:?}"
+    );
 }
 
 // ---------------------------------------------------------------- PSK31
@@ -721,17 +894,17 @@ fn psk31_debug_bitstream() {
         let _ = d.process(chunk);
     }
     let rx = &d.captured_bits;
-    let s = |b: &[bool]| b.iter().map(|x| if *x { '1' } else { '0' }).collect::<String>();
+    let s = |b: &[bool]| {
+        b.iter()
+            .map(|x| if *x { '1' } else { '0' })
+            .collect::<String>()
+    };
     println!("tx ({:3}): {}", tx.len(), s(&tx));
     println!("rx ({:3}): {}", rx.len(), s(rx));
     // Find the alignment that matches best.
     let mut best = (0usize, 0usize);
     for off in 0..rx.len().saturating_sub(tx.len()).min(200) {
-        let n = tx
-            .iter()
-            .zip(&rx[off..])
-            .filter(|(a, b)| a == b)
-            .count();
+        let n = tx.iter().zip(&rx[off..]).filter(|(a, b)| a == b).count();
         if n > best.1 {
             best = (off, n);
         }
@@ -944,7 +1117,12 @@ fn bench_ft8_decode_depth() {
     for deep in [false, true] {
         let at = std::time::Instant::now();
         let out = ft8::FtDecoder::decode_audio_depth(&audio, false, deep);
-        println!("FT8 {} depth: {} decode(s), {:.2}s", if deep { "deep" } else { "conservative" }, out.len(), at.elapsed().as_secs_f64());
+        println!(
+            "FT8 {} depth: {} decode(s), {:.2}s",
+            if deep { "deep" } else { "conservative" },
+            out.len(),
+            at.elapsed().as_secs_f64()
+        );
     }
 }
 
@@ -1060,7 +1238,10 @@ fn ft8_through_chain(radio_rate: f64, audio_hz: f64) -> Vec<String> {
         buf.len()
     );
     let peak = buf.iter().map(|v| v.abs() as i32).max().unwrap_or(0);
-    assert!(peak > 500, "audio level far too low for decoding: peak {peak}");
+    assert!(
+        peak > 500,
+        "audio level far too low for decoding: peak {peak}"
+    );
     ft8::FtDecoder::decode_audio(&buf, false)
 }
 
@@ -1394,29 +1575,45 @@ fn cw_envelope_filter_gain_db() -> f32 {
     let mut rng = 0x71ac_2049u32;
     let dit = 60usize;
     let n = 6000;
-    let raw: Vec<f32> = (0..n).map(|i| {
-        let mark = (i / dit) % 4 < 2;
-        (if mark { 0.18 } else { 0.0 }) + noise(&mut rng) * 0.45
-    }).collect();
+    let raw: Vec<f32> = (0..n)
+        .map(|i| {
+            let mark = (i / dit) % 4 < 2;
+            (if mark { 0.18 } else { 0.0 }) + noise(&mut rng) * 0.45
+        })
+        .collect();
     let window = (0.35 * dit as f32) as usize;
     let mut sum = 0.0;
     let mut filtered = Vec::with_capacity(n);
     for i in 0..n {
         sum += raw[i];
-        if i >= window { sum -= raw[i - window]; }
+        if i >= window {
+            sum -= raw[i - window];
+        }
         filtered.push(sum / (i + 1).min(window) as f32);
     }
     let snr = |x: &[f32]| {
-        let mut on = Vec::new(); let mut off = Vec::new();
+        let mut on = Vec::new();
+        let mut off = Vec::new();
         for i in window..n {
             let pos = i % dit;
-            if pos < window || pos + window >= dit { continue; }
-            if (i / dit) % 4 < 2 { on.push(x[i]); } else { off.push(x[i]); }
+            if pos < window || pos + window >= dit {
+                continue;
+            }
+            if (i / dit) % 4 < 2 {
+                on.push(x[i]);
+            } else {
+                off.push(x[i]);
+            }
         }
         let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
         let (mo, mf) = (mean(&on), mean(&off));
-        let var = on.iter().map(|v| (v-mo).powi(2)).chain(off.iter().map(|v| (v-mf).powi(2))).sum::<f32>() / (on.len()+off.len()) as f32;
-        (mo-mf).abs() / var.sqrt()
+        let var = on
+            .iter()
+            .map(|v| (v - mo).powi(2))
+            .chain(off.iter().map(|v| (v - mf).powi(2)))
+            .sum::<f32>()
+            / (on.len() + off.len()) as f32;
+        (mo - mf).abs() / var.sqrt()
     };
     20.0 * (snr(&filtered) / snr(&raw)).log10()
 }
@@ -1430,7 +1627,10 @@ fn cw_matched_envelope_gains_two_db() {
 #[test]
 #[ignore]
 fn bench_cw_matched_envelope() {
-    println!("CW clock-matched envelope separation gain: {:.1} dB", cw_envelope_filter_gain_db());
+    println!(
+        "CW clock-matched envelope separation gain: {:.1} dB",
+        cw_envelope_filter_gain_db()
+    );
 }
 
 /// Steady-state copy on a signal weak enough to be worth decoding by
@@ -1518,15 +1718,13 @@ fn cw_stays_quiet_on_a_steady_carrier() {
     let sig: Vec<Complex32> = (0..n)
         .map(|i| {
             let ph = 2.0 * PI * CW_TONE * i as f32 / FS as f32;
-            Complex32::from_polar(1.0, ph)
-                + Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.02
+            Complex32::from_polar(1.0, ph) + Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.02
         })
         .collect();
     let got = decode_cw(&sig, 0.0);
     let letters = got.chars().filter(|c| !c.is_whitespace()).count();
     assert!(letters <= 2, "a steady carrier decoded as {got:?}");
 }
-
 
 // ---------------------------------------------- PSK31 accuracy bench
 
@@ -1595,7 +1793,11 @@ fn psk31_still_copies_at_six_db() {
     for db in [10.0f32, 15.0] {
         let sig = gen_psk31_snr(msg, 0.0, psk_scale_for_snr(db));
         let acc = accuracy(msg, &decode_psk(&sig, 0.0));
-        assert!(acc >= 0.85, "{db:.0} dB PSK31 regressed to {:.0}%", acc * 100.0);
+        assert!(
+            acc >= 0.85,
+            "{db:.0} dB PSK31 regressed to {:.0}%",
+            acc * 100.0
+        );
     }
 }
 
@@ -1617,7 +1819,9 @@ fn bench_psk31_accuracy() {
     }
 
     println!("\n== 15 dB, by residual tuning error ==");
-    for err in [-150.0f32, -100.0, -50.0, -20.0, 0.0, 20.0, 50.0, 100.0, 150.0] {
+    for err in [
+        -150.0f32, -100.0, -50.0, -20.0, 0.0, 20.0, 50.0, 100.0, 150.0,
+    ] {
         let sig = gen_psk31_snr(msg, err, psk_scale_for_snr(15.0));
         let (got, lock, locked) = decode_psk_dbg(&sig, 0.0);
         println!(
@@ -1655,7 +1859,13 @@ fn debug_psk31_gates() {
 }
 
 /// PSK31 at an arbitrary sample rate, for span-level tests.
-pub(crate) fn gen_psk31_at(text: &str, fs: f64, offset_hz: f64, snr_scale: f32, secs: f64) -> Vec<Complex32> {
+pub(crate) fn gen_psk31_at(
+    text: &str,
+    fs: f64,
+    offset_hz: f64,
+    snr_scale: f32,
+    secs: f64,
+) -> Vec<Complex32> {
     let sps = (fs as f32 / BAUD_TEST) as usize;
     let mut bits: Vec<bool> = vec![false; 64];
     loop {
@@ -1743,11 +1953,7 @@ fn psk31_copies_a_weak_signal() {
         let sig = gen_psk31_snr(msg, 0.0, psk_scale_for_snr(db));
         let got = decode_psk(&sig, 0.0);
         let acc = accuracy(msg, &got);
-        assert!(
-            acc > 0.85,
-            "{db:.0} dB copied {:.0}%: {got:?}",
-            acc * 100.0
-        );
+        assert!(acc > 0.85, "{db:.0} dB copied {:.0}%: {got:?}", acc * 100.0);
     }
 }
 
@@ -1776,24 +1982,21 @@ fn psk31_still_rejects_a_plain_carrier() {
     let sig: Vec<Complex32> = (0..n)
         .map(|i| {
             let ph = 2.0 * PI * 40.0 * i as f32 / FS as f32;
-            Complex32::from_polar(1.0, ph)
-                + Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.02
+            Complex32::from_polar(1.0, ph) + Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.02
         })
         .collect();
     let hits = psk31::scan_span(&sig, FS, &[(0.0, 20.0)]);
-    assert!(hits.is_empty(), "a steady carrier confirmed as PSK31: {hits:?}");
+    assert!(
+        hits.is_empty(),
+        "a steady carrier confirmed as PSK31: {hits:?}"
+    );
 }
 
 // ------------------------------------------------------- AGC benches
 
 /// Decode with the app's software AGC in the path, as auto mode runs it:
 /// one scalar gain per audio block, applied after the tuning chain.
-fn decode_with_agc(
-    sig: &[Complex32],
-    tune: f32,
-    mut d: Box<dyn Decoder>,
-    agc: bool,
-) -> String {
+fn decode_with_agc(sig: &[Complex32], tune: f32, mut d: Box<dyn Decoder>, agc: bool) -> String {
     let bw = d.bandwidth();
     let shift = d.offset_shift();
     let mut chain = crate::dsp::DecodeChain::new(FS, bw, FS);
@@ -1922,7 +2125,10 @@ fn rtty_stays_quiet_on_noise() {
             .collect();
         let got = decode_rtty(&sig);
         let letters = got.chars().filter(|c| !c.is_whitespace()).count();
-        assert!(letters <= 6, "12 s of noise produced {letters} chars: {got:?}");
+        assert!(
+            letters <= 6,
+            "12 s of noise produced {letters} chars: {got:?}"
+        );
     }
 }
 
@@ -2010,8 +2216,8 @@ fn rtty_is_indifferent_to_sideband() {
 /// not of FT8, and one that would make this test lie in the flattering
 /// direction. An SDR delivers complex baseband with no such image.
 fn ft8_as_iq(audio_hz: f32) -> Vec<Complex32> {
-    use mfsk_core::msg::wsjt77::pack77;
     use mfsk_core::ft8::wave_gen::message_to_tones;
+    use mfsk_core::msg::wsjt77::pack77;
     let msg77 = pack77("CQ", "JA1ABC", "PM95").expect("pack77");
     let tones = message_to_tones(&msg77);
     let sps = (FS as f32 / 6.25) as usize; // 0.16 s per symbol
@@ -2044,10 +2250,7 @@ fn ft8_traffic_does_not_confirm_as_psk31() {
     let iq = ft8_as_iq(1500.0);
     // Look where the FT8 signal actually is, which is the hostile case.
     let hits = psk31::scan_span(&iq, FS, &[(1500.0, 20.0), (0.0, 20.0)]);
-    assert!(
-        hits.is_empty(),
-        "FT8 traffic confirmed as PSK31: {hits:?}"
-    );
+    assert!(hits.is_empty(), "FT8 traffic confirmed as PSK31: {hits:?}");
 }
 
 /// And the RTTY framer must not spell Baudot out of 8-FSK either.
@@ -2064,7 +2267,10 @@ fn ft8_traffic_does_not_frame_as_rtty() {
         out.push_str(&d.process(&audio));
     }
     let letters = out.chars().filter(|c| !c.is_whitespace()).count();
-    assert!(letters <= 4, "FT8 traffic framed as {letters} chars of RTTY: {out:?}");
+    assert!(
+        letters <= 4,
+        "FT8 traffic framed as {letters} chars of RTTY: {out:?}"
+    );
 }
 
 /// What the copy floor is actually made of.
@@ -2332,7 +2538,9 @@ pub(crate) fn gen_rtty_at(
     let mut bits: Vec<bool> = vec![true; 60];
     let mut figs_state = false;
     for c in text.chars() {
-        let Some((code, figs)) = ita2_code(c) else { continue };
+        let Some((code, figs)) = ita2_code(c) else {
+            continue;
+        };
         if figs != figs_state && c != ' ' {
             let sc = if figs { 0x1Bu8 } else { 0x1F };
             bits.push(false);
@@ -2384,7 +2592,9 @@ fn bench_baud_line() {
             let n = (FS as f32 * secs) as usize;
             let cut = &sig[sig.len().saturating_sub(n)..];
             let (f, prom, at) = psk31::baud_line(cut, FS as f32, hz);
-            out.push_str(&format!("  {secs:.1}s: {f:>5.1}Hz x{prom:>5.1} (31.25: x{at:>5.1})"));
+            out.push_str(&format!(
+                "  {secs:.1}s: {f:>5.1}Hz x{prom:>5.1} (31.25: x{at:>5.1})"
+            ));
         }
         println!("{out}");
     };

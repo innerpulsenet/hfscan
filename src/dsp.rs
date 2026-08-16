@@ -38,8 +38,7 @@ impl Window {
                 (0..size)
                     .map(|i| {
                         let x = 2.0 * PI * i as f32 / size as f32;
-                        A[0] - A[1] * x.cos() + A[2] * (2.0 * x).cos()
-                            - A[3] * (3.0 * x).cos()
+                        A[0] - A[1] * x.cos() + A[2] * (2.0 * x).cos() - A[3] * (3.0 * x).cos()
                     })
                     .collect()
             }
@@ -164,7 +163,12 @@ const TAU_BIAS_S: f32 = 8.0;
 
 impl NoiseFloor {
     pub fn new() -> Self {
-        Self { bins: Vec::new(), corrected: Vec::new(), bias: 0.0, seen: false }
+        Self {
+            bins: Vec::new(),
+            corrected: Vec::new(),
+            bias: 0.0,
+            seen: false,
+        }
     }
 
     /// Fold in one fresh periodogram covering `dt` seconds.
@@ -223,7 +227,8 @@ impl NoiseFloor {
         }
 
         self.corrected.clear();
-        self.corrected.extend(self.bins.iter().map(|f| f + self.bias));
+        self.corrected
+            .extend(self.bins.iter().map(|f| f + self.bias));
         &self.bins
     }
 
@@ -262,11 +267,13 @@ pub fn smooth_bins(src: &[f32], taps: usize, out: &mut Vec<f32>) {
     if taps >= 5 && len >= 5 {
         out[0] = (6.0 * src[0] + 4.0 * src[1] + src[2]) / 11.0;
         out[1] = (4.0 * src[0] + 6.0 * src[1] + 4.0 * src[2] + src[3]) / 15.0;
-        out[len - 2] = (src[len - 4] + 4.0 * src[len - 3] + 6.0 * src[len - 2] + 4.0 * src[len - 1]) / 15.0;
+        out[len - 2] =
+            (src[len - 4] + 4.0 * src[len - 3] + 6.0 * src[len - 2] + 4.0 * src[len - 1]) / 15.0;
         out[len - 1] = (src[len - 3] + 4.0 * src[len - 2] + 6.0 * src[len - 1]) / 11.0;
         const NORM5: f32 = 1.0 / 16.0;
         for i in 2..len - 2 {
-            out[i] = (src[i - 2] + 4.0 * src[i - 1] + 6.0 * src[i] + 4.0 * src[i + 1] + src[i + 2]) * NORM5;
+            out[i] = (src[i - 2] + 4.0 * src[i - 1] + 6.0 * src[i] + 4.0 * src[i + 1] + src[i + 2])
+                * NORM5;
         }
     } else {
         out[0] = (2.0 * src[0] + src[1]) / 3.0;
@@ -345,26 +352,39 @@ impl Rotator {
 /// back to back), giving a sinc² response — roughly double the stopband dB
 /// of a plain block average for one extra accumulator — so a strong
 /// neighbour elsewhere in the span aliases far less into the analysis audio.
+#[allow(dead_code)]
 pub fn mix_decim(iq: &[Complex32], fs: f32, hz: f32, decim: usize) -> Vec<Complex32> {
-    let mut osc = Rotator::new(-2.0 * PI * hz / fs);
     let mut out = Vec::with_capacity(iq.len() / decim.max(1) + 1);
+    mix_decim_into(iq, fs, hz, decim, &mut out);
+    out
+}
+
+/// Zero-allocation variant of `mix_decim` that reuses `out`.
+pub fn mix_decim_into(iq: &[Complex32], fs: f32, hz: f32, decim: usize, out: &mut Vec<Complex32>) {
+    out.clear();
+    let mut osc = Rotator::new(-2.0 * PI * hz / fs);
     if decim <= 1 {
         for &s in iq {
             out.push(s * osc.next());
         }
-        return out;
+        return;
     }
     let d = decim as f32;
-    // Each sample feeds the falling half of the window ending this block and
-    // the rising half of the one ending next block; the halves sum to D+1.
+    let inv_d = 1.0 / d;
     let norm = 1.0 / (d + 1.0);
+    let mut weights_fall = Vec::with_capacity(decim);
+    let mut weights_rise = Vec::with_capacity(decim);
+    for r in 0..decim {
+        weights_fall.push(1.0 - r as f32 * inv_d);
+        weights_rise.push((r + 1) as f32 * inv_d);
+    }
     let mut fall = Complex32::new(0.0, 0.0);
     let mut rise = Complex32::new(0.0, 0.0);
     let mut r = 0usize;
     for &s in iq {
         let m = s * osc.next();
-        fall += m * (1.0 - r as f32 / d);
-        rise += m * ((r + 1) as f32 / d);
+        fall += m * weights_fall[r];
+        rise += m * weights_rise[r];
         r += 1;
         if r == decim {
             out.push(fall * norm);
@@ -373,7 +393,6 @@ pub fn mix_decim(iq: &[Complex32], fs: f32, hz: f32, decim: usize) -> Vec<Comple
             r = 0;
         }
     }
-    out
 }
 
 /// Numerically controlled oscillator used to shift a signal of interest to 0 Hz.
@@ -437,7 +456,14 @@ impl DecimFir {
             taps: lowpass_taps(cutoff_hz, fs, ntaps),
             buf: Vec::with_capacity(ntaps * 4),
             decim,
-            fft: None, ifft: None, response: Vec::new(), work: Vec::new(), overlap: Vec::new(), fft_len: 0, fft_phase: 0, fft_warm: 0,
+            fft: None,
+            ifft: None,
+            response: Vec::new(),
+            work: Vec::new(),
+            overlap: Vec::new(),
+            fft_len: 0,
+            fft_phase: 0,
+            fft_warm: 0,
         };
         this.rebuild_fft();
         this
@@ -497,10 +523,13 @@ impl DecimFir {
         let fft = planner.plan_fft_forward(self.fft_len);
         let ifft = planner.plan_fft_inverse(self.fft_len);
         self.response = vec![Complex32::new(0.0, 0.0); self.fft_len];
-        for (dst, &tap) in self.response.iter_mut().zip(&self.taps) { dst.re = tap; }
+        for (dst, &tap) in self.response.iter_mut().zip(&self.taps) {
+            dst.re = tap;
+        }
         fft.process(&mut self.response);
         self.work.resize(self.fft_len, Complex32::new(0.0, 0.0));
-        self.overlap.resize(self.taps.len() - 1, Complex32::new(0.0, 0.0));
+        self.overlap
+            .resize(self.taps.len() - 1, Complex32::new(0.0, 0.0));
         self.fft = Some(fft);
         self.ifft = Some(ifft);
         self.buf.clear();
@@ -518,7 +547,9 @@ impl DecimFir {
             self.work[..discard].copy_from_slice(&self.overlap);
             self.work[discard..discard + hop].copy_from_slice(&self.buf[..hop]);
             self.fft.as_ref().unwrap().process(&mut self.work);
-            for (x, h) in self.work.iter_mut().zip(&self.response) { *x *= *h; }
+            for (x, h) in self.work.iter_mut().zip(&self.response) {
+                *x *= *h;
+            }
             self.ifft.as_ref().unwrap().process(&mut self.work);
             let scale = 1.0 / self.fft_len as f32;
             for x in &self.work[discard..discard + hop] {
@@ -526,9 +557,13 @@ impl DecimFir {
                     self.fft_warm -= 1;
                     continue;
                 }
-                if self.fft_phase == 0 { out.push(*x * scale); }
+                if self.fft_phase == 0 {
+                    out.push(*x * scale);
+                }
                 self.fft_phase += 1;
-                if self.fft_phase == self.decim { self.fft_phase = 0; }
+                if self.fft_phase == self.decim {
+                    self.fft_phase = 0;
+                }
             }
             if discard <= hop {
                 self.overlap.copy_from_slice(&self.buf[hop - discard..hop]);
@@ -775,6 +810,7 @@ pub struct ChannelTap {
     /// the whole frame and discarding all but every Dth sample.
     folded: Vec<Complex32>,
     decimated: Vec<Complex32>,
+    audio_buf: Vec<Complex32>,
     audio: DecimFir,
     fs_in: f64,
     fs_out: f64,
@@ -812,6 +848,7 @@ impl ChannelTap {
             active: Vec::new(),
             folded: vec![Complex32::new(0.0, 0.0); m],
             decimated: Vec::new(),
+            audio_buf: Vec::new(),
             audio: DecimFir::new(bandwidth / 2.0, fs_out as f32, 1, AUDIO_TAPS_MIN),
             fs_in,
             fs_out,
@@ -820,7 +857,11 @@ impl ChannelTap {
             hop,
             k0: 0,
             res_rot: Rotator::new(0.0),
-            warm: if fold { (RADIO_TAPS - 1) / decim } else { RADIO_TAPS - 1 },
+            warm: if fold {
+                (RADIO_TAPS - 1) / decim
+            } else {
+                RADIO_TAPS - 1
+            },
         };
         tap.set_bandwidth(bandwidth);
         tap
@@ -855,7 +896,9 @@ impl ChannelTap {
         let hi = (fs_out - half - tr * 0.5).max(lo);
         let radio_cut = (fs_out * 0.5).clamp(lo, hi);
         let taps = lowpass_taps(radio_cut, self.fs_in as f32, RADIO_TAPS);
-        self.response.iter_mut().for_each(|v| *v = Complex32::new(0.0, 0.0));
+        self.response
+            .iter_mut()
+            .for_each(|v| *v = Complex32::new(0.0, 0.0));
         for (dst, &t) in self.response.iter_mut().zip(&taps) {
             dst.re = t;
         }
@@ -864,7 +907,11 @@ impl ChannelTap {
         // Everything the filter has already removed contributes nothing to
         // the fold. 100 dB below the passband is far past what the taps'
         // own stopband reaches.
-        let peak = self.response.iter().map(|v| v.norm()).fold(0.0f32, f32::max);
+        let peak = self
+            .response
+            .iter()
+            .map(|v| v.norm())
+            .fold(0.0f32, f32::max);
         let floor = peak * 1e-5;
         self.active.clear();
         self.active
@@ -884,7 +931,9 @@ impl ChannelTap {
         // reduce a tap to one pass over the hundred-odd bins its filter
         // actually passes, plus a short inverse transform.
         let k0 = self.k0.rem_euclid(n as isize) as usize;
-        self.folded.iter_mut().for_each(|v| *v = Complex32::new(0.0, 0.0));
+        self.folded
+            .iter_mut()
+            .for_each(|v| *v = Complex32::new(0.0, 0.0));
         if self.fold {
             for &k in &self.active {
                 let src = k + k0;
@@ -903,7 +952,8 @@ impl ChannelTap {
         // The rotation was taken about the frame's own origin, but the signal
         // does not restart at each frame: the shift has to be referred to
         // absolute time, which is one phase per frame.
-        let ang = -2.0 * std::f32::consts::PI
+        let ang = -2.0
+            * std::f32::consts::PI
             * (self.k0 as f64 * (start % n as u64) as f64 / n as f64) as f32;
         let block_phase = Complex32::from_polar(1.0 / n as f32, ang);
 
@@ -935,11 +985,10 @@ impl ChannelTap {
                 }
             }
         }
-        let mut audio = Vec::new();
         let decimated = std::mem::take(&mut self.decimated);
-        self.audio.process(&decimated, &mut audio);
+        self.audio.process(&decimated, &mut self.audio_buf);
         self.decimated = decimated;
-        out.extend_from_slice(&audio);
+        out.extend_from_slice(&self.audio_buf);
     }
 }
 
@@ -1107,8 +1156,8 @@ impl AudioNr {
                 let p = powers[i];
                 let noise_ref = p.min(med_pwr * 2.0);
                 if self.trained < 16 {
-                    self.noise_psd[i] =
-                        (self.noise_psd[i] * self.trained as f32 + noise_ref) / (self.trained + 1) as f32;
+                    self.noise_psd[i] = (self.noise_psd[i] * self.trained as f32 + noise_ref)
+                        / (self.trained + 1) as f32;
                 } else {
                     self.noise_psd[i] += (noise_ref - self.noise_psd[i]) * 0.05;
                 }
@@ -1176,7 +1225,12 @@ mod tests {
         let mut rng = 0x5eed_1234u32;
         let n = (fs * secs) as usize;
         let iq: Vec<Complex32> = (0..n)
-            .map(|_| Complex32::new(frontend_tests::noise(&mut rng), frontend_tests::noise(&mut rng)))
+            .map(|_| {
+                Complex32::new(
+                    frontend_tests::noise(&mut rng),
+                    frontend_tests::noise(&mut rng),
+                )
+            })
             .collect();
         let mut spec = Spectrum::new(fft);
         let mut nf = NoiseFloor::new();
@@ -1266,18 +1320,14 @@ mod tests {
     #[test]
     fn soft_agc_pulls_a_hot_block_down_and_does_not_pump() {
         let mut agc = SoftAgc::new(8000.0);
-        let mut hot: Vec<Complex32> = (0..800)
-            .map(|_| Complex32::new(0.8, 0.0))
-            .collect();
+        let mut hot: Vec<Complex32> = (0..800).map(|_| Complex32::new(0.8, 0.0)).collect();
         agc.process(&mut hot);
         let peak = hot.iter().map(|c| c.norm()).fold(0.0f32, f32::max);
         assert!(peak < 0.6, "hot block should be ducked, peak {peak}");
 
         // After hang, a quiet block must not instantly slam the gain up.
         let gain_after_hot = agc.gain();
-        let mut quiet: Vec<Complex32> = (0..800)
-            .map(|_| Complex32::new(0.01, 0.0))
-            .collect();
+        let mut quiet: Vec<Complex32> = (0..800).map(|_| Complex32::new(0.01, 0.0)).collect();
         agc.process(&mut quiet);
         assert!(
             agc.gain() <= gain_after_hot * 1.05,
@@ -1363,7 +1413,10 @@ mod tests {
                 let t = i as f32 / fs as f32;
                 Complex32::from_polar(0.3, 2.0 * PI * offset as f32 * t)
                     + Complex32::from_polar(3.0, 2.0 * PI * (offset as f32 + 9000.0) * t)
-                    + Complex32::new(frontend_tests::noise(&mut rng), frontend_tests::noise(&mut rng)) * 0.02
+                    + Complex32::new(
+                        frontend_tests::noise(&mut rng),
+                        frontend_tests::noise(&mut rng),
+                    ) * 0.02
             })
             .collect();
 
@@ -1418,16 +1471,32 @@ mod tests {
 
     #[test]
     fn overlap_save_matches_direct_decimation() {
-        let input: Vec<_> = (0..20_000).map(|i| Complex32::new((i as f32 * 0.013).sin(), (i as f32 * 0.021).cos())).collect();
+        let input: Vec<_> = (0..20_000)
+            .map(|i| Complex32::new((i as f32 * 0.013).sin(), (i as f32 * 0.021).cos()))
+            .collect();
         let mut fast = DecimFir::new(3500.0, 192_000.0, 24, 4095);
         let taps = fast.taps.clone();
         let mut got = Vec::new();
-        for block in input.chunks(3000) { let mut part = Vec::new(); fast.process(block, &mut part); got.extend(part); }
+        for block in input.chunks(3000) {
+            let mut part = Vec::new();
+            fast.process(block, &mut part);
+            got.extend(part);
+        }
         let mut want = Vec::new();
         for i in (0..=input.len() - taps.len()).step_by(24) {
-            want.push(input[i..i + taps.len()].iter().zip(&taps).map(|(x, h)| *x * *h).sum::<Complex32>());
+            want.push(
+                input[i..i + taps.len()]
+                    .iter()
+                    .zip(&taps)
+                    .map(|(x, h)| *x * *h)
+                    .sum::<Complex32>(),
+            );
         }
-        let err = got.iter().zip(&want).map(|(a,b)| (*a-*b).norm()).fold(0.0f32, f32::max);
+        let err = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (*a - *b).norm())
+            .fold(0.0f32, f32::max);
         assert!(err < 1e-3, "overlap-save differs by {err}");
     }
 
@@ -1442,7 +1511,9 @@ mod tests {
                 .map(|_| {
                     let s = Complex32::from_polar(1.0, phase as f32);
                     phase += step;
-                    if phase > std::f64::consts::PI { phase -= 2.0 * std::f64::consts::PI; }
+                    if phase > std::f64::consts::PI {
+                        phase -= 2.0 * std::f64::consts::PI;
+                    }
                     s
                 })
                 .collect();
@@ -1478,7 +1549,10 @@ mod tests {
         }
         // ...and still stopped before the real part folds it onto itself.
         let fold = chain_resp_db(192_000.0, 3000.0, 12_000.0, -1750.0);
-        assert!(fold < -30.0, "below the dial should be rejected, got {fold:.1} dB");
+        assert!(
+            fold < -30.0,
+            "below the dial should be rejected, got {fold:.1} dB"
+        );
     }
 
     /// A filter setting has to mean what it says: the narrow positions are
@@ -1508,10 +1582,7 @@ mod tests {
     fn decimation_does_not_alias_into_the_channel() {
         for hz in [7900.0, 8000.0, 8100.0, 16_000.0] {
             let r = chain_resp_db(192_000.0, 400.0, 8000.0, hz);
-            assert!(
-                r < -80.0,
-                "{hz:.0} Hz folds into the channel at {r:.1} dB"
-            );
+            assert!(r < -80.0, "{hz:.0} Hz folds into the channel at {r:.1} dB");
         }
     }
 
@@ -1519,20 +1590,33 @@ mod tests {
     #[ignore]
     fn bench_fast_convolution() {
         use std::time::Instant;
-        let input: Vec<_> = (0..96_000).map(|i| Complex32::new((i as f32 * 0.017).sin(), 0.0)).collect();
+        let input: Vec<_> = (0..96_000)
+            .map(|i| Complex32::new((i as f32 * 0.017).sin(), 0.0))
+            .collect();
         let taps = lowpass_taps(100.0, 8000.0, 1101);
         let at = Instant::now();
         let mut direct = Vec::with_capacity(input.len());
         for i in 0..input.len() - taps.len() {
-            direct.push(input[i..i + taps.len()].iter().zip(&taps).map(|(x, h)| *x * *h).sum::<Complex32>());
+            direct.push(
+                input[i..i + taps.len()]
+                    .iter()
+                    .zip(&taps)
+                    .map(|(x, h)| *x * *h)
+                    .sum::<Complex32>(),
+            );
         }
         let direct_ms = at.elapsed().as_secs_f64() * 1000.0;
         let mut fir = DecimFir::new(100.0, 8000.0, 1, 1101);
         let at = Instant::now();
         let mut out = Vec::new();
-        for block in input.chunks(4096) { fir.process(block, &mut out); }
+        for block in input.chunks(4096) {
+            fir.process(block, &mut out);
+        }
         let fft_ms = at.elapsed().as_secs_f64() * 1000.0;
-        println!("1101-tap convolution: direct {direct_ms:.1} ms, overlap-save {fft_ms:.1} ms ({:.1}x faster)", direct_ms / fft_ms);
+        println!(
+            "1101-tap convolution: direct {direct_ms:.1} ms, overlap-save {fft_ms:.1} ms ({:.1}x faster)",
+            direct_ms / fft_ms
+        );
     }
 }
 
@@ -1669,7 +1753,11 @@ impl NoiseBlanker {
                 i += 1;
             }
             let end = i;
-            let before = if start > 0 { iq[start - 1] } else { self.last_good };
+            let before = if start > 0 {
+                iq[start - 1]
+            } else {
+                self.last_good
+            };
             let after = if end < n { iq[end] } else { before };
             let span = (end - start + 1) as f32;
             for (k, j) in (start..end).enumerate() {
@@ -1793,7 +1881,10 @@ impl FrontEnd {
         for b in 0..K {
             if let Some(mut target) = estimate[b] {
                 let mut weight = 1.0;
-                for neighbour in [b.checked_sub(1), (b + 1 < K).then_some(b + 1)].into_iter().flatten() {
+                for neighbour in [b.checked_sub(1), (b + 1 < K).then_some(b + 1)]
+                    .into_iter()
+                    .flatten()
+                {
                     if let Some(v) = estimate[neighbour] {
                         target += v * 0.25;
                         weight += 0.25;
@@ -1869,7 +1960,13 @@ pub(crate) mod frontend_tests {
 
     /// A band of noise with a signal on it, a DC offset, and a gain and
     /// quadrature error between I and Q — an ordinary uncorrected front end.
-    pub(crate) fn dirty_iq(fs: f32, sig_hz: f32, dc: Complex32, gain_err: f32, phase_err: f32) -> Vec<Complex32> {
+    pub(crate) fn dirty_iq(
+        fs: f32,
+        sig_hz: f32,
+        dc: Complex32,
+        gain_err: f32,
+        phase_err: f32,
+    ) -> Vec<Complex32> {
         let mut rng = 0x1234_5678u32;
         // Long enough to cover the front end's settle time several times over.
         (0..(fs * 10.0) as usize)
@@ -1909,13 +2006,24 @@ pub(crate) mod frontend_tests {
             let noise = Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.025;
             clean.push(tone + noise);
             let crash = impulses && i > fs as usize && i % 1800 < 4;
-            dirty.push(tone + noise + if crash { Complex32::new(8.0, -6.0) } else { Complex32::new(0.0, 0.0) });
+            dirty.push(
+                tone + noise
+                    + if crash {
+                        Complex32::new(8.0, -6.0)
+                    } else {
+                        Complex32::new(0.0, 0.0)
+                    },
+            );
         }
         (clean, dirty)
     }
 
     fn error_power(got: &[Complex32], want: &[Complex32]) -> f32 {
-        got.iter().zip(want).skip(got.len() / 3).map(|(a, b)| (*a - *b).norm_sqr()).sum::<f32>()
+        got.iter()
+            .zip(want)
+            .skip(got.len() / 3)
+            .map(|(a, b)| (*a - *b).norm_sqr())
+            .sum::<f32>()
             / (got.len() - got.len() / 3) as f32
     }
 
@@ -1925,18 +2033,26 @@ pub(crate) mod frontend_tests {
         let (clean, dirty) = impulse_case(fs, true);
         let mut blanked = dirty.clone();
         let mut nb = NoiseBlanker::new(fs as f64);
-        for block in blanked.chunks_mut(4096) { nb.process(block); }
-        let improvement = 10.0 * (error_power(&dirty, &clean) / error_power(&blanked, &clean)).log10();
+        for block in blanked.chunks_mut(4096) {
+            nb.process(block);
+        }
+        let improvement =
+            10.0 * (error_power(&dirty, &clean) / error_power(&blanked, &clean)).log10();
         // Interpolating across a blanked run rather than zeroing it is worth
         // about 2 dB of this on its own: a zeroed run is a rectangular hole,
         // and its edges are steps that the narrow channel filters downstream
         // ring on.
-        assert!(improvement >= 12.0, "impulse error improved only {improvement:.1} dB");
+        assert!(
+            improvement >= 12.0,
+            "impulse error improved only {improvement:.1} dB"
+        );
 
         let (_, mut untouched) = impulse_case(fs, false);
         let before = power_at(&untouched, fs, 1500.0);
         let mut nb = NoiseBlanker::new(fs as f64);
-        for block in untouched.chunks_mut(4096) { nb.process(block); }
+        for block in untouched.chunks_mut(4096) {
+            nb.process(block);
+        }
         let harm = (10.0 * (before / power_at(&untouched, fs, 1500.0)).log10()).abs();
         assert!(harm < 0.2, "clean tone changed by {harm:.2} dB");
     }
@@ -1948,9 +2064,15 @@ pub(crate) mod frontend_tests {
         let (clean, dirty) = impulse_case(fs, true);
         let mut blanked = dirty.clone();
         let mut nb = NoiseBlanker::new(fs as f64);
-        for block in blanked.chunks_mut(4096) { nb.process(block); }
-        let improvement = 10.0 * (error_power(&dirty, &clean) / error_power(&blanked, &clean)).log10();
-        println!("wideband impulse blanker: {improvement:.1} dB error-power improvement, {} blanks/s", nb.blanks_per_second());
+        for block in blanked.chunks_mut(4096) {
+            nb.process(block);
+        }
+        let improvement =
+            10.0 * (error_power(&dirty, &clean) / error_power(&blanked, &clean)).log10();
+        println!(
+            "wideband impulse blanker: {improvement:.1} dB error-power improvement, {} blanks/s",
+            nb.blanks_per_second()
+        );
     }
 
     /// The DC offset is what forces the LO bins to be blanked, so removing it
@@ -1977,8 +2099,7 @@ pub(crate) mod frontend_tests {
         // 6% gain error and 3 degrees of quadrature error: poor, but the sort
         // of thing an uncorrected direct-conversion front end really does.
         let iq = dirty_iq(fs, 400.0, Complex32::new(0.0, 0.0), 1.06, 0.052);
-        let before =
-            10.0 * (power_at(&iq, fs, 400.0) / power_at(&iq, fs, -400.0)).log10();
+        let before = 10.0 * (power_at(&iq, fs, 400.0) / power_at(&iq, fs, -400.0)).log10();
         let out = run_frontend(&iq, fs);
         let sig = power_at(&out, fs, 400.0);
         let after = 10.0 * (sig / power_at(&out, fs, -400.0)).log10();
@@ -1996,19 +2117,22 @@ pub(crate) mod frontend_tests {
     fn frequency_dependent_case(fs: f32) -> (Vec<Complex32>, [f32; 2]) {
         let hz = [4687.5, 16406.25]; // exact 4096-point bins
         let a = [Complex32::new(0.09, 0.025), Complex32::new(-0.065, 0.045)];
-        let iq = (0..(fs * 10.0) as usize).map(|i| {
-            let mut x = Complex32::new(0.0, 0.0);
-            for j in 0..2 {
-                let s = Complex32::from_polar(0.35, 2.0 * PI * hz[j] * i as f32 / fs);
-                x += s + a[j] * s.conj();
-            }
-            x
-        }).collect();
+        let iq = (0..(fs * 10.0) as usize)
+            .map(|i| {
+                let mut x = Complex32::new(0.0, 0.0);
+                for j in 0..2 {
+                    let s = Complex32::from_polar(0.35, 2.0 * PI * hz[j] * i as f32 / fs);
+                    x += s + a[j] * s.conj();
+                }
+                x
+            })
+            .collect();
         (iq, hz)
     }
 
     fn worst_rejection(iq: &[Complex32], fs: f32, hz: [f32; 2]) -> f32 {
-        hz.into_iter().map(|f| 10.0 * (power_at(iq, fs, f) / power_at(iq, fs, -f).max(1e-30)).log10())
+        hz.into_iter()
+            .map(|f| 10.0 * (power_at(iq, fs, f) / power_at(iq, fs, -f).max(1e-30)).log10())
             .fold(f32::INFINITY, f32::min)
     }
 
@@ -2032,7 +2156,11 @@ pub(crate) mod frontend_tests {
         let scalar: Vec<_> = iq.iter().map(|&x| x - scalar_a * x.conj()).collect();
         let scalar_rej = worst_rejection(&scalar, fs, hz);
         let per_band = worst_rejection(&run_subband_only(&iq, fs), fs, hz);
-        assert!(per_band >= scalar_rej + 15.0, "subbands gained only {:.1} dB ({scalar_rej:.1} -> {per_band:.1})", per_band - scalar_rej);
+        assert!(
+            per_band >= scalar_rej + 15.0,
+            "subbands gained only {:.1} dB ({scalar_rej:.1} -> {per_band:.1})",
+            per_band - scalar_rej
+        );
     }
 
     #[test]
@@ -2044,7 +2172,10 @@ pub(crate) mod frontend_tests {
         let scalar: Vec<_> = iq.iter().map(|&x| x - scalar_a * x.conj()).collect();
         let scalar_rej = worst_rejection(&scalar, fs, hz);
         let per_band = worst_rejection(&run_subband_only(&iq, fs), fs, hz);
-        println!("frequency-dependent IQ: worst-band scalar {scalar_rej:.1} dB, 12-band {per_band:.1} dB ({:.1} dB gain)", per_band - scalar_rej);
+        println!(
+            "frequency-dependent IQ: worst-band scalar {scalar_rej:.1} dB, 12-band {per_band:.1} dB ({:.1} dB gain)",
+            per_band - scalar_rej
+        );
     }
 
     /// The same frequency-dependent imbalance, with static crashes on top.
@@ -2123,8 +2254,8 @@ pub(crate) mod frontend_tests {
 
 #[cfg(test)]
 mod frontend_bench {
-    use super::*;
     use super::frontend_tests::*;
+    use super::*;
 
     #[test]
     #[ignore]
@@ -2143,13 +2274,16 @@ mod frontend_bench {
         }
 
         println!("\n== IQ image rejection (gain error / quadrature error) ==");
-        for (g, p) in [(1.01f32, 0.009f32), (1.03, 0.026), (1.06, 0.052), (1.12, 0.105)] {
+        for (g, p) in [
+            (1.01f32, 0.009f32),
+            (1.03, 0.026),
+            (1.06, 0.052),
+            (1.12, 0.105),
+        ] {
             let iq = dirty_iq(fs, 400.0, Complex32::new(0.0, 0.0), g, p);
-            let before =
-                10.0 * (power_at(&iq, fs, 400.0) / power_at(&iq, fs, -400.0)).log10();
+            let before = 10.0 * (power_at(&iq, fs, 400.0) / power_at(&iq, fs, -400.0)).log10();
             let out = run_frontend(&iq, fs);
-            let after =
-                10.0 * (power_at(&out, fs, 400.0) / power_at(&out, fs, -400.0)).log10();
+            let after = 10.0 * (power_at(&out, fs, 400.0) / power_at(&out, fs, -400.0)).log10();
             println!(
                 "  {:>4.0}% gain, {:>4.1} deg: {:>5.1} dB -> {:>5.1} dB",
                 (g - 1.0) * 100.0,
@@ -2261,8 +2395,7 @@ mod window_bench {
                 })
                 .collect();
             let h = peak_over_floor(&spectrum_of(&iq, Window::Hann, n), fs, weak_hz);
-            let b =
-                peak_over_floor(&spectrum_of(&iq, Window::BlackmanHarris, n), fs, weak_hz);
+            let b = peak_over_floor(&spectrum_of(&iq, Window::BlackmanHarris, n), fs, weak_hz);
             println!(
                 "{:>10}{:>12}{:>12}",
                 format!("{amp:.3}"),
@@ -2285,14 +2418,12 @@ mod window_bench {
                 .map(|i| {
                     let t = i as f32 / fs;
                     let weak = Complex32::from_polar(0.005, 2.0 * PI * weak_hz * t);
-                    let strong =
-                        Complex32::from_polar(50.0, 2.0 * PI * (weak_hz + sep) * t);
+                    let strong = Complex32::from_polar(50.0, 2.0 * PI * (weak_hz + sep) * t);
                     weak + strong + Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.01
                 })
                 .collect();
             let h = peak_over_floor(&spectrum_of(&iq, Window::Hann, n), fs, weak_hz);
-            let b =
-                peak_over_floor(&spectrum_of(&iq, Window::BlackmanHarris, n), fs, weak_hz);
+            let b = peak_over_floor(&spectrum_of(&iq, Window::BlackmanHarris, n), fs, weak_hz);
             println!(
                 "{:>10}{:>10}{:>12}{:>12}",
                 format!("{sep:.0} Hz"),
@@ -2314,8 +2445,7 @@ mod frontend_audit {
         let sig = power_at(iq, fs, hz);
         // Floor sampled well away from the tone and its image, avoiding DC.
         let probes = [hz + 3000.0, hz + 5000.0, hz - 4000.0, hz + 7000.0];
-        let n: f32 = probes.iter().map(|&f| power_at(iq, fs, f)).sum::<f32>()
-            / probes.len() as f32;
+        let n: f32 = probes.iter().map(|&f| power_at(iq, fs, f)).sum::<f32>() / probes.len() as f32;
         10.0 * (sig / n.max(1e-30)).log10()
     }
 
@@ -2332,9 +2462,19 @@ mod frontend_audit {
         let fs = 192_000.0f32;
         let hz = 12_000.0f32;
         for (label, gain_err, phase_err, dc) in [
-            ("clean input      ", 1.0f32, 0.0f32, Complex32::new(0.0, 0.0)),
+            (
+                "clean input      ",
+                1.0f32,
+                0.0f32,
+                Complex32::new(0.0, 0.0),
+            ),
             ("1% gain imbalance", 1.01, 0.005, Complex32::new(0.0, 0.0)),
-            ("5% gain imbalance", 1.05, 0.03, Complex32::new(0.01, -0.007)),
+            (
+                "5% gain imbalance",
+                1.05,
+                0.03,
+                Complex32::new(0.01, -0.007),
+            ),
         ] {
             let mut rng = 0x1357_9bdfu32;
             let n = (fs * 4.0) as usize;

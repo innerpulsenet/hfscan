@@ -14,23 +14,23 @@ use clap::Parser;
 use decoders::cw::{self, CwHit};
 use decoders::psk31::{self, PskHit};
 use decoders::{CwView, Decoder, FtMessage, Mode, PskView};
-use dsp::{smooth_bins, ChannelTap, Channelizer, DecodeChain, SoftAgc, Spectrum};
+use dsp::{ChannelTap, Channelizer, DecodeChain, SoftAgc, Spectrum, smooth_bins};
 use num_complex::Complex32;
+use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseEventKind,
 };
-use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
-use report::{is_callsign, Reporter};
+use report::{Reporter, is_callsign};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Restores the user's terminal even if the TUI returns early or panics.
@@ -82,7 +82,7 @@ const FT_SAFE_RATE: f64 = 192_000.0;
 /// 12 kHz divisor and therefore return to `FT_SAFE_RATE`.
 const LOW_IF_RATE: f64 = 250_000.0;
 
-const WF_INTERVALS_MS: [u64; 5] = [100, 250, 500, 1000, 2000];
+const WF_INTERVALS_MS: [u64; 6] = [50, 100, 250, 500, 1000, 2000];
 
 /// Selectable FFT sizes. Larger means finer frequency resolution at the cost of
 /// a slower spectrum update, since a full segment has to be collected first.
@@ -155,7 +155,7 @@ impl WfRes {
 /// FT8 and FT4 do not count against this. Their slots are pinned to calling
 /// frequencies, there are only ever a handful in a span, and charging them to
 /// the narrowband budget quietly shrank it on every band that has them.
-const MAX_AUTO_SLOTS: usize = 24;
+const MAX_AUTO_SLOTS: usize = 32;
 /// Slots × sample rate the decode fleet may spend, which is the quantity that
 /// actually costs time.
 ///
@@ -175,7 +175,7 @@ const MAX_AUTO_SLOTS: usize = 24;
 /// needs the frame to divide by the decimation, which every rate in the band
 /// table does and an arbitrary `--rate` need not; a span that cannot fold
 /// costs about 96 ms per slot per second of IQ at 5 MS/s, and this guard
-/// exists precisely for the spans nobody planned. 24 slots at 700 kS/s keeps
+/// exists precisely for the spans nobody planned. 32 slots at 700 kS/s keeps
 /// that worst case near a third of real time. Every band preset folds, and
 /// every band preset is capped by `MAX_AUTO_SLOTS` long before it gets here.
 const SLOT_RATE_BUDGET: f64 = MAX_AUTO_SLOTS as f64 * 700_000.0;
@@ -311,10 +311,7 @@ fn sanitize(s: &str) -> String {
 
 /// `sanitize` for a whole transcript, keeping line structure intact.
 fn sanitize_text(s: &str) -> String {
-    s.split('\n')
-        .map(sanitize)
-        .collect::<Vec<_>>()
-        .join("\n")
+    s.split('\n').map(sanitize).collect::<Vec<_>>().join("\n")
 }
 
 /// One automatically tuned decoder inside the current span.
@@ -516,7 +513,10 @@ impl RxFilter {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "hfscan", about = "HF band scanner and digital decoder for the RSP1A")]
+#[command(
+    name = "hfscan",
+    about = "HF band scanner and digital decoder for the RSP1A"
+)]
 struct Args {
     /// SoapySDR device arguments
     #[arg(long, default_value = "driver=sdrplay")]
@@ -578,6 +578,128 @@ struct ScanState {
     dwell_until: Instant,
     results: Vec<ScanHit>,
     kind: ScanKind,
+}
+
+/// Decode kinds we attribute `process()` time to. Shared DSP sits in the
+/// overall figure, not here — splitting the channelizer FFT across modes
+/// would be fiction.
+const CPU_KINDS: [identify::Kind; 5] = [
+    identify::Kind::Cw,
+    identify::Kind::Psk31,
+    identify::Kind::Rtty,
+    identify::Kind::Ft8,
+    identify::Kind::Ft4,
+];
+
+fn cpu_kind_index(kind: identify::Kind) -> Option<usize> {
+    CPU_KINDS.iter().position(|&k| k == kind)
+}
+
+fn mode_kind(mode: Mode) -> Option<identify::Kind> {
+    match mode {
+        Mode::Cw => Some(identify::Kind::Cw),
+        Mode::Psk31 => Some(identify::Kind::Psk31),
+        Mode::Rtty => Some(identify::Kind::Rtty),
+        Mode::Ft8 => Some(identify::Kind::Ft8),
+        Mode::Ft4 => Some(identify::Kind::Ft4),
+        Mode::Off | Mode::Auto => None,
+    }
+}
+
+fn cpu_kind_tag(kind: identify::Kind) -> &'static str {
+    match kind {
+        identify::Kind::Cw => "cw",
+        identify::Kind::Psk31 => "psk",
+        identify::Kind::Rtty => "rtty",
+        identify::Kind::Ft8 => "ft8",
+        identify::Kind::Ft4 => "ft4",
+        _ => "",
+    }
+}
+
+/// Rolling occupancy of the UI-thread pipeline, percent of real time.
+///
+/// The radio drops blocks rather than blocking, so this is the number that
+/// predicts a stuttering waterfall. Per-kind shares come from
+/// `decoder.process` only.
+struct CpuMeter {
+    window_start: Instant,
+    feed_ns: u128,
+    kind_ns: [u128; 5],
+    /// Smoothed overall occupancy. `None` until the first window closes.
+    overall: Option<f32>,
+    kind: [f32; 5],
+}
+
+const CPU_WINDOW: Duration = Duration::from_millis(1000);
+const CPU_EMA: f32 = 0.35;
+/// Hide a per-mode share below this; it is noise, not a load.
+const CPU_KIND_FLOOR: f32 = 2.0;
+
+impl CpuMeter {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            feed_ns: 0,
+            kind_ns: [0; 5],
+            overall: None,
+            kind: [0.0; 5],
+        }
+    }
+
+    fn add_kind(&mut self, kind: identify::Kind, ns: u128) {
+        if let Some(i) = cpu_kind_index(kind) {
+            self.kind_ns[i] += ns;
+        }
+    }
+
+    fn add_feed(&mut self, ns: u128) {
+        self.feed_ns += ns;
+        self.flush();
+    }
+
+    fn apply_sample(&mut self, feed_ns: u128, kind_ns: [u128; 5], wall_ns: u128) {
+        let wall_ns = wall_ns.max(1) as f64;
+        let overall = (feed_ns as f64 / wall_ns * 100.0) as f32;
+        let mut kind = [0.0f32; 5];
+        for i in 0..5 {
+            kind[i] = (kind_ns[i] as f64 / wall_ns * 100.0) as f32;
+        }
+        match self.overall {
+            None => {
+                self.overall = Some(overall);
+                self.kind = kind;
+            }
+            Some(prev) => {
+                self.overall = Some((1.0 - CPU_EMA) * prev + CPU_EMA * overall);
+                for i in 0..5 {
+                    self.kind[i] = (1.0 - CPU_EMA) * self.kind[i] + CPU_EMA * kind[i];
+                }
+            }
+        }
+    }
+
+    fn flush(&mut self) {
+        let wall = self.window_start.elapsed();
+        if wall < CPU_WINDOW {
+            return;
+        }
+        self.apply_sample(self.feed_ns, self.kind_ns, wall.as_nanos());
+        self.feed_ns = 0;
+        self.kind_ns = [0; 5];
+        self.window_start = Instant::now();
+    }
+
+    #[cfg(test)]
+    fn set_display(&mut self, overall: f32, kinds: &[(identify::Kind, f32)]) {
+        self.overall = Some(overall);
+        self.kind = [0.0; 5];
+        for &(k, v) in kinds {
+            if let Some(i) = cpu_kind_index(k) {
+                self.kind[i] = v;
+            }
+        }
+    }
 }
 
 struct App {
@@ -708,6 +830,7 @@ struct App {
     /// lock is on its sideband. See `Decoder::confidence`.
     copy_floor: f32,
     cursor_snr: f32,
+    cpu: CpuMeter,
 
     /// Recent radio IQ used by the span scout and the signature classifier.
     scout_iq: Vec<Complex32>,
@@ -846,7 +969,10 @@ impl App {
             gain: 36.0,
             rfgr: 3.0,
             ifgr: 40.0,
-            gain_control: radio::GainControl::Overall { min: 0.0, max: 48.0 },
+            gain_control: radio::GainControl::Overall {
+                min: 0.0,
+                max: 48.0,
+            },
             agc: AgcMode::Soft,
             agc_setpoint: -30,
             biast: false,
@@ -891,7 +1017,7 @@ impl App {
             waterfall: VecDeque::new(),
             wf_accum: Vec::new(),
             wf_last: Instant::now(),
-            wf_idx: 2, // 500 ms per row
+            wf_idx: 2,  // 500 ms per row
             fft_idx: 3, // 8192
             floor_db: -90.0,
             ceil_db: -20.0,
@@ -928,6 +1054,7 @@ impl App {
             squelch_db: 12.0,
             copy_floor: COPY_FLOOR,
             cursor_snr: 0.0,
+            cpu: CpuMeter::new(),
             scout_iq: Vec::new(),
             psk_hits: Vec::new(),
             cw_hits: Vec::new(),
@@ -1002,9 +1129,7 @@ impl App {
     fn queue_more_hw_gain(&mut self, measured_dbfs: f32) -> bool {
         match self.gain_control {
             radio::GainControl::Sdrplay {
-                rfgr_min,
-                ifgr_min,
-                ..
+                rfgr_min, ifgr_min, ..
             } => {
                 // IFGR is a calibrated dB reduction and is therefore the fine
                 // control. Preserve the RF/LNA state until IF trim is exhausted.
@@ -1012,7 +1137,8 @@ impl App {
                     let old = self.ifgr;
                     self.ifgr = (self.ifgr - 2.0).max(ifgr_min);
                     self.pending_ifgr = Some(self.ifgr);
-                    self.gain_probe = Some((Instant::now(), measured_dbfs, (old - self.ifgr) as f32));
+                    self.gain_probe =
+                        Some((Instant::now(), measured_dbfs, (old - self.ifgr) as f32));
                     true
                 } else if self.rfgr > rfgr_min {
                     self.rfgr = (self.rfgr - 1.0).max(rfgr_min);
@@ -1027,7 +1153,8 @@ impl App {
                 self.gain = (self.gain + 2.0).min(max);
                 self.pending_gain = Some(self.gain);
                 if self.gain > old {
-                    self.gain_probe = Some((Instant::now(), measured_dbfs, (self.gain - old) as f32));
+                    self.gain_probe =
+                        Some((Instant::now(), measured_dbfs, (self.gain - old) as f32));
                     true
                 } else {
                     false
@@ -1041,9 +1168,7 @@ impl App {
         self.external_noise_dominant = false;
         match self.gain_control {
             radio::GainControl::Sdrplay {
-                rfgr_max,
-                ifgr_max,
-                ..
+                rfgr_max, ifgr_max, ..
             } => {
                 // RFGR moves the LNA first, protecting the mixer from strong
                 // out-of-band stations; IFGR then supplies fine extra headroom.
@@ -1314,15 +1439,22 @@ impl App {
             }
         }
 
+        let mut kind_ns = [0u128; 5];
         for slot in &mut self.auto {
             if soft && slot.decoder.wants_agc() {
                 slot.agc.process(&mut slot.audio);
             }
+            let t = Instant::now();
             let text = slot.decoder.process(&slot.audio);
+            if let Some(i) = cpu_kind_index(slot.kind) {
+                kind_ns[i] += t.elapsed().as_nanos();
+            }
             let (dial_hz, kind, mode) = (slot.dial_hz, slot.kind, slot.decoder.name());
             let conf = slot.decoder.confidence();
             let speed = slot.decoder.speed().unwrap_or_default();
-            let signal = conf.map(|c| format!("{:.0}%", c * 100.0)).unwrap_or_default();
+            let signal = conf
+                .map(|c| format!("{:.0}%", c * 100.0))
+                .unwrap_or_default();
             // The decoder keeps running either way — it has to, or it would
             // never find the lock that lifts it back over the floor. Only what
             // it says while it is below the floor is thrown away.
@@ -1396,9 +1528,7 @@ impl App {
                     }
                 }
                 let idle = slot.quiet as f64 >= AUTO_FLUSH_SECS * slot.tap.fs_out();
-                if slot.partial.len() >= AUTO_LINE
-                    || (idle && !slot.partial.trim().is_empty())
-                {
+                if slot.partial.len() >= AUTO_LINE || (idle && !slot.partial.trim().is_empty()) {
                     let take = slot
                         .partial
                         .char_indices()
@@ -1407,6 +1537,12 @@ impl App {
                     let line: String = slot.partial.drain(..take).collect();
                     lines.push(row(&signal, line.trim_end().to_string()));
                 }
+            }
+        }
+
+        for (i, ns) in kind_ns.iter().copied().enumerate() {
+            if ns > 0 {
+                self.cpu.add_kind(CPU_KINDS[i], ns);
             }
         }
 
@@ -1526,7 +1662,15 @@ impl App {
             if !pinned && self.auto.iter().filter(|s| !s.pinned).count() >= self.slot_budget() {
                 continue;
             }
-            if let Some(slot) = AutoSlot::new(kind, dial, self.center, self.rate, pinned, shift, self.channelizer.hop()) {
+            if let Some(slot) = AutoSlot::new(
+                kind,
+                dial,
+                self.center,
+                self.rate,
+                pinned,
+                shift,
+                self.channelizer.hop(),
+            ) {
                 self.auto.push(slot);
             }
         }
@@ -1602,6 +1746,7 @@ impl App {
     }
 
     fn feed(&mut self, block: &[Complex32], spec: &mut Spectrum, out: &mut Vec<Complex32>) {
+        let feed_t0 = Instant::now();
         // Front-end cleanup first, so nothing downstream — spectrum,
         // classifier, scouts, decoders — ever sees the receiver's own DC
         // offset or the image its IQ imbalance mirrors about the LO. Applied
@@ -1652,17 +1797,18 @@ impl App {
             }
         }
 
-        // Accumulate the peak between waterfall rows instead of pushing a row
-        // per block - otherwise the display scrolls far faster than it reads.
+        // Smoothly accumulate between waterfall rows instead of hard peak-latching
+        // so static crashes and noise flutter don't speckle the display.
         if self.wf_accum.len() != self.smoothed.len() {
             self.wf_accum = self.smoothed.clone();
         } else {
             for (a, v) in self.wf_accum.iter_mut().zip(&self.smoothed) {
-                *a = a.max(*v);
+                *a = 0.60 * *a + 0.40 * *v;
             }
         }
         if self.wf_last.elapsed() >= self.wf_interval() {
-            self.waterfall.push_front(std::mem::take(&mut self.wf_accum));
+            self.waterfall
+                .push_front(std::mem::take(&mut self.wf_accum));
             let cap = (WF_HISTORY_FLOATS / self.fft_size().max(1)).clamp(16, WF_MAX_ROWS);
             while self.waterfall.len() > cap {
                 self.waterfall.pop_back();
@@ -1767,6 +1913,8 @@ impl App {
             self.feed_auto(block);
         }
 
+        let dec_kind = mode_kind(self.mode);
+        let mut dec_ns = 0u128;
         if self.decoder.is_some() {
             let (shift, gated, rides_agc) = self
                 .decoder
@@ -1783,7 +1931,9 @@ impl App {
             let open = !self.squelch || !gated || self.cursor_snr >= self.squelch_db;
             let floor = self.copy_floor;
             if let Some(d) = &mut self.decoder {
+                let t = Instant::now();
                 let new = if open { d.process(out) } else { String::new() };
+                dec_ns = t.elapsed().as_nanos();
                 // Same floor the auto pane applies: the decoder keeps hunting,
                 // but text it has no confidence in never reaches the pane.
                 let new = if d.confidence().is_none_or(|c| c >= floor) {
@@ -1834,8 +1984,13 @@ impl App {
             }
         }
 
+        if let Some(k) = dec_kind {
+            self.cpu.add_kind(k, dec_ns);
+        }
+
         // Hand the scratch buffer back so the next block reuses it.
         self.iq_buf = buf;
+        self.cpu.add_feed(feed_t0.elapsed().as_nanos());
     }
 }
 
@@ -1949,7 +2104,8 @@ fn main() -> Result<()> {
     if args.bench {
         return bench::run(
             &args.device,
-            args.freq.unwrap_or(bands::BANDS[bands::DEFAULT_BAND].default),
+            args.freq
+                .unwrap_or(bands::BANDS[bands::DEFAULT_BAND].default),
         );
     }
 
@@ -2078,237 +2234,255 @@ fn run_app<B: Backend>(
         if event::poll(Duration::from_millis(10))? {
             match event::read()? {
                 Event::Key(k) => {
-                if k.kind != KeyEventKind::Press {
-                    continue;
-                }
-                // While the settings dialog is open it owns all keys.
-                if app.settings.is_some() {
-                    settings_key(app, k);
-                    continue;
-                }
-                let shift = k.modifiers.contains(KeyModifiers::SHIFT);
-                let step = app.step_hz();
-                match k.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('?') => app.show_help = !app.show_help,
-                    KeyCode::Char('o') => {
-                        app.settings = Some(SettingsEdit {
-                            call: app.my_call.clone(),
-                            grid: app.my_grid.clone(),
-                            field: 0,
-                        });
+                    if k.kind != KeyEventKind::Press {
+                        continue;
                     }
-                    KeyCode::Left => nudge_cursor(app, if shift { -step * 10.0 } else { -step }),
-                    KeyCode::Right => nudge_cursor(app, if shift { step * 10.0 } else { step }),
-                    KeyCode::Char('z') => app.zoom = (app.zoom * 2.0).min(512.0),
-                    KeyCode::Char('Z') => app.zoom = (app.zoom / 2.0).max(1.0),
-                    KeyCode::Char('n') => next_signal(app, true),
-                    KeyCode::Char('N') => next_signal(app, false),
-                    KeyCode::Char('p') => mode_scan_key(app, radio),
-                    KeyCode::Char('f') => {
-                        app.fft_idx = (app.fft_idx + 1) % FFT_SIZES.len();
-                        let n = app.fft_size();
-                        let hz = app.bin_hz();
-                        app.log(format!("FFT {n} ({hz:.1} Hz/bin)"));
+                    // While the settings dialog is open it owns all keys.
+                    if app.settings.is_some() {
+                        settings_key(app, k);
+                        continue;
                     }
-                    KeyCode::Char('F') => {
-                        app.fft_idx = (app.fft_idx + FFT_SIZES.len() - 1) % FFT_SIZES.len();
-                        let n = app.fft_size();
-                        let hz = app.bin_hz();
-                        app.log(format!("FFT {n} ({hz:.1} Hz/bin)"));
-                    }
-                    KeyCode::Char('w') => {
-                        app.wf_idx = (app.wf_idx + 1) % WF_INTERVALS_MS.len();
-                        let ms = WF_INTERVALS_MS[app.wf_idx];
-                        app.log(format!("waterfall {ms} ms/row"));
-                    }
-                    KeyCode::Char('v') => {
-                        app.decode_zoom = (app.decode_zoom + 1) % 3;
-                        let size = ["normal", "large", "huge"][app.decode_zoom as usize];
-                        app.log(format!("decode pane: {size}"));
-                    }
-                    KeyCode::Char('V') => {
-                        // The two faces anchor at opposite ends, so an offset
-                        // carried across would land somewhere arbitrary.
-                        app.msg_scroll = 0;
-                        app.auto_view = match app.auto_view {
-                            AutoView::Rows => AutoView::Log,
-                            AutoView::Log => AutoView::Rows,
-                        };
-                        let what = match app.auto_view {
-                            AutoView::Rows => "held rows",
-                            AutoView::Log => "chronological log",
-                        };
-                        app.log(format!("auto decode view: {what}"));
-                    }
-                    KeyCode::Char('[') => retune(app, radio, app.center - 10_000.0),
-                    KeyCode::Char(']') => retune(app, radio, app.center + 10_000.0),
-                    KeyCode::PageUp => retune(app, radio, app.center - app.rate / 2.0),
-                    KeyCode::PageDown => retune(app, radio, app.center + app.rate / 2.0),
-                    KeyCode::Char('c') => {
-                        let f = app.tuned_freq();
-                        app.cursor = 0.0;
-                        retune(app, radio, f);
-                    }
-                    KeyCode::Char('b') => {
-                        app.band_idx = (app.band_idx + 1) % bands::BANDS.len();
-                        go_to_band(app, radio);
-                    }
-                    KeyCode::Char('B') => {
-                        app.band_idx = (app.band_idx + bands::BANDS.len() - 1) % bands::BANDS.len();
-                        go_to_band(app, radio);
-                    }
-                    KeyCode::Char('d') => {
-                        let next = app.mode.next();
-                        // FT8/FT4 need a radio rate that divides by 12 kHz.
-                        if needs_exact_audio(next) && !rate_ok_for_ft(app.rate) {
-                            set_radio_rate(app, radio, FT_SAFE_RATE);
-                            app.log(format!("sample rate -> {FT_SAFE_RATE:.0} Hz for FT"));
+                    let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+                    let step = app.step_hz();
+                    match k.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('?') => app.show_help = !app.show_help,
+                        KeyCode::Char('o') => {
+                            app.settings = Some(SettingsEdit {
+                                call: app.my_call.clone(),
+                                grid: app.my_grid.clone(),
+                                field: 0,
+                            });
                         }
-                        app.set_mode(next);
-                    }
-                    KeyCode::Char('r') => {
-                        if let Some(d) = &mut app.decoder {
-                            d.toggle();
+                        KeyCode::Left => {
+                            nudge_cursor(app, if shift { -step * 10.0 } else { -step })
                         }
-                    }
-                    KeyCode::Char('u') if matches!(app.mode, Mode::Cw | Mode::Psk31) => {
-                        lock_nudge(app, -2.0);
-                    }
-                    KeyCode::Char('i') if matches!(app.mode, Mode::Cw | Mode::Psk31) => {
-                        lock_nudge(app, 2.0);
-                    }
-                    KeyCode::Char('g') if matches!(app.mode, Mode::Cw | Mode::Psk31) => {
-                        centre_on_lock(app);
-                    }
-                    KeyCode::Char('x') => {
-                        app.text.clear();
-                        app.decode_log.clear();
-                        app.rows.clear();
-                        app.ft_msgs.clear();
-                        app.stations.clear();
-                        app.msg_scroll = 0;
-                        app.st_scroll = 0;
-                        app.act_scroll = 0;
-                        if let Some(d) = &mut app.decoder {
-                            d.reset();
+                        KeyCode::Right => nudge_cursor(app, if shift { step * 10.0 } else { step }),
+                        KeyCode::Char('z') => app.zoom = (app.zoom * 2.0).min(512.0),
+                        KeyCode::Char('Z') => app.zoom = (app.zoom / 2.0).max(1.0),
+                        KeyCode::Char('n') => next_signal(app, true),
+                        KeyCode::Char('N') => next_signal(app, false),
+                        KeyCode::Char('p') => mode_scan_key(app, radio),
+                        KeyCode::Char('f') => {
+                            app.fft_idx = (app.fft_idx + 1) % FFT_SIZES.len();
+                            let n = app.fft_size();
+                            let hz = app.bin_hz();
+                            app.log(format!("FFT {n} ({hz:.1} Hz/bin)"));
                         }
-                    }
-                    KeyCode::Up => {
-                        let n = if shift { 10 } else { 1 };
-                        app.scroll_transcript(n as isize);
-                    }
-                    KeyCode::Down => {
-                        let n = if shift { 10 } else { 1 };
-                        app.scroll_transcript(-(n as isize));
-                    }
-                    KeyCode::Char('W') => {
-                        app.wf_res = app.wf_res.next();
-                        app.wf_scroll = 0;
-                        let what = app.wf_res.label();
-                        app.log(format!("waterfall: {what}"));
-                    }
-                    KeyCode::Char('a') => cycle_agc(app, radio),
-                    KeyCode::Char(';') => {
-                        if app.radio_caps.as_ref().is_some_and(|c| c.agc_setpoint) {
-                            app.agc_setpoint = match app.agc_setpoint {
-                                i if i <= -40 => -30,
-                                i if i <= -30 => -20,
-                                _ => -40,
+                        KeyCode::Char('F') => {
+                            app.fft_idx = (app.fft_idx + FFT_SIZES.len() - 1) % FFT_SIZES.len();
+                            let n = app.fft_size();
+                            let hz = app.bin_hz();
+                            app.log(format!("FFT {n} ({hz:.1} Hz/bin)"));
+                        }
+                        KeyCode::Char('w') => {
+                            app.wf_idx = (app.wf_idx + 1) % WF_INTERVALS_MS.len();
+                            let ms = WF_INTERVALS_MS[app.wf_idx];
+                            app.log(format!("waterfall {ms} ms/row"));
+                        }
+                        KeyCode::Char('v') => {
+                            app.decode_zoom = (app.decode_zoom + 1) % 3;
+                            let size = ["normal", "large", "huge"][app.decode_zoom as usize];
+                            app.log(format!("decode pane: {size}"));
+                        }
+                        KeyCode::Char('V') => {
+                            // The two faces anchor at opposite ends, so an offset
+                            // carried across would land somewhere arbitrary.
+                            app.msg_scroll = 0;
+                            app.auto_view = match app.auto_view {
+                                AutoView::Rows => AutoView::Log,
+                                AutoView::Log => AutoView::Rows,
                             };
-                            let _ = radio.cmd.send(radio::Cmd::AgcSetpoint(app.agc_setpoint));
-                            app.log(format!("hardware AGC setpoint {} dBFS", app.agc_setpoint));
-                        } else {
-                            app.log("hardware AGC setpoint is not exposed by this backend".into());
+                            let what = match app.auto_view {
+                                AutoView::Rows => "held rows",
+                                AutoView::Log => "chronological log",
+                            };
+                            app.log(format!("auto decode view: {what}"));
                         }
-                    }
-                    KeyCode::Char('e') => {
-                        app.smooth_idx = (app.smooth_idx + 1) % SMOOTH_LABELS.len();
-                        app.log(format!(
-                            "spectrum smooth: {}",
-                            SMOOTH_LABELS[app.smooth_idx]
-                        ));
-                    }
-                    KeyCode::Char('j') => {
-                        let level = app.front.cycle_blanker();
-                        app.log(format!("noise blanker: {level}"));
-                    }
-                    KeyCode::Char('l') => {
-                        app.rx_filter = app.rx_filter.next();
-                        app.apply_rx_filter();
-                        app.log(format!(
-                            "RX filter: {} ({:.0} Hz)",
-                            app.rx_filter.label(),
-                            app.rx_bandwidth()
-                        ));
-                    }
-                    KeyCode::Char('t') => {
-                        app.biast = !app.biast;
-                        let _ = radio.cmd.send(radio::Cmd::BiasT(app.biast));
-                    }
-                    KeyCode::Char('m') => cycle_rf_notch(app, radio),
-                    KeyCode::Char('D') => {
-                        if app.radio_caps.as_ref().is_some_and(|c| c.dab_notch) {
-                            app.dab_notch = !app.dab_notch;
-                            let _ = radio.cmd.send(radio::Cmd::DabNotch(app.dab_notch));
-                        } else {
-                            app.log("DAB notch is not exposed by this backend".into());
+                        KeyCode::Char('[') => retune(app, radio, app.center - 10_000.0),
+                        KeyCode::Char(']') => retune(app, radio, app.center + 10_000.0),
+                        KeyCode::PageUp => retune(app, radio, app.center - app.rate / 2.0),
+                        KeyCode::PageDown => retune(app, radio, app.center + app.rate / 2.0),
+                        KeyCode::Char('c') => {
+                            let f = app.tuned_freq();
+                            app.cursor = 0.0;
+                            retune(app, radio, f);
                         }
-                    }
-                    KeyCode::Char('I') => {
-                        if app.radio_caps.as_ref().is_some_and(|c| c.iq_correction) {
-                            app.iq_correction = !app.iq_correction;
-                            let _ = radio.cmd.send(radio::Cmd::IqCorrection(app.iq_correction));
-                        } else {
-                            app.log("driver IQ correction is not exposed by this backend".into());
+                        KeyCode::Char('b') => {
+                            app.band_idx = (app.band_idx + 1) % bands::BANDS.len();
+                            go_to_band(app, radio);
                         }
-                    }
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        if app.radio_caps.as_ref().is_some_and(|c| c.ppm) {
-                            let delta = if matches!(k.code, KeyCode::Char('Y')) { 0.1 } else { -0.1 };
-                            app.ppm = (app.ppm + delta).clamp(-100.0, 100.0);
-                            let _ = radio.cmd.send(radio::Cmd::Ppm(app.ppm));
-                            app.log(format!("frequency correction {:+.1} ppm", app.ppm));
-                        } else {
-                            app.log("frequency correction is not exposed by this backend".into());
+                        KeyCode::Char('B') => {
+                            app.band_idx =
+                                (app.band_idx + bands::BANDS.len() - 1) % bands::BANDS.len();
+                            go_to_band(app, radio);
                         }
-                    }
-                    KeyCode::Char('h') => toggle_low_if(app, radio),
-                    KeyCode::Char('+') | KeyCode::Char('=') => {
-                        adjust_manual_gain(app, true);
-                        apply_agc_mode(app, radio, AgcMode::Off);
-                    }
-                    KeyCode::Char('-') => {
-                        adjust_manual_gain(app, false);
-                        apply_agc_mode(app, radio, AgcMode::Off);
-                    }
-                    KeyCode::Char('k') => {
-                        app.squelch = !app.squelch;
-                        let msg = format!("squelch {}", if app.squelch { "on" } else { "off" });
-                        app.log(msg);
-                    }
-                    KeyCode::Char(',') => app.squelch_db = (app.squelch_db - 1.0).max(0.0),
-                    KeyCode::Char('.') => app.squelch_db = (app.squelch_db + 1.0).min(40.0),
-                    KeyCode::Char('<') | KeyCode::Char('>') => {
-                        let step = if matches!(k.code, KeyCode::Char('>')) { 0.05 } else { -0.05 };
-                        app.copy_floor = (app.copy_floor + step).clamp(0.0, 0.95);
-                        let msg = if app.copy_floor <= 0.0 {
-                            "copy floor off — everything the decoders say is printed".to_string()
-                        } else {
-                            format!("copy floor {:.0}%", app.copy_floor * 100.0)
-                        };
-                        app.log(msg);
-                    }
-                    KeyCode::Char('s') => {
-                        if app.scan.is_some() {
-                            app.scan = None;
-                            app.log("scan cancelled".into());
-                        } else {
-                            start_scan(app, radio, ScanKind::Energy);
+                        KeyCode::Char('d') => {
+                            let next = app.mode.next();
+                            // FT8/FT4 need a radio rate that divides by 12 kHz.
+                            if needs_exact_audio(next) && !rate_ok_for_ft(app.rate) {
+                                set_radio_rate(app, radio, FT_SAFE_RATE);
+                                app.log(format!("sample rate -> {FT_SAFE_RATE:.0} Hz for FT"));
+                            }
+                            app.set_mode(next);
                         }
+                        KeyCode::Char('r') => {
+                            if let Some(d) = &mut app.decoder {
+                                d.toggle();
+                            }
+                        }
+                        KeyCode::Char('u') if matches!(app.mode, Mode::Cw | Mode::Psk31) => {
+                            lock_nudge(app, -2.0);
+                        }
+                        KeyCode::Char('i') if matches!(app.mode, Mode::Cw | Mode::Psk31) => {
+                            lock_nudge(app, 2.0);
+                        }
+                        KeyCode::Char('g') if matches!(app.mode, Mode::Cw | Mode::Psk31) => {
+                            centre_on_lock(app);
+                        }
+                        KeyCode::Char('x') => {
+                            app.text.clear();
+                            app.decode_log.clear();
+                            app.rows.clear();
+                            app.ft_msgs.clear();
+                            app.stations.clear();
+                            app.msg_scroll = 0;
+                            app.st_scroll = 0;
+                            app.act_scroll = 0;
+                            if let Some(d) = &mut app.decoder {
+                                d.reset();
+                            }
+                        }
+                        KeyCode::Up => {
+                            let n = if shift { 10 } else { 1 };
+                            app.scroll_transcript(n as isize);
+                        }
+                        KeyCode::Down => {
+                            let n = if shift { 10 } else { 1 };
+                            app.scroll_transcript(-(n as isize));
+                        }
+                        KeyCode::Char('W') => {
+                            app.wf_res = app.wf_res.next();
+                            app.wf_scroll = 0;
+                            let what = app.wf_res.label();
+                            app.log(format!("waterfall: {what}"));
+                        }
+                        KeyCode::Char('a') => cycle_agc(app, radio),
+                        KeyCode::Char(';') => {
+                            if app.radio_caps.as_ref().is_some_and(|c| c.agc_setpoint) {
+                                app.agc_setpoint = match app.agc_setpoint {
+                                    i if i <= -40 => -30,
+                                    i if i <= -30 => -20,
+                                    _ => -40,
+                                };
+                                let _ = radio.cmd.send(radio::Cmd::AgcSetpoint(app.agc_setpoint));
+                                app.log(format!("hardware AGC setpoint {} dBFS", app.agc_setpoint));
+                            } else {
+                                app.log(
+                                    "hardware AGC setpoint is not exposed by this backend".into(),
+                                );
+                            }
+                        }
+                        KeyCode::Char('e') => {
+                            app.smooth_idx = (app.smooth_idx + 1) % SMOOTH_LABELS.len();
+                            app.log(format!(
+                                "spectrum smooth: {}",
+                                SMOOTH_LABELS[app.smooth_idx]
+                            ));
+                        }
+                        KeyCode::Char('j') => {
+                            let level = app.front.cycle_blanker();
+                            app.log(format!("noise blanker: {level}"));
+                        }
+                        KeyCode::Char('l') => {
+                            app.rx_filter = app.rx_filter.next();
+                            app.apply_rx_filter();
+                            app.log(format!(
+                                "RX filter: {} ({:.0} Hz)",
+                                app.rx_filter.label(),
+                                app.rx_bandwidth()
+                            ));
+                        }
+                        KeyCode::Char('t') => {
+                            app.biast = !app.biast;
+                            let _ = radio.cmd.send(radio::Cmd::BiasT(app.biast));
+                        }
+                        KeyCode::Char('m') => cycle_rf_notch(app, radio),
+                        KeyCode::Char('D') => {
+                            if app.radio_caps.as_ref().is_some_and(|c| c.dab_notch) {
+                                app.dab_notch = !app.dab_notch;
+                                let _ = radio.cmd.send(radio::Cmd::DabNotch(app.dab_notch));
+                            } else {
+                                app.log("DAB notch is not exposed by this backend".into());
+                            }
+                        }
+                        KeyCode::Char('I') => {
+                            if app.radio_caps.as_ref().is_some_and(|c| c.iq_correction) {
+                                app.iq_correction = !app.iq_correction;
+                                let _ = radio.cmd.send(radio::Cmd::IqCorrection(app.iq_correction));
+                            } else {
+                                app.log(
+                                    "driver IQ correction is not exposed by this backend".into(),
+                                );
+                            }
+                        }
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            if app.radio_caps.as_ref().is_some_and(|c| c.ppm) {
+                                let delta = if matches!(k.code, KeyCode::Char('Y')) {
+                                    0.1
+                                } else {
+                                    -0.1
+                                };
+                                app.ppm = (app.ppm + delta).clamp(-100.0, 100.0);
+                                let _ = radio.cmd.send(radio::Cmd::Ppm(app.ppm));
+                                app.log(format!("frequency correction {:+.1} ppm", app.ppm));
+                            } else {
+                                app.log(
+                                    "frequency correction is not exposed by this backend".into(),
+                                );
+                            }
+                        }
+                        KeyCode::Char('h') => toggle_low_if(app, radio),
+                        KeyCode::Char('+') | KeyCode::Char('=') => {
+                            adjust_manual_gain(app, true);
+                            apply_agc_mode(app, radio, AgcMode::Off);
+                        }
+                        KeyCode::Char('-') => {
+                            adjust_manual_gain(app, false);
+                            apply_agc_mode(app, radio, AgcMode::Off);
+                        }
+                        KeyCode::Char('k') => {
+                            app.squelch = !app.squelch;
+                            let msg = format!("squelch {}", if app.squelch { "on" } else { "off" });
+                            app.log(msg);
+                        }
+                        KeyCode::Char(',') => app.squelch_db = (app.squelch_db - 1.0).max(0.0),
+                        KeyCode::Char('.') => app.squelch_db = (app.squelch_db + 1.0).min(40.0),
+                        KeyCode::Char('<') | KeyCode::Char('>') => {
+                            let step = if matches!(k.code, KeyCode::Char('>')) {
+                                0.05
+                            } else {
+                                -0.05
+                            };
+                            app.copy_floor = (app.copy_floor + step).clamp(0.0, 0.95);
+                            let msg = if app.copy_floor <= 0.0 {
+                                "copy floor off — everything the decoders say is printed"
+                                    .to_string()
+                            } else {
+                                format!("copy floor {:.0}%", app.copy_floor * 100.0)
+                            };
+                            app.log(msg);
+                        }
+                        KeyCode::Char('s') => {
+                            if app.scan.is_some() {
+                                app.scan = None;
+                                app.log("scan cancelled".into());
+                            } else {
+                                start_scan(app, radio, ScanKind::Energy);
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
                 }
                 Event::Mouse(m) => {
                     let delta: isize = match m.kind {
@@ -2335,7 +2509,11 @@ fn settings_key(app: &mut App, k: KeyEvent) {
         KeyCode::Esc => app.settings = None,
         KeyCode::Tab | KeyCode::Up | KeyCode::Down => ed.field = 1 - ed.field,
         KeyCode::Backspace => {
-            let s = if ed.field == 0 { &mut ed.call } else { &mut ed.grid };
+            let s = if ed.field == 0 {
+                &mut ed.call
+            } else {
+                &mut ed.grid
+            };
             s.pop();
         }
         KeyCode::Enter => {
@@ -2379,9 +2557,7 @@ fn settings_key(app: &mut App, k: KeyEvent) {
 /// independently, the waterfall scrolls back through its history.
 fn scroll_pane_at(app: &mut App, area: Rect, col: u16, row: u16, delta: isize) {
     let chunks = pane_rects(area, app);
-    let inside = |r: Rect| {
-        col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
-    };
+    let inside = |r: Rect| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height;
     let adj = |v: &mut usize| *v = v.saturating_add_signed(delta);
     if inside(chunks[3]) {
         if matches!(app.mode, Mode::Ft8 | Mode::Ft4) {
@@ -2577,9 +2753,7 @@ fn apply_idents(app: &mut App, raw: Vec<identify::Ident>) {
         }
         if let Some(i) = match_track(&app.tracks, &id) {
             let t = &mut app.tracks[i];
-            if matches!(t.kind, identify::Kind::Ft8 | identify::Kind::Ft4)
-                && t.kind == id.kind
-            {
+            if matches!(t.kind, identify::Kind::Ft8 | identify::Kind::Ft4) && t.kind == id.kind {
                 let lo = (t.offset_hz - t.bw_hz * 0.5).min(id.offset_hz - id.bw_hz * 0.5);
                 let hi = (t.offset_hz + t.bw_hz * 0.5).max(id.offset_hz + id.bw_hz * 0.5);
                 t.offset_hz = (lo + hi) * 0.5;
@@ -2650,10 +2824,10 @@ fn match_track(tracks: &[LabelTrack], id: &identify::Ident) -> Option<usize> {
             (t.offset_hz - id.offset_hz).abs() < slack
         })
         .min_by(|(_, a), (_, b)| {
-            let da = (a.offset_hz - id.offset_hz).abs()
-                + if a.kind == id.kind { 0.0 } else { 800.0 };
-            let db = (b.offset_hz - id.offset_hz).abs()
-                + if b.kind == id.kind { 0.0 } else { 800.0 };
+            let da =
+                (a.offset_hz - id.offset_hz).abs() + if a.kind == id.kind { 0.0 } else { 800.0 };
+            let db =
+                (b.offset_hz - id.offset_hz).abs() + if b.kind == id.kind { 0.0 } else { 800.0 };
             da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(i, _)| i)
@@ -2720,7 +2894,8 @@ fn merge_heard(app: &mut App) {
     // ordering actually did was hand the front of the row permanently to
     // whatever sits lowest in the band, which on the amateur bands is the
     // bottom edge, and bury everything found since behind the `+N`.
-    app.heard.sort_by(|a, b| b.last.cmp(&a.last).then(b.seq.cmp(&a.seq)));
+    app.heard
+        .sort_by(|a, b| b.last.cmp(&a.last).then(b.seq.cmp(&a.seq)));
 }
 
 fn cycle_agc(app: &mut App, radio: &radio::Radio) {
@@ -2783,7 +2958,11 @@ fn cycle_rf_notch(app: &mut App, radio: &radio::Radio) {
         app.rf_notch = automatic_rf_notch(app.center);
         app.log(format!(
             "RF notch auto ({})",
-            if app.rf_notch { "on for HF" } else { "off for MW/LW" }
+            if app.rf_notch {
+                "on for HF"
+            } else {
+                "off for MW/LW"
+            }
         ));
     }
     let _ = radio.cmd.send(radio::Cmd::RfNotch(app.rf_notch));
@@ -2802,7 +2981,11 @@ fn go_to_band(app: &mut App, radio: &radio::Radio) {
     app.cursor = 0.0;
     if (app.rate - span).abs() >= 1.0 {
         set_radio_rate(app, radio, span);
-        app.log(format!("span {:.0} kHz — {} end to end", span / 1000.0, band.name));
+        app.log(format!(
+            "span {:.0} kHz — {} end to end",
+            span / 1000.0,
+            band.name
+        ));
     }
     retune(app, radio, freq);
 }
@@ -2825,10 +3008,17 @@ fn set_radio_rate(app: &mut App, radio: &radio::Radio, rate: f64) {
 
 fn toggle_low_if(app: &mut App, radio: &radio::Radio) {
     if matches!(app.mode, Mode::Ft8 | Mode::Ft4 | Mode::Auto) {
-        app.log("low-IF mode is unavailable in FT/AUTO: those decoders require an exact 12 kHz clock".into());
+        app.log(
+            "low-IF mode is unavailable in FT/AUTO: those decoders require an exact 12 kHz clock"
+                .into(),
+        );
         return;
     }
-    let rate = if app.low_if { FT_SAFE_RATE } else { LOW_IF_RATE };
+    let rate = if app.low_if {
+        FT_SAFE_RATE
+    } else {
+        LOW_IF_RATE
+    };
     set_radio_rate(app, radio, rate);
     app.log(if app.low_if {
         "acquisition: low-IF 250 kS/s (benchmark against zero-IF for your site)".into()
@@ -3322,7 +3512,8 @@ fn step_scan(app: &mut App) -> Option<bool> {
         }
         ScanKind::Energy => {
             let peaks = find_peaks(&app.detect_spec, &app.noise_floor, cur, app.rate);
-            let ids = identify::classify_span(&app.scout_iq, app.rate, &app.detect_spec, app.center);
+            let ids =
+                identify::classify_span(&app.scout_iq, app.rate, &app.detect_spec, app.center);
             if let Some(s) = app.scan.as_mut() {
                 for (f, snr) in peaks {
                     let label = ids
@@ -3333,8 +3524,7 @@ fn step_scan(app: &mut App) -> Option<bool> {
                             da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
                         })
                         .filter(|i| {
-                            (s.cur + i.offset_hz as f64 - f).abs()
-                                < i.bw_hz.max(400.0) as f64
+                            (s.cur + i.offset_hz as f64 - f).abs() < i.bw_hz.max(400.0) as f64
                         })
                         .map(|i| i.kind.label())
                         .unwrap_or("");
@@ -3414,7 +3604,8 @@ fn step_scan(app: &mut App) -> Option<bool> {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             results.dedup_by(|a, b| (a.freq - b.freq).abs() < 200.0);
-            app.text.push_str("\n--- scan results (strongest first) ---\n");
+            app.text
+                .push_str("\n--- scan results (strongest first) ---\n");
             app.push_decode_note("--- scan results (strongest first) ---".into());
             for h in results.iter().take(25) {
                 let marker = bands::MARKERS
@@ -3510,7 +3701,8 @@ fn scout_peaks(spectrum: &[f32], floor: &[f32], center: f64, rate: f64) -> Vec<(
     // bins. If it opens across the whole span, the floor has not settled (or
     // the span is pure noise); retain the former 4 dB gate for that frame.
     let crowded = candidates.len() > 64;
-    candidates.into_iter()
+    candidates
+        .into_iter()
         .filter(|(_, _, local_prom)| !crowded || *local_prom >= 4.0)
         .map(|(freq, prom, _)| (freq, prom))
         .collect()
@@ -3567,7 +3759,11 @@ mod noise_floor_detection_tests {
 
     fn old_scout_count(spectrum: &[f32]) -> usize {
         let local = -80.0;
-        spectrum.iter().enumerate().filter(|(i, v)| **v >= local + 4.0 && i.abs_diff(spectrum.len() / 2) > 2).count()
+        spectrum
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| **v >= local + 4.0 && i.abs_diff(spectrum.len() / 2) > 2)
+            .count()
     }
 
     fn measured_thresholds() -> (f32, f32) {
@@ -3583,8 +3779,12 @@ mod noise_floor_detection_tests {
             let snr = half_db as f32 * 0.5;
             let mut spectrum = vec![-80.0; n];
             spectrum[bin] += snr;
-            if old_scout_count(&spectrum) > 0 { old_at = old_at.min(snr); }
-            if !scout_peaks(&spectrum, &floor, 0.0, 48_000.0).is_empty() { new_at = new_at.min(snr); }
+            if old_scout_count(&spectrum) > 0 {
+                old_at = old_at.min(snr);
+            }
+            if !scout_peaks(&spectrum, &floor, 0.0, 48_000.0).is_empty() {
+                new_at = new_at.min(snr);
+            }
         }
         (old_at, new_at)
     }
@@ -3592,7 +3792,11 @@ mod noise_floor_detection_tests {
     #[test]
     fn tracked_floor_opens_the_candidate_gate_by_two_db_without_flat_noise_hits() {
         let (old_at, new_at) = measured_thresholds();
-        assert!(old_at - new_at >= 2.0, "gate improved only {:.1} dB", old_at - new_at);
+        assert!(
+            old_at - new_at >= 2.0,
+            "gate improved only {:.1} dB",
+            old_at - new_at
+        );
         let noise = vec![-80.0; 1024];
         assert_eq!(old_scout_count(&noise), 0);
         assert!(scout_peaks(&noise, &noise, 0.0, 48_000.0).is_empty());
@@ -3602,7 +3806,10 @@ mod noise_floor_detection_tests {
     #[ignore]
     fn bench_tracked_floor_candidate_gate() {
         let (old_at, new_at) = measured_thresholds();
-        println!("scout candidate threshold: old {old_at:.1} dB, tracked floor {new_at:.1} dB ({:.1} dB improvement)", old_at - new_at);
+        println!(
+            "scout candidate threshold: old {old_at:.1} dB, tracked floor {new_at:.1} dB ({:.1} dB improvement)",
+            old_at - new_at
+        );
     }
 }
 
@@ -3623,8 +3830,8 @@ fn pane_rects(area: Rect, app: &App) -> [Rect; 5] {
         (_, _) => Constraint::Percentage(65),
     };
     let chunks = Layout::vertical([
-        // 2 content lines + 2 border rows
-        Constraint::Length(4),
+        // 3 content lines + 2 border rows
+        Constraint::Length(5),
         Constraint::Length(10),
         Constraint::Min(3),
         dec,
@@ -3720,84 +3927,78 @@ fn draw_settings(f: &mut Frame, area: Rect, ed: &SettingsEdit) {
     );
 }
 
-fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let band = bands::band_for(app.center).map(|b| b.name).unwrap_or("--");
-    let dec_status = app
-        .decoder
-        .as_ref()
-        .map(|d| d.status())
-        .unwrap_or_else(|| "-".into());
-    let marker = bands::MARKERS
-        .iter()
-        .find(|m| (m.freq - app.tuned_freq()).abs() < 300.0)
-        .map(|m| format!(" [{}]", m.label))
-        .unwrap_or_default();
-    let (lo, hi) = app.view_range();
+fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(|s| s.content.chars().count()).sum()
+}
 
-    // UTC clock, and for the slot-based modes a countdown to the boundary so
-    // you can see a slot is about to be decoded (and that the clock is sane).
-    let now = utc_secs();
-    let utc = format!(
-        "{:02}:{:02}:{:02}",
-        (now / 3600.0) as u64 % 24,
-        (now / 60.0) as u64 % 60,
-        now as u64 % 60
-    );
-    let slot = match app.mode {
-        Mode::Ft8 => Some(format!("-{:2.0}s", 15.0 - now % 15.0)),
-        Mode::Ft4 => Some(format!("-{:2.1}s", 7.5 - now % 7.5)),
-        _ => None,
-    };
-
-    // Colour code every datum so the eye can jump straight to it: labels dim
-    // grey, values coloured by what they mean.
-    let dim = Style::default().fg(Color::DarkGray);
-    let lbl = |s: &'static str| Span::styled(s, dim);
-    let val = |s: String| Span::styled(s, Style::default().fg(Color::White));
-
-    let mut spans1 = vec![
-        Span::styled(
-            format!("{:.4} kHz", app.tuned_freq() / 1000.0),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(marker, Style::default().fg(Color::Magenta)),
-    ];
-    if !app.my_call.is_empty() {
-        spans1.push(Span::styled(
-            format!("   de {}", app.my_call),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+/// Pad `left` so `right` sits on the trailing edge of `width`. `None` if
+/// they will not both fit.
+fn with_right_align(
+    left: Vec<Span<'static>>,
+    right: &[Span<'static>],
+    width: usize,
+) -> Option<Vec<Span<'static>>> {
+    let lw = spans_width(&left);
+    let rw = spans_width(right);
+    if right.is_empty() {
+        return Some(left);
     }
-    spans1.extend([
-        lbl("   centre "),
-        val(format!("{:.3}", app.center / 1000.0)),
-        lbl("  cursor "),
-        Span::styled(
-            format!("{:+.0} Hz", app.cursor),
-            Style::default().fg(Color::LightCyan),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            band,
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        lbl("  view "),
-        val(format!("{:.2} kHz", (hi - lo) / 1000.0)),
-        Span::styled(format!(" (x{:.0})", app.zoom), dim),
-        lbl("  step "),
-        val(format!("{:.0} Hz", app.step_hz())),
-        Span::styled(format!("  {:.1} Hz/bin", app.bin_hz()), dim),
-    ]);
-    let line1 = Line::from(spans1);
+    if lw + rw > width {
+        return None;
+    }
+    let pad = width - lw - rw;
+    let mut out = left;
+    if pad > 0 {
+        out.push(Span::raw(" ".repeat(pad)));
+    }
+    out.extend(right.iter().cloned());
+    Some(out)
+}
 
-    // Mode gets its own hue so the active decoder is obvious at a glance.
-    let mode_color = match app.mode {
+/// Keep clusters left-to-right, dropping the lowest-priority ones until the
+/// line fits. Priority 100 is never dropped.
+fn pack_clusters(items: &[(Vec<Span<'static>>, u8)], width: usize) -> Vec<Span<'static>> {
+    let mut keep: Vec<bool> = items.iter().map(|(s, _)| !s.is_empty()).collect();
+    let width_of = |keep: &[bool]| {
+        let mut n = 0usize;
+        let mut w = 0usize;
+        for (i, (s, _)) in items.iter().enumerate() {
+            if keep[i] {
+                if n > 0 {
+                    w += 2;
+                }
+                w += spans_width(s);
+                n += 1;
+            }
+        }
+        w
+    };
+    while width_of(&keep) > width {
+        let victim = items
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, p))| keep[*i] && *p < 100)
+            .min_by_key(|(_, (_, p))| *p);
+        match victim {
+            Some((i, _)) => keep[i] = false,
+            None => break,
+        }
+    }
+    let mut out = Vec::new();
+    for (i, (s, _)) in items.iter().enumerate() {
+        if !keep[i] {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(Span::raw("  "));
+        }
+        out.extend(s.iter().cloned());
+    }
+    out
+}
+
+fn mode_color(mode: Mode) -> Color {
+    match mode {
         Mode::Off => Color::DarkGray,
         Mode::Cw => Color::Yellow,
         Mode::Rtty => Color::Magenta,
@@ -3805,13 +4006,135 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::Ft8 => Color::Green,
         Mode::Ft4 => Color::LightGreen,
         Mode::Auto => Color::LightRed,
-    };
-    let snr_color = if app.cursor_snr >= 10.0 {
+    }
+}
+
+fn cpu_color(pct: f32) -> Color {
+    if pct < 35.0 {
         Color::Green
-    } else if app.cursor_snr >= 0.0 {
+    } else if pct < 60.0 {
         Color::Yellow
     } else {
         Color::Red
+    }
+}
+
+const STATUS_PAD: usize = 2;
+
+fn lead_pad() -> Span<'static> {
+    Span::raw(" ".repeat(STATUS_PAD))
+}
+
+fn pack_padded(items: &[(Vec<Span<'static>>, u8)], width: usize) -> Vec<Span<'static>> {
+    let mut out = vec![lead_pad()];
+    out.extend(pack_clusters(items, width.saturating_sub(STATUS_PAD)));
+    out
+}
+
+/// Three content lines for the status strip. `width` is the inner width.
+///
+/// Line 1 is where the radio is (frequency, band, centre, cursor, view).
+/// Line 2 is what it is doing (mode, CPU, SNR). Line 3 is the front-end
+/// and the rest of the radio chrome.
+fn status_lines(app: &App, width: usize) -> [Line<'static>; 3] {
+    let dim = Style::default().fg(Color::DarkGray);
+    let lbl = |s: &'static str| Span::styled(s, dim);
+    let val = |s: String| Span::styled(s, Style::default().fg(Color::White));
+
+    let band = bands::band_for(app.center).map(|b| b.name).unwrap_or("--");
+    let marker = bands::MARKERS
+        .iter()
+        .find(|m| (m.freq - app.tuned_freq()).abs() < 300.0)
+        .map(|m| m.label);
+    let mut hero = vec![
+        Span::styled(
+            format!("{:.2} kHz", app.tuned_freq() / 1000.0),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            band.to_string(),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(label) = marker {
+        hero.push(Span::styled(
+            format!("  [{label}]"),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+
+    let mut mode_spans = vec![Span::styled(
+        app.mode.label().to_string(),
+        Style::default()
+            .fg(mode_color(app.mode))
+            .add_modifier(Modifier::BOLD),
+    )];
+    if app.mode == Mode::Auto {
+        let n = app.auto.len();
+        let word = if n == 1 { "decoder" } else { "decoders" };
+        mode_spans.push(Span::styled(format!(" · {n} {word}"), dim));
+    }
+
+    let now = utc_secs();
+    let utc = format!(
+        "{:02}:{:02}:{:02} UTC",
+        (now / 3600.0) as u64 % 24,
+        (now / 60.0) as u64 % 60,
+        now as u64 % 60
+    );
+    let mut utc_spans = vec![Span::styled(utc, Style::default().fg(Color::LightBlue))];
+    match app.mode {
+        Mode::Ft8 => utc_spans.push(Span::styled(
+            format!(" -{:.0}s", 15.0 - now % 15.0),
+            Style::default().fg(Color::Magenta),
+        )),
+        Mode::Ft4 => utc_spans.push(Span::styled(
+            format!(" -{:.1}s", 7.5 - now % 7.5),
+            Style::default().fg(Color::Magenta),
+        )),
+        _ => {}
+    }
+
+    let (lo, hi) = app.view_range();
+    let centre = vec![lbl("centre "), val(format!("{:.2}", app.center / 1000.0))];
+    let cursor = vec![
+        lbl("cursor "),
+        Span::styled(
+            format!("{:>+6.0} Hz", app.cursor),
+            Style::default().fg(Color::LightCyan),
+        ),
+    ];
+    let view = vec![
+        lbl("view "),
+        val(format!("{:.0} kHz", (hi - lo) / 1000.0)),
+        Span::styled(format!(" ×{:.0}", app.zoom), dim),
+    ];
+    let step = vec![lbl("step "), val(format!("{:.0} Hz", app.step_hz()))];
+    let bin = vec![Span::styled(format!("{:.1} Hz/bin", app.bin_hz()), dim)];
+    let line1 = Line::from(pack_padded(
+        &[
+            (hero, 100),
+            (centre, 90),
+            (cursor, 85),
+            (view, 75),
+            (step, 45),
+            (bin, 30),
+        ],
+        width,
+    ));
+
+    let dec_status = if matches!(app.mode, Mode::Off | Mode::Auto) {
+        String::new()
+    } else {
+        app.decoder
+            .as_ref()
+            .map(|d| d.status())
+            .unwrap_or_else(|| "-".into())
     };
     let dec_style = if app.decoder.as_ref().is_some_and(|d| d.locked()) {
         Style::default()
@@ -3822,59 +4145,111 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     } else {
         Style::default().fg(Color::White)
     };
-    let mut spans2 = vec![
+    let status_spans = if dec_status.is_empty() {
+        Vec::new()
+    } else {
+        vec![Span::styled(dec_status, dec_style)]
+    };
+
+    let cpu_spans = match app.cpu.overall {
+        Some(pct) => vec![
+            lbl("cpu "),
+            Span::styled(format!("{pct:.0}%"), Style::default().fg(cpu_color(pct))),
+        ],
+        None => vec![lbl("cpu "), Span::styled("--", dim)],
+    };
+    let mut kind_spans = Vec::new();
+    for (i, &kind) in CPU_KINDS.iter().enumerate() {
+        let v = app.cpu.kind[i];
+        if v < CPU_KIND_FLOOR {
+            continue;
+        }
+        if !kind_spans.is_empty() {
+            kind_spans.push(Span::raw("  "));
+        }
+        kind_spans.push(lbl(cpu_kind_tag(kind)));
+        kind_spans.push(Span::raw(" "));
+        kind_spans.push(Span::styled(
+            format!("{v:.0}"),
+            Style::default().fg(Color::White),
+        ));
+    }
+
+    let snr_color = if app.cursor_snr >= 10.0 {
+        Color::Green
+    } else if app.cursor_snr >= 0.0 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+    let snr_spans = vec![
+        lbl("snr "),
         Span::styled(
-            app.mode.label(),
-            Style::default()
-                .fg(mode_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(dec_status, dec_style),
-        lbl("  UTC "),
-        Span::styled(utc, Style::default().fg(Color::LightBlue)),
-    ];
-    if let Some(slot) = slot {
-        spans2.push(lbl("  slot "));
-        spans2.push(Span::styled(slot, Style::default().fg(Color::Magenta)));
-    }
-    // Front-end correction, shown only while it is doing something. A DC
-    // offset or a poor image rejection is a property of the receiver, not of
-    // the band, and is otherwise invisible — which is how it went unnoticed.
-    let (dc, rej) = app.front.status();
-    if rej < 45.0 {
-        spans2.push(lbl("  img "));
-        spans2.push(Span::styled(
-            format!("{rej:.0} dB"),
-            Style::default().fg(if rej < 30.0 {
-                Color::Yellow
-            } else {
-                Color::Gray
-            }),
-        ));
-    }
-    if dc > 0.02 {
-        spans2.push(lbl("  dc "));
-        spans2.push(Span::styled(
-            format!("{:.0}%", dc * 100.0),
-            Style::default().fg(if dc > 0.15 { Color::Yellow } else { Color::Gray }),
-        ));
-    }
-    let (nb_level, blanks) = app.front.blanker_status();
-    if nb_level != "off" {
-        spans2.push(lbl("  nb "));
-        spans2.push(Span::styled(
-            format!("{blanks}/s"),
-            Style::default().fg(if blanks > 0 { Color::LightCyan } else { Color::Gray }),
-        ));
-    }
-    spans2.extend([
-        lbl("  snr "),
-        Span::styled(
-            format!("{:+.0} dB", app.cursor_snr),
+            format!("{:>+3.0} dB", app.cursor_snr),
             Style::default().fg(snr_color),
         ),
-        lbl("  sq "),
+    ];
+
+    let agc_spans = match app.agc {
+        AgcMode::Soft => {
+            let g = app.soft_agc.gain();
+            let railed = !(0.09..=59.0).contains(&g);
+            vec![
+                Span::styled(
+                    "AGC",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {:>+3.0} dB", 20.0 * g.log10()),
+                    Style::default().fg(if railed { Color::Yellow } else { Color::Gray }),
+                ),
+            ]
+        }
+        AgcMode::Hardware => vec![
+            Span::styled(
+                "AGC",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" hw {:>2} dBFS", app.agc_setpoint),
+                Style::default().fg(Color::Gray),
+            ),
+        ],
+        AgcMode::Off => match app.gain_control {
+            radio::GainControl::Sdrplay { .. } => vec![
+                lbl("GR "),
+                Span::styled(
+                    format!("RF{:>2.0}/IF{:>2.0}", app.rfgr, app.ifgr),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ],
+            radio::GainControl::Overall { .. } => vec![
+                lbl("gain "),
+                Span::styled(
+                    format!("{:>2.0} dB", app.gain),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ],
+        },
+    };
+
+    let fil_spans = vec![
+        lbl("fil "),
+        Span::styled(
+            if app.rx_filter == RxFilter::Auto {
+                format!("auto {:.0}", app.rx_bandwidth())
+            } else {
+                app.rx_filter.label().to_string()
+            },
+            Style::default().fg(Color::LightCyan),
+        ),
+    ];
+    let sq_spans = vec![
+        lbl("sq "),
         if app.squelch {
             Span::styled(
                 format!("{:.0}", app.squelch_db),
@@ -3883,160 +4258,21 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         } else {
             Span::styled("off", dim)
         },
-        Span::raw("  "),
-    ]);
-    match app.agc {
-        AgcMode::Soft => {
-            spans2.push(Span::styled(
-                "AGC",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans2.push(lbl(" hang "));
-            // The soft gain rails at 0.08 and 60. Sitting on a rail means the
-            // level reaching the decoders is wrong — too little to slice, or
-            // clipped — which is invisible if only the mode name is shown.
-            let g = app.soft_agc.gain();
-            let railed = !(0.09..=59.0).contains(&g);
-            spans2.push(Span::styled(
-                format!("{:+.0} dB", 20.0 * g.log10()),
-                Style::default().fg(if railed { Color::Yellow } else { Color::Gray }),
-            ));
-        }
-        AgcMode::Hardware => {
-            spans2.push(Span::styled(
-                "AGC",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans2.push(lbl(" hw "));
-            spans2.push(Span::styled(
-                format!("{} dBFS", app.agc_setpoint),
-                Style::default().fg(Color::Gray),
-            ));
-        }
-        AgcMode::Off => {
-            match app.gain_control {
-                radio::GainControl::Sdrplay { .. } => {
-                    spans2.push(lbl("GR "));
-                    spans2.push(Span::styled(
-                        format!("RF{:.0}/IF{:.0}", app.rfgr, app.ifgr),
-                        Style::default().fg(Color::Yellow),
-                    ));
-                }
-                radio::GainControl::Overall { .. } => {
-                    spans2.push(lbl("gain "));
-                    spans2.push(Span::styled(
-                        format!("{:.0} dB", app.gain),
-                        Style::default().fg(Color::Yellow),
-                    ));
-                }
-            }
-        }
-    }
-    spans2.push(lbl("  fil "));
-    spans2.push(Span::styled(
-        if app.rx_filter == RxFilter::Auto {
-            format!("auto {:.0}", app.rx_bandwidth())
-        } else {
-            app.rx_filter.label().to_string()
-        },
-        Style::default().fg(Color::LightCyan),
-    ));
-    spans2.push(lbl("  bias-T "));
-    spans2.push(if app.biast {
-        Span::styled(
-            "ON",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled("off", dim)
-    });
-    if app.rf_notch {
-        spans2.push(Span::styled(
-            if app.rf_notch_auto { "  MW/FM-A" } else { "  MW/FM" },
-            Style::default().fg(Color::LightGreen),
-        ));
-    }
-    if app.dab_notch {
-        spans2.push(Span::styled("  DAB", Style::default().fg(Color::LightGreen)));
-    }
-    if app.ppm.abs() >= 0.05 {
-        spans2.push(Span::styled(
-            format!("  {:+.1}ppm", app.ppm),
-            Style::default().fg(Color::LightCyan),
-        ));
-    }
-    if app.low_if {
-        spans2.push(Span::styled("  low-IF", Style::default().fg(Color::LightBlue)));
-    }
-    if app.dropped_blocks > 0 {
-        spans2.push(Span::styled(
-            format!("  drop {}", app.dropped_blocks),
-            Style::default().fg(Color::Red),
-        ));
-    }
-    if app.clipped_fraction > 0.0001 {
-        spans2.push(Span::styled(
-            format!("  clip {:.2}%", app.clipped_fraction * 100.0),
-            Style::default().fg(Color::Red),
-        ));
-    }
-    spans2.push(lbl("  wf "));
-    spans2.push(Span::styled(
-        format!("{}ms", WF_INTERVALS_MS[app.wf_idx]),
-        dim,
-    ));
-    if let Some(s) = &app.scan {
-        let tag = match s.kind {
-            ScanKind::Psk31 => "  PSK SCAN",
-            ScanKind::Cw => "  CW SCAN",
-            ScanKind::Energy => "  SCANNING",
-        };
-        spans2.push(Span::styled(
-            tag,
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    if app.mode == Mode::Psk31 && !app.psk_hits.is_empty() {
-        spans2.push(lbl("  psk "));
-        spans2.push(Span::styled(
-            app.psk_hits.len().to_string(),
-            Style::default().fg(Color::Cyan),
-        ));
-    }
-    if app.mode == Mode::Cw && !app.cw_hits.is_empty() {
-        spans2.push(lbl("  cw "));
-        spans2.push(Span::styled(
-            app.cw_hits.len().to_string(),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-    if !app.idents.is_empty() {
-        spans2.push(lbl("  id "));
-        spans2.push(Span::styled(
-            identify::summary(&app.idents),
-            Style::default().fg(Color::LightCyan),
-        ));
-    }
+    ];
+    let wf_spans = vec![
+        lbl("wf "),
+        Span::styled(format!("{}ms", WF_INTERVALS_MS[app.wf_idx]), dim),
+    ];
+
+    let mut spots_spans = Vec::new();
+    let mut report_detail = Vec::new();
     if let Some(r) = &app.reporter {
-        // A bare cumulative total cannot distinguish "nothing new to report"
-        // from "wedged", and the hourly re-report rule means a healthy
-        // reporter sits still for long stretches. Show the queue and the age
-        // of the last datagram alongside it.
         let s = r.stats();
-        spans2.push(lbl("  spots "));
-        spans2.push(Span::styled(
-            s.sent.to_string(),
+        spots_spans.push(lbl("spots "));
+        spots_spans.push(Span::styled(
+            format!("{:>3}", s.sent),
             Style::default().fg(Color::Green),
         ));
-        // The per-mode split goes in the activity pane's title, not here.
-        // This line is already full at 80 columns — it clips before the end —
-        // and the health detail below is what has to survive that.
         let mut detail = Vec::new();
         if s.queued > 0 {
             detail.push(format!("{} queued", s.queued));
@@ -4049,21 +4285,197 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             Some(age) => detail.push(format!("sent {}m ago", age / 60)),
             None => detail.push("none sent yet".into()),
         }
-        spans2.push(Span::styled(
-            format!(" ({})", detail.join(", ")),
+        report_detail.push(Span::styled(
+            format!("({})", detail.join(", ")),
             Style::default().fg(Color::DarkGray),
         ));
     }
-    let line2 = Line::from(spans2);
 
-    let title = if app.my_call.is_empty() {
-        " hfscan  —  press ? for help ".to_string()
+    let id_spans = if app.idents.is_empty() {
+        Vec::new()
     } else {
-        format!(" hfscan  ·  {}  —  press ? for help ", app.my_call)
+        vec![
+            lbl("id "),
+            Span::styled(
+                identify::summary(&app.idents),
+                Style::default().fg(Color::LightCyan),
+            ),
+        ]
     };
-    let p = Paragraph::new(vec![line1, line2]).block(
-        Block::default().borders(Borders::ALL).title(title),
+
+    let mut extra = Vec::new();
+    let extra_sep = |extra: &mut Vec<Span<'static>>| {
+        if !extra.is_empty() {
+            extra.push(Span::raw("  "));
+        }
+    };
+    if app.biast {
+        extra_sep(&mut extra);
+        extra.push(lbl("bias-T "));
+        extra.push(Span::styled(
+            "ON",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if app.rf_notch {
+        extra_sep(&mut extra);
+        extra.push(Span::styled(
+            if app.rf_notch_auto {
+                "MW/FM-A"
+            } else {
+                "MW/FM"
+            },
+            Style::default().fg(Color::LightGreen),
+        ));
+    }
+    if app.dab_notch {
+        extra_sep(&mut extra);
+        extra.push(Span::styled("DAB", Style::default().fg(Color::LightGreen)));
+    }
+    if app.ppm.abs() >= 0.05 {
+        extra_sep(&mut extra);
+        extra.push(Span::styled(
+            format!("{:+.1}ppm", app.ppm),
+            Style::default().fg(Color::LightCyan),
+        ));
+    }
+    if app.low_if {
+        extra_sep(&mut extra);
+        extra.push(Span::styled(
+            "low-IF",
+            Style::default().fg(Color::LightBlue),
+        ));
+    }
+    let (_, blanks) = app.front.blanker_status();
+    if blanks > 0 {
+        extra_sep(&mut extra);
+        extra.push(lbl("nb "));
+        extra.push(Span::styled(
+            format!("{blanks}/s"),
+            Style::default().fg(Color::LightCyan),
+        ));
+    }
+    if app.mode == Mode::Psk31 && !app.psk_hits.is_empty() {
+        extra_sep(&mut extra);
+        extra.push(lbl("psk "));
+        extra.push(Span::styled(
+            app.psk_hits.len().to_string(),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    if app.mode == Mode::Cw && !app.cw_hits.is_empty() {
+        extra_sep(&mut extra);
+        extra.push(lbl("cw "));
+        extra.push(Span::styled(
+            app.cw_hits.len().to_string(),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    let mut alerts = Vec::new();
+    if app.dropped_blocks > 0 {
+        alerts.push(Span::styled(
+            format!("drop {}", app.dropped_blocks),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    if app.clipped_fraction > 0.0001 {
+        if !alerts.is_empty() {
+            alerts.push(Span::raw("  "));
+        }
+        alerts.push(Span::styled(
+            format!("clip {:.2}%", app.clipped_fraction * 100.0),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    let (dc, rej) = app.front.status();
+    if rej < 45.0 {
+        if !alerts.is_empty() {
+            alerts.push(Span::raw("  "));
+        }
+        alerts.push(lbl("img "));
+        alerts.push(Span::styled(
+            format!("{rej:.0} dB"),
+            Style::default().fg(if rej < 30.0 {
+                Color::Yellow
+            } else {
+                Color::Gray
+            }),
+        ));
+    }
+    if dc > 0.02 {
+        if !alerts.is_empty() {
+            alerts.push(Span::raw("  "));
+        }
+        alerts.push(lbl("dc "));
+        alerts.push(Span::styled(
+            format!("{:.0}%", dc * 100.0),
+            Style::default().fg(if dc > 0.15 {
+                Color::Yellow
+            } else {
+                Color::Gray
+            }),
+        ));
+    }
+    if let Some(s) = &app.scan {
+        if !alerts.is_empty() {
+            alerts.push(Span::raw("  "));
+        }
+        let tag = match s.kind {
+            ScanKind::Psk31 => "PSK SCAN",
+            ScanKind::Cw => "CW SCAN",
+            ScanKind::Energy => "SCANNING",
+        };
+        alerts.push(Span::styled(
+            tag,
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let line2_left = pack_padded(
+        &[
+            (mode_spans, 90),
+            (status_spans, 70),
+            (cpu_spans, 100),
+            (kind_spans, 50),
+            (snr_spans, 100),
+            (spots_spans, 55),
+            (id_spans, 35),
+        ],
+        width,
     );
+    let line2 =
+        Line::from(with_right_align(line2_left.clone(), &utc_spans, width).unwrap_or(line2_left));
+
+    // Front-end chrome drops extras and reporter detail first. Alerts stay.
+    let line3 = Line::from(pack_padded(
+        &[
+            (agc_spans, 90),
+            (fil_spans, 80),
+            (sq_spans, 70),
+            (wf_spans, 50),
+            (report_detail, 10),
+            (extra, 25),
+            (alerts, 100),
+        ],
+        width,
+    ));
+
+    [line1, line2, line3]
+}
+
+fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let lines = status_lines(app, inner.width as usize);
+    let title = if app.my_call.is_empty() {
+        " hfscan ".to_string()
+    } else {
+        format!(" hfscan · {} ", app.my_call)
+    };
+    let p =
+        Paragraph::new(Vec::from(lines)).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 }
 
@@ -4252,7 +4664,9 @@ fn note_line(app: &App, budget: usize) -> Line<'static> {
             room = room.saturating_sub(text.chars().count());
             spans.push(Span::styled(
                 text,
-                Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::ITALIC),
             ));
         } else {
             let need = len + SEP.chars().count();
@@ -4263,7 +4677,9 @@ fn note_line(app: &App, budget: usize) -> Line<'static> {
             spans.push(Span::styled(SEP, Style::default().fg(Color::DarkGray)));
             spans.push(Span::styled(
                 text,
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
             ));
         }
     }
@@ -4284,10 +4700,19 @@ fn view_bins(app: &App, n: usize) -> (usize, usize) {
 /// Reduce a bin range to one value per terminal column, keeping the peak so
 /// narrow carriers stay visible.
 fn resample(spectrum: &[f32], width: usize) -> Vec<f32> {
-    if spectrum.is_empty() || width == 0 {
-        return vec![-140.0; width];
-    }
     let mut out = Vec::with_capacity(width);
+    resample_into(spectrum, width, &mut out);
+    out
+}
+
+/// Zero-allocation variant of `resample` that reuses `out`.
+fn resample_into(spectrum: &[f32], width: usize, out: &mut Vec<f32>) {
+    out.clear();
+    if spectrum.is_empty() || width == 0 {
+        out.resize(width, -140.0);
+        return;
+    }
+    out.reserve(width);
     for x in 0..width {
         let a = x * spectrum.len() / width;
         let b = (((x + 1) * spectrum.len()) / width)
@@ -4301,7 +4726,6 @@ fn resample(spectrum: &[f32], width: usize) -> Vec<f32> {
         }
         out.push(m);
     }
-    out
 }
 
 fn cursor_col(app: &App, width: usize) -> usize {
@@ -4395,11 +4819,7 @@ fn draw_spectrum(f: &mut Frame, area: Rect, app: &App) {
         ),
         Mode::Psk31 => {
             let half = app.rx_bandwidth() as f64 / 2.0;
-            (
-                app.cursor - half,
-                app.cursor + half,
-                Color::Rgb(16, 36, 52),
-            )
+            (app.cursor - half, app.cursor + half, Color::Rgb(16, 36, 52))
         }
         Mode::Cw | Mode::Rtty => {
             let half = app.rx_bandwidth() as f64 / 2.0;
@@ -4469,15 +4889,15 @@ fn draw_spectrum(f: &mut Frame, area: Rect, app: &App) {
                 .iter()
                 .find(|(lo, hi, _, _, _)| x >= *lo && x <= *hi);
             let style = if x == cur {
-                Style::default().fg(Color::Magenta).bg(Color::Rgb(40, 0, 40))
+                Style::default()
+                    .fg(Color::Magenta)
+                    .bg(Color::Rgb(40, 0, 40))
             } else if lock_col == Some(x) {
                 Style::default()
                     .fg(Color::LightCyan)
                     .bg(Color::Rgb(0, 40, 50))
             } else if hit_cols.contains(&x) {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .bg(Color::Rgb(0, 24, 32))
+                Style::default().fg(Color::Cyan).bg(Color::Rgb(0, 24, 32))
             } else if let Some((_, _, _, k, a)) = on_peak {
                 Style::default()
                     .fg(ident_fade_fg(*k, *a))
@@ -4508,11 +4928,7 @@ fn paint_ident_labels(lines: &mut [Line], app: &App, w: usize) {
         return;
     }
     let now = Instant::now();
-    let mut order: Vec<&LabelTrack> = app
-        .tracks
-        .iter()
-        .filter(|t| t.alpha(now) >= 0.12)
-        .collect();
+    let mut order: Vec<&LabelTrack> = app.tracks.iter().filter(|t| t.alpha(now) >= 0.12).collect();
     order.sort_by(|a, b| {
         a.score
             .partial_cmp(&b.score)
@@ -4576,7 +4992,11 @@ fn paint_ident_labels(lines: &mut [Line], app: &App, w: usize) {
         };
         let cap = Style::default().fg(fg).bg(bg);
         for (i, ch) in chip.iter().enumerate() {
-            let style = if *ch == '▌' || *ch == '▐' { cap } else { body };
+            let style = if *ch == '▌' || *ch == '▐' {
+                cap
+            } else {
+                body
+            };
             cells[start + i] = Span::styled(ch.to_string(), style);
             used[start + i] = true;
         }
@@ -4639,8 +5059,7 @@ fn axis_row(app: &App, w: usize) -> Line<'static> {
 }
 
 const QUADRANTS_STR: [&str; 16] = [
-    " ", "▘", "▝", "▀", "▖", "▌", "▞", "▛",
-    "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█",
+    " ", "▘", "▝", "▀", "▖", "▌", "▞", "▛", "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█",
 ];
 
 fn draw_waterfall(f: &mut Frame, area: Rect, app: &App) {
@@ -4669,37 +5088,40 @@ fn draw_waterfall(f: &mut Frame, area: Rect, app: &App) {
 
     let row_spec = |idx: usize| -> Option<&Vec<f32>> {
         let spec = app.waterfall.get(idx + scroll)?;
-        if spec.is_empty() {
-            None
-        } else {
-            Some(spec)
-        }
+        if spec.is_empty() { None } else { Some(spec) }
     };
 
     // `fcells` frequency subcells across each column, `tcells` time steps
     // stacked into each text row.
     let (fcells, tcells) = app.wf_res.cells();
-    let row_cols = |idx: usize| -> Option<Vec<f32>> {
-        let spec = row_spec(idx)?;
+    let mut upper_buf = Vec::with_capacity(w * fcells);
+    let mut lower_buf = Vec::with_capacity(w * fcells);
+    let row_cols = |idx: usize, buf: &mut Vec<f32>| -> bool {
+        let Some(spec) = row_spec(idx) else {
+            return false;
+        };
         let (a, b) = view_bins(app, spec.len());
-        Some(resample(&spec[a..b], w * fcells))
+        resample_into(&spec[a..b], w * fcells, buf);
+        true
     };
 
     let mut lines = Vec::with_capacity(inner.height as usize);
     for row in 0..inner.height as usize {
         // The newest of the time steps this row covers. If even that is
         // missing the history simply does not reach this far back.
-        let Some(upper) = row_cols(row * tcells) else {
+        if !row_cols(row * tcells, &mut upper_buf) {
             lines.push(Line::from(""));
             continue;
-        };
+        }
         // A half-filled history repeats the row it does have rather than
         // punching a hole in the middle of the display.
-        let lower = if tcells > 1 {
-            row_cols(row * tcells + 1).unwrap_or_else(|| upper.clone())
+        let have_lower = if tcells > 1 {
+            row_cols(row * tcells + 1, &mut lower_buf)
         } else {
-            upper.clone()
+            false
         };
+        let lower = if have_lower { &lower_buf } else { &upper_buf };
+        let upper = &upper_buf;
         let at = |c: &[f32], i: usize| norm(c.get(i).copied().unwrap_or(f32::MIN));
 
         let mut spans = Vec::with_capacity(w);
@@ -4753,9 +5175,7 @@ fn transcript_lines(app: &App, width: usize, rows: usize, ft: bool) -> Vec<Line<
         }
     }
     let max = wrapped.len().saturating_sub(rows);
-    let start = wrapped
-        .len()
-        .saturating_sub(rows + app.msg_scroll.min(max));
+    let start = wrapped.len().saturating_sub(rows + app.msg_scroll.min(max));
     let end = (start + rows).min(wrapped.len());
     wrapped[start..end]
         .iter()
@@ -5169,7 +5589,12 @@ fn draw_cw_text(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let body = transcript_lines(app, inner.width.max(1) as usize, inner.height as usize, false);
+    let body = transcript_lines(
+        app,
+        inner.width.max(1) as usize,
+        inner.height as usize,
+        false,
+    );
     f.render_widget(Paragraph::new(body), inner);
 }
 
@@ -5201,7 +5626,9 @@ fn draw_cw_tuner(f: &mut Frame, area: Rect, app: &App, view: Option<&CwView>) {
                 Span::styled("rf     ", dim),
                 Span::styled(
                     format!("{:.3} kHz", center / 1000.0),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]));
             lines.push(Line::from(vec![
@@ -5366,7 +5793,11 @@ fn draw_psk_scope(f: &mut Frame, area: Rect, view: Option<&PskView>) {
         let x = ((s.re + 1.25) / 2.5 * w as f32).round() as isize;
         let y = ((1.25 - s.im) / 2.5 * eye_h as f32).round() as isize;
         if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < eye_h {
-            let ch = if i + 4 >= v.symbols.len() { '●' } else { '·' };
+            let ch = if i + 4 >= v.symbols.len() {
+                '●'
+            } else {
+                '·'
+            };
             grid[y as usize][x as usize] = ch;
         }
     }
@@ -5456,10 +5887,7 @@ fn draw_psk_tuner(f: &mut Frame, area: Rect, app: &App, view: Option<&PskView>) 
                     format!("{:.0}%", v.quality * 100.0),
                     Style::default().fg(Color::White),
                 ),
-                Span::styled(
-                    format!("   rev {:.0}%", v.reversals * 100.0),
-                    dim,
-                ),
+                Span::styled(format!("   rev {:.0}%", v.reversals * 100.0), dim),
             ]));
             lines.push(Line::from(Span::styled(
                 "u/i fine   g centre   n next",
@@ -5533,7 +5961,11 @@ fn draw_ft_activity(f: &mut Frame, area: Rect, app: &App) {
         (dial + f_hi as f64) / 1000.0
     );
     if app.act_scroll > 0 {
-        title = format!(" activity {} ({} slots back) ", app.mode.label(), app.act_scroll);
+        title = format!(
+            " activity {} ({} slots back) ",
+            app.mode.label(),
+            app.act_scroll
+        );
     }
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
@@ -5568,7 +6000,11 @@ fn draw_ft_activity(f: &mut Frame, area: Rect, app: &App) {
     for (r, stamp) in stamps.iter().enumerate() {
         let mut spans = Vec::with_capacity(LABEL + w);
         // '>' marks the live slot; hidden while scrolled back.
-        let marker = if r == 0 && app.act_scroll == 0 { '>' } else { ' ' };
+        let marker = if r == 0 && app.act_scroll == 0 {
+            '>'
+        } else {
+            ' '
+        };
         spans.push(Span::styled(
             format!("{marker}{stamp} "),
             Style::default().fg(Color::DarkGray),
@@ -5670,7 +6106,10 @@ fn draw_ft_messages(f: &mut Frame, area: Rect, app: &App) {
             style = style.add_modifier(Modifier::BOLD);
         }
         lines.push(Line::from(Span::styled(
-            format!("{time} {:>4.0} {:+4.1} {rf:>9.3} {text}", m.snr_db, m.dt_sec),
+            format!(
+                "{time} {:>4.0} {:+4.1} {rf:>9.3} {text}",
+                m.snr_db, m.dt_sec
+            ),
             style,
         )));
     }
@@ -5679,7 +6118,11 @@ fn draw_ft_messages(f: &mut Frame, area: Rect, app: &App) {
     if app.msg_scroll == 0 {
         for line in app.text.lines().filter(|l| {
             !l.is_empty()
-                && !l.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                && !l
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
         }) {
             lines.push(Line::from(Span::styled(
                 line.to_string(),
@@ -5724,7 +6167,12 @@ fn utc_stamp() -> String {
 
 /// hhmmss (as stamped on a slot) to seconds of day.
 fn stamp_secs(stamp: &str) -> i64 {
-    let field = |r: std::ops::Range<usize>| stamp.get(r).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    let field = |r: std::ops::Range<usize>| {
+        stamp
+            .get(r)
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0)
+    };
     field(0..2) * 3600 + field(2..4) * 60 + field(4..6)
 }
 
@@ -5732,7 +6180,11 @@ fn draw_ft_stations(f: &mut Frame, area: Rect, app: &App) {
     let now = utc_secs() as i64 % 86400;
     let mut title = format!(" stations ({}) ", app.stations.len());
     if app.st_scroll > 0 {
-        title = format!(" stations ({}, skipped {}) ", app.stations.len(), app.st_scroll);
+        title = format!(
+            " stations ({}, skipped {}) ",
+            app.stations.len(),
+            app.st_scroll
+        );
     }
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
@@ -5787,7 +6239,9 @@ fn help_row(key: &str, desc: &str, now: Option<String>) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
             format!("  {key:<11}"),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(desc.to_string()),
     ];
@@ -5796,7 +6250,9 @@ fn help_row(key: &str, desc: &str, now: Option<String>) -> Line<'static> {
         spans.push(Span::raw(" ".repeat(pad.max(1))));
         spans.push(Span::styled(
             v,
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     Line::from(spans)
@@ -5852,11 +6308,13 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         help_row(
             "V",
             "auto decode view",
-            Some(match app.auto_view {
-                AutoView::Rows => "held rows",
-                AutoView::Log => "chronological log",
-            }
-            .into()),
+            Some(
+                match app.auto_view {
+                    AutoView::Rows => "held rows",
+                    AutoView::Log => "chronological log",
+                }
+                .into(),
+            ),
         ),
         help_note("rows hold one signal each, copy building in place"),
         help_row("wheel", "scroll the pane under the mouse", None),
@@ -5873,9 +6331,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
             "band preset",
             Some(format!(
                 "{} · {:.0} kHz",
-                bands::BANDS
-                    .get(app.band_idx)
-                    .map_or("—", |b| b.name),
+                bands::BANDS.get(app.band_idx).map_or("—", |b| b.name),
                 app.rate / 1000.0
             )),
         ),
@@ -5883,7 +6339,11 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         help_note("AUTO decodes every digital signal in the span at once"),
         help_row("r", "force RTTY shift polarity (else auto-detected)", None),
         help_row("s", "scan the current band; results are labelled", None),
-        help_row("v", "decode pane size", Some(format!("{}", app.decode_zoom))),
+        help_row(
+            "v",
+            "decode pane size",
+            Some(format!("{}", app.decode_zoom)),
+        ),
         help_row(
             "w / W",
             "waterfall speed / subcell",
@@ -5910,7 +6370,11 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         help_row("m", "MW/FM RF notch", Some(notch)),
         help_row("D", "DAB notch", Some(on_off(app.dab_notch))),
         help_row("I", "driver IQ correction", Some(on_off(app.iq_correction))),
-        help_row("y / Y", "frequency correction", Some(format!("{:+.1} ppm", app.ppm))),
+        help_row(
+            "y / Y",
+            "frequency correction",
+            Some(format!("{:+.1} ppm", app.ppm)),
+        ),
         help_row(
             "h",
             "acquisition path",
@@ -5929,12 +6393,20 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         help_row(
             "l",
             "RX bandpass",
-            Some(format!("{} ({:.0} Hz)", app.rx_filter.label(), app.rx_bandwidth())),
+            Some(format!(
+                "{} ({:.0} Hz)",
+                app.rx_filter.label(),
+                app.rx_bandwidth()
+            )),
         ),
         help_row(
             "k",
             "squelch   (, / . threshold)",
-            Some(format!("{} · {:.0} dB", on_off(app.squelch), app.squelch_db)),
+            Some(format!(
+                "{} · {:.0} dB",
+                on_off(app.squelch),
+                app.squelch_db
+            )),
         ),
         help_row(
             "< / >",
@@ -5942,7 +6414,11 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
             Some(format!("{:.0}%", app.copy_floor * 100.0)),
         ),
         help_note("hides decodes the decoder itself is not confident in"),
-        help_row("t", "bias-T (external preamp power)", Some(on_off(app.biast))),
+        help_row(
+            "t",
+            "bias-T (external preamp power)",
+            Some(on_off(app.biast)),
+        ),
         help_row("o", "station settings", Some(station)),
         help_row("x", "clear the decode pane", None),
         help_row("? / q", "toggle help / quit", None),
@@ -5984,7 +6460,6 @@ fn heat(v: f32) -> Color {
     Color::Rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::report::is_callsign;
@@ -6000,7 +6475,7 @@ mod tests {
         }
     }
 
-    use super::{identify, MAX_AUTO_SLOTS};
+    use super::{MAX_AUTO_SLOTS, identify};
     use num_complex::Complex32;
     use std::time::{Duration, Instant};
 
@@ -6039,6 +6514,42 @@ mod tests {
         assert!(app.auto.iter().all(|s| s.pinned));
     }
 
+    /// 17 m FT8 is 18.100 in WSJT-X. A pin at 18.104 puts the decoder's
+    /// 200–3000 Hz window entirely above the pile-up, so Auto on the band
+    /// default hears nothing after whatever leaked into the first slot.
+    #[test]
+    fn auto_pins_17m_ft8_on_the_wsjt_dial() {
+        let b = super::bands::BANDS
+            .iter()
+            .find(|b| b.name == "17m")
+            .unwrap();
+        assert_eq!(b.default, 18_090_000.0);
+        let mut app = App::new(b.default, b.span, Mode::Auto);
+        app.reconcile_auto();
+        let ft8: Vec<f64> = app
+            .auto
+            .iter()
+            .filter(|s| s.kind == identify::Kind::Ft8)
+            .map(|s| s.dial_hz)
+            .collect();
+        assert!(
+            ft8.iter().any(|d| (*d - 18_100_000.0).abs() < 1.0),
+            "17m FT8 pin is {ft8:?}, want 18100 kHz"
+        );
+        assert!(
+            ft8.iter().all(|d| (*d - 18_104_000.0).abs() > 1.0),
+            "18.104 is the FT4 dial, not FT8: {ft8:?}"
+        );
+        // A station in the middle of the WSJT-X waterfall must sit inside
+        // the pinned decoder's search, not 2.5 kHz below it.
+        let audio = 18_101_500.0 - 18_100_000.0;
+        assert!(
+            (super::decoders::ft8::FREQ_MIN as f64..super::decoders::ft8::FREQ_MAX as f64)
+                .contains(&audio),
+            "18101.5 kHz is {audio} Hz above the pin"
+        );
+    }
+
     /// A marker that sits too close to the edge of the span cannot have its
     /// whole passband received, so decoding it would just waste a slot.
     #[test]
@@ -6048,7 +6559,9 @@ mod tests {
         let mut app = App::new(app_lo, 192_000.0, Mode::Auto);
         app.reconcile_auto();
         assert!(
-            app.auto.iter().all(|s| (s.dial_hz - 14_074_000.0).abs() > 1.0),
+            app.auto
+                .iter()
+                .all(|s| (s.dial_hz - 14_074_000.0).abs() > 1.0),
             "took an FT8 slot whose passband runs off the span"
         );
     }
@@ -6073,7 +6586,10 @@ mod tests {
         app.idents = vec![ident(identify::Kind::Cw, 3040.0, 19.0)];
         app.reconcile_auto();
         assert_eq!(
-            app.auto.iter().filter(|s| s.kind == identify::Kind::Cw).count(),
+            app.auto
+                .iter()
+                .filter(|s| s.kind == identify::Kind::Cw)
+                .count(),
             1,
             "a wobbling estimate must not spawn duplicate decoders"
         );
@@ -6100,7 +6616,10 @@ mod tests {
     fn auto_caps_slots_and_prefers_strong_signals() {
         // Inside 40m's decoded stretch, since signals above it are now left
         // to the phone operators who put them there.
-        let b = super::bands::BANDS.iter().find(|b| b.name == "40m").unwrap();
+        let b = super::bands::BANDS
+            .iter()
+            .find(|b| b.name == "40m")
+            .unwrap();
         let mut app = App::new(b.default, b.span, Mode::Auto);
         app.idents = (0..40)
             .map(|i| ident(identify::Kind::Cw, -45_000.0 + i as f32 * 2250.0, i as f32))
@@ -6123,7 +6642,9 @@ mod tests {
         // The strongest ident was the last one (snr 39), so it must have a slot.
         let strongest = b.default + (-45_000.0 + 39.0 * 2250.0);
         assert!(
-            app.auto.iter().any(|s| (s.dial_hz - strongest).abs() < 200.0),
+            app.auto
+                .iter()
+                .any(|s| (s.dial_hz - strongest).abs() < 200.0),
             "cap dropped the strongest signal"
         );
     }
@@ -6159,9 +6680,20 @@ mod tests {
     fn cw_iq(text: &str, wpm: f32, tone_hz: f64, fs: f64, secs: f64) -> Vec<Complex32> {
         fn code(c: char) -> &'static str {
             match c {
-                'A' => ".-", 'B' => "-...", 'C' => "-.-.", 'D' => "-..", 'E' => ".",
-                'G' => "--.", 'K' => "-.-", 'N' => "-.", 'O' => "---", 'Q' => "--.-",
-                'R' => ".-.", 'S' => "...", 'T' => "-", 'W' => ".--",
+                'A' => ".-",
+                'B' => "-...",
+                'C' => "-.-.",
+                'D' => "-..",
+                'E' => ".",
+                'G' => "--.",
+                'K' => "-.-",
+                'N' => "-.",
+                'O' => "---",
+                'Q' => "--.-",
+                'R' => ".-.",
+                'S' => "...",
+                'T' => "-",
+                'W' => ".--",
                 _ => "",
             }
         }
@@ -6229,7 +6761,10 @@ mod tests {
         // This span also covers the 40m FT4 and FT8 calling frequencies, so
         // those get pinned decoders too — they simply have nothing to hear.
         assert_eq!(
-            app.auto.iter().filter(|s| s.kind == identify::Kind::Cw).count(),
+            app.auto
+                .iter()
+                .filter(|s| s.kind == identify::Kind::Cw)
+                .count(),
             1,
             "expected exactly one CW decoder, got {:?}",
             app.auto.iter().map(|s| s.dial_hz).collect::<Vec<_>>()
@@ -6312,18 +6847,25 @@ mod tests {
     #[test]
     fn quadrant_split_follows_the_largest_step() {
         let (_, fg, bg) = super::quad_cell([0.90, 0.95, 0.10, 0.12]);
-        assert!((fg - 0.925).abs() < 0.01, "foreground averaged the hot pair");
-        assert!((bg - 0.11).abs() < 0.01, "background averaged the cold pair");
+        assert!(
+            (fg - 0.925).abs() < 0.01,
+            "foreground averaged the hot pair"
+        );
+        assert!(
+            (bg - 0.11).abs() < 0.01,
+            "background averaged the cold pair"
+        );
     }
 
     #[test]
     fn callsign_heuristic() {
-        for call in ["K1ABC", "W1AW", "JA1ABC", "G0ABC", "3D2AG", "K1ABC/P", "VE3XYZ"] {
+        for call in [
+            "K1ABC", "W1AW", "JA1ABC", "G0ABC", "3D2AG", "K1ABC/P", "VE3XYZ",
+        ] {
             assert!(is_callsign(call), "{call} should be a callsign");
         }
         for not in [
-            "CQ", "DE", "73", "RRR", "RR73", "FN42", "PM95", "IO91", "-12", "+03", "R-05",
-            "R+10",
+            "CQ", "DE", "73", "RRR", "RR73", "FN42", "PM95", "IO91", "-12", "+03", "R-05", "R+10",
         ] {
             assert!(!is_callsign(not), "{not} should not be a callsign");
         }
@@ -6377,7 +6919,10 @@ mod tests {
         assert!(
             !app.notes.iter().any(|n| n.text.contains("14074")),
             "a detection must not crowd the message row: {:?}",
-            app.notes.iter().map(|n| n.text.as_str()).collect::<Vec<_>>()
+            app.notes
+                .iter()
+                .map(|n| n.text.as_str())
+                .collect::<Vec<_>>()
         );
         let notes = app.notes.len();
         super::merge_heard(&mut app);
@@ -6393,8 +6938,8 @@ mod tests {
     /// traffic that makes a status message worth reading.
     #[test]
     fn a_message_survives_a_full_activity_row() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
         // Enough signals to fill the widest row this test draws.
@@ -6486,21 +7031,30 @@ mod tests {
                 assert!(
                     m.freq > lo && m.freq + 3_000.0 < hi,
                     "{}: view {:.3}-{:.3} MHz leaves the {} marker at {:.3} outside",
-                    b.name, lo / 1e6, hi / 1e6, m.label, m.freq / 1e6
+                    b.name,
+                    lo / 1e6,
+                    hi / 1e6,
+                    m.label,
+                    m.freq / 1e6
                 );
             }
             if b.end - b.start <= b.span {
                 assert!(
                     lo <= b.start && hi >= b.end,
                     "{}: view {:.3}-{:.3} MHz misses part of {:.3}-{:.3}",
-                    b.name, lo / 1e6, hi / 1e6, b.start / 1e6, b.end / 1e6
+                    b.name,
+                    lo / 1e6,
+                    hi / 1e6,
+                    b.start / 1e6,
+                    b.end / 1e6
                 );
             }
             // A band jump must never be the reason FT decoding stops.
             assert!(
                 super::rate_ok_for_ft(b.span),
                 "{} span {:.0} Hz would kick FT8/FT4 back to 192 kS/s",
-                b.name, b.span
+                b.name,
+                b.span
             );
         }
     }
@@ -6510,8 +7064,8 @@ mod tests {
     /// display. It reports the current value now.
     #[test]
     fn the_help_shows_the_current_setting() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = App::new(14_060_000.0, 192_000.0, Mode::Auto);
         app.show_help = true;
@@ -6552,7 +7106,10 @@ mod tests {
             "40%",              // copy floor
             "KQ2Y FN30",        // o
         ] {
-            assert!(shown.contains(want), "help does not report {want:?}:\n{shown}");
+            assert!(
+                shown.contains(want),
+                "help does not report {want:?}:\n{shown}"
+            );
         }
 
         // ...and it has to follow the setting, not print a constant.
@@ -6560,7 +7117,10 @@ mod tests {
         app.squelch = false;
         app.biast = true;
         let changed = render(&app);
-        assert!(changed.contains("heavy"), "smoothing did not update:\n{changed}");
+        assert!(
+            changed.contains("heavy"),
+            "smoothing did not update:\n{changed}"
+        );
         assert!(
             changed.contains("off · 12 dB"),
             "squelch did not update:\n{changed}"
@@ -6663,7 +7223,12 @@ mod tests {
             .collect();
         app.reconcile_auto();
 
-        let dials: Vec<f64> = app.auto.iter().filter(|s| !s.pinned).map(|s| s.dial_hz).collect();
+        let dials: Vec<f64> = app
+            .auto
+            .iter()
+            .filter(|s| !s.pinned)
+            .map(|s| s.dial_hz)
+            .collect();
         assert!(
             dials.iter().any(|d| (d - inside).abs() < 500.0),
             "the signal in the digital segment should have a decoder: {dials:?}"
@@ -6724,7 +7289,11 @@ mod tests {
     #[test]
     fn scout_interval_holds_its_share_as_the_span_widens() {
         let at = |rate: f64| App::new(14_060_000.0, rate, Mode::Auto).scout_interval();
-        assert_eq!(at(192_000.0), at(2_000_000.0), "narrow spans keep the base interval");
+        assert_eq!(
+            at(192_000.0),
+            at(2_000_000.0),
+            "narrow spans keep the base interval"
+        );
         let wide = at(4_320_000.0);
         assert!(
             wide > at(2_000_000.0),
@@ -6788,8 +7357,14 @@ mod tests {
         let (heavy_det, heavy_disp) = run(2);
 
         assert!(!med_det.is_empty(), "no spectrum was produced");
-        assert_eq!(light_det, med_det, "'light' changed the detectors' spectrum");
-        assert_eq!(heavy_det, med_det, "'heavy' changed the detectors' spectrum");
+        assert_eq!(
+            light_det, med_det,
+            "'light' changed the detectors' spectrum"
+        );
+        assert_eq!(
+            heavy_det, med_det,
+            "'heavy' changed the detectors' spectrum"
+        );
 
         // ...and the setting must still do something, or this proves nothing.
         assert_ne!(light_disp, med_disp, "'light' did not change the display");
@@ -6801,8 +7376,8 @@ mod tests {
     /// total but no room for this — it already clips at 80 columns.
     #[test]
     fn the_activity_title_shows_spots_per_mode() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
         app.reporter = Some(super::report::Reporter::with_tallies(&[
@@ -6815,7 +7390,13 @@ mod tests {
             t.draw(|f| super::draw(f, &app)).unwrap();
             let buf = t.backend().buffer();
             let title: String = (0..buf.area.width)
-                .map(|x| buf[(x, buf.area.height - 4)].symbol().chars().next().unwrap_or(' '))
+                .map(|x| {
+                    buf[(x, buf.area.height - 4)]
+                        .symbol()
+                        .chars()
+                        .next()
+                        .unwrap_or(' ')
+                })
                 .collect();
             // Ordered by count, so the mode carrying the traffic reads first.
             assert!(
@@ -6831,8 +7412,8 @@ mod tests {
     /// time, with everything found since hidden behind the `+N`.
     #[test]
     fn the_chip_row_leads_with_the_newest() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
         let ident = |off: f32| super::identify::Ident {
@@ -6856,7 +7437,13 @@ mod tests {
         t.draw(|f| super::draw(f, &app)).unwrap();
         let buf = t.backend().buffer();
         let chips: String = (0..buf.area.width)
-            .map(|x| buf[(x, buf.area.height - 3)].symbol().chars().next().unwrap_or(' '))
+            .map(|x| {
+                buf[(x, buf.area.height - 3)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' ')
+            })
             .collect();
         let (newest, oldest) = (
             chips.find("14079.000").expect("newest chip missing"),
@@ -6873,8 +7460,8 @@ mod tests {
     /// else, so sharing a list with them buried every message worth reading.
     #[test]
     fn detections_stay_on_the_chip_row() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
         app.idents = (0..5)
@@ -6900,7 +7487,10 @@ mod tests {
         };
         let (chips, messages) = (row(buf.area.height - 3), row(buf.area.height - 2));
 
-        assert!(chips.contains("14072.000"), "no detections on the chip row: {chips:?}");
+        assert!(
+            chips.contains("14072.000"),
+            "no detections on the chip row: {chips:?}"
+        );
         assert!(
             messages.contains("AGC: soft hang"),
             "message row lost its message: {messages:?}"
@@ -6915,8 +7505,8 @@ mod tests {
     /// row packs as many as fit rather than keeping only the newest.
     #[test]
     fn the_message_row_packs_what_fits() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
         for msg in ["oldest one", "middle one", "newest one"] {
@@ -6938,7 +7528,10 @@ mod tests {
 
         let wide = render(&app, 120);
         for msg in ["newest one", "middle one", "oldest one"] {
-            assert!(wide.contains(msg), "{msg:?} missing from a wide row:\n{wide}");
+            assert!(
+                wide.contains(msg),
+                "{msg:?} missing from a wide row:\n{wide}"
+            );
         }
         // Newest first, so the one that matters sits at a fixed spot.
         let (newest, oldest) = (
@@ -6964,8 +7557,8 @@ mod tests {
     /// as the current state of the receiver.
     #[test]
     fn scrolled_back_messages_are_marked() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
         app.log("older message".into());
@@ -7016,8 +7609,8 @@ mod tests {
     /// or not. Layout math lives on the render path, so exercise it directly.
     #[test]
     fn ft_panes_render_without_panicking() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         for mode in [Mode::Ft8, Mode::Ft4] {
             let mut app = App::new(14_074_000.0, 192_000.0, mode);
@@ -7065,8 +7658,8 @@ mod tests {
 
     #[test]
     fn psk_panes_render_without_panicking() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = App::new(14_070_000.0, 192_000.0, Mode::Psk31);
         app.text = "CQ CQ DE TEST\n".into();
@@ -7092,8 +7685,8 @@ mod tests {
 
     #[test]
     fn cw_panes_render_without_panicking() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = App::new(14_026_000.0, 192_000.0, Mode::Cw);
         app.text = "CQ CQ DE W1AW K\n".into();
@@ -7124,8 +7717,8 @@ mod tests {
     /// than one cell wide.
     #[test]
     fn hostile_decoder_output_cannot_corrupt_the_grid() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
         let junk = "\u{1b}[2J\u{1b}[31mRED\u{7}\r\n\u{0}\u{200b}\u{feff}日本語\ttab";
@@ -7193,12 +7786,40 @@ mod tests {
         let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
         app.auto_view = super::AutoView::Log;
         for (f, k, m, sig, speed, text) in [
-            (14_070_150.0, identify::Kind::Psk31, "PSK31", "78%", "31bd", "CQ DE W1AW K"),
-            (14_074_000.0, identify::Kind::Ft8, "FT8", "-12dB", "", "+0.2s  CQ K1ABC FN42"),
-            (14_035_000.0, identify::Kind::Cw, "CW", "91%", "22wpm", "TEST DE W2XYZ"),
+            (
+                14_070_150.0,
+                identify::Kind::Psk31,
+                "PSK31",
+                "78%",
+                "31bd",
+                "CQ DE W1AW K",
+            ),
+            (
+                14_074_000.0,
+                identify::Kind::Ft8,
+                "FT8",
+                "-12dB",
+                "",
+                "+0.2s  CQ K1ABC FN42",
+            ),
+            (
+                14_035_000.0,
+                identify::Kind::Cw,
+                "CW",
+                "91%",
+                "22wpm",
+                "TEST DE W2XYZ",
+            ),
             // A speed estimate off the rails, which is what a decoder hands
             // back when it is timing noise.
-            (14_083_000.0, identify::Kind::Rtty, "RTTY", "100000%", "inf wpm", "RYRY DE VK3"),
+            (
+                14_083_000.0,
+                identify::Kind::Rtty,
+                "RTTY",
+                "100000%",
+                "inf wpm",
+                "RYRY DE VK3",
+            ),
         ] {
             app.decode_log.push_back(super::DecodeEntry {
                 stamp: "12:34:56".into(),
@@ -7222,7 +7843,10 @@ mod tests {
             .iter()
             .map(|l| {
                 let whole: String = l.spans.iter().map(|s| s.content.to_string()).collect();
-                assert!(whole.chars().count() <= 96, "line overruns the pane: {whole:?}");
+                assert!(
+                    whole.chars().count() <= 96,
+                    "line overruns the pane: {whole:?}"
+                );
                 l.spans
                     .iter()
                     .rev()
@@ -7267,15 +7891,24 @@ mod tests {
         assert_eq!(app.rows.len(), 1);
 
         let text_of = |l: &super::Line| {
-            l.spans.iter().map(|s| s.content.to_string()).collect::<String>()
+            l.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
         };
         // Copy wider than the pane shows its tail, marked as continuing.
         app.rows[0].push_copy(&"-".repeat(400));
         let rect = ratatui::layout::Rect::new(0, 0, 60, 4);
         let drawn = text_of(&super::signal_rows_lines(&app, rect)[0]);
         assert!(drawn.contains('…'), "no continuation mark: {drawn:?}");
-        assert!(drawn.ends_with('-'), "not showing the newest copy: {drawn:?}");
-        assert!(drawn.chars().count() <= 60, "row overran the pane: {drawn:?}");
+        assert!(
+            drawn.ends_with('-'),
+            "not showing the newest copy: {drawn:?}"
+        );
+        assert!(
+            drawn.chars().count() <= 60,
+            "row overran the pane: {drawn:?}"
+        );
 
         // The buffer stays bounded however long the station transmits.
         for _ in 0..50 {
@@ -7322,11 +7955,20 @@ mod tests {
     fn both_auto_views_scroll_the_same_direction() {
         let mut app = App::new(14_070_000.0, 192_000.0, Mode::Auto);
         for i in 0..30 {
-            row(&mut app, 14_000_000.0 + i as f64 * 1000.0, identify::Kind::Cw, "x", 0);
+            row(
+                &mut app,
+                14_000_000.0 + i as f64 * 1000.0,
+                identify::Kind::Cw,
+                "x",
+                0,
+            );
         }
         let rect = ratatui::layout::Rect::new(0, 0, 60, 5);
         let text_of = |l: &super::Line| {
-            l.spans.iter().map(|s| s.content.to_string()).collect::<String>()
+            l.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
         };
         let _ = super::signal_rows_lines(&app, rect); // records the row count
 
@@ -7381,7 +8023,10 @@ mod tests {
         }
         let rect = ratatui::layout::Rect::new(0, 0, 60, 5);
         let text_of = |l: &super::Line| {
-            l.spans.iter().map(|s| s.content.to_string()).collect::<String>()
+            l.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
         };
 
         let live = super::decode_log_lines(&app, rect);
@@ -7422,7 +8067,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let text_of = |l: &super::Line| {
-            l.spans.iter().map(|s| s.content.to_string()).collect::<String>()
+            l.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
         };
         let live = super::transcript_lines(&app, 40, 5, false);
         assert_eq!(text_of(live.last().unwrap()), "line 19");
@@ -7441,8 +8089,8 @@ mod tests {
     /// not raw WSJT-X lines or bare audio offsets.
     #[test]
     fn ft_messages_show_time_and_rf() {
-        use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
         let mut app = App::new(14_074_000.0, 192_000.0, Mode::Ft8);
         let m = ftm("123045", -8.0, 1500.0, "CQ K1ABC FN42");
@@ -7462,11 +8110,181 @@ mod tests {
         assert!(text.contains("12:30:45"), "clear time missing:\n{text}");
         assert!(text.contains("14075.500"), "message RF missing:\n{text}");
         assert!(text.contains("14075.50"), "station RF missing:\n{text}");
-        assert!(text.contains("14074.2"), "activity RF range missing:\n{text}");
+        assert!(
+            text.contains("14074.2"),
+            "activity RF range missing:\n{text}"
+        );
+    }
+
+    fn status_text(app: &App, width: usize) -> [String; 3] {
+        super::status_lines(app, width)
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+    }
+
+    fn pane_text(app: &App, w: u16, h: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| super::draw(f, app)).unwrap();
+        let buf = t.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    /// Frequency and band lead the tune line, inset from the border.
+    /// Decode health and front-end state each get their own line.
+    #[test]
+    fn status_emphasizes_frequency_and_band() {
+        let mut app = App::new(14_074_000.0, 192_000.0, Mode::Auto);
+        app.cpu.set_display(
+            28.0,
+            &[
+                (identify::Kind::Cw, 14.0),
+                (identify::Kind::Psk31, 8.0),
+                (identify::Kind::Ft8, 5.0),
+            ],
+        );
+        let [l1, l2, l3] = status_text(&app, 78);
+        assert!(
+            l1.starts_with("  14074.00"),
+            "frequency must be padded off the border: {l1:?}"
+        );
+        let f = l1.find("14074.00").expect(&l1);
+        let b = l1.find("20m").expect(&l1);
+        assert!(f < b, "band should follow frequency: {l1:?}");
+        assert!(
+            l1.contains("[FT8]"),
+            "calling-frequency marker missing: {l1:?}"
+        );
+        assert!(l1.contains("centre"), "tune line missing centre: {l1:?}");
+        assert!(l1.contains("cursor"), "tune line missing cursor: {l1:?}");
+        assert!(l1.contains("view"), "tune line missing view: {l1:?}");
+        assert!(l2.contains("AUTO"), "mode should sit with decode: {l2:?}");
+        assert!(l2.contains("cpu 28%"), "{l2:?}");
+        assert!(l2.contains("cw 14"), "{l2:?}");
+        assert!(l2.contains("psk 8"), "{l2:?}");
+        assert!(l2.contains("ft8 5"), "{l2:?}");
+        assert!(l2.contains("snr"), "{l2:?}");
+        assert!(l3.contains("AGC"), "{l3:?}");
+        assert!(l3.contains("fil"), "{l3:?}");
+        assert!(l3.contains("sq"), "{l3:?}");
+        assert!(!l1.contains("press ?"), "help chrome leaked: {l1:?}");
+    }
+
+    /// At 80 columns the things that used to clip — frequency, band, CPU,
+    /// drops — still have to be on screen, even with a reporter and a fleet.
+    #[test]
+    fn status_keeps_freq_band_cpu_and_drops_at_80_cols() {
+        let mut app = App::new(14_074_000.0, 192_000.0, Mode::Auto);
+        app.reconcile_auto();
+        app.dropped_blocks = 12;
+        app.clipped_fraction = 0.012;
+        app.cpu.set_display(
+            28.0,
+            &[
+                (identify::Kind::Cw, 14.0),
+                (identify::Kind::Psk31, 8.0),
+                (identify::Kind::Ft8, 5.0),
+            ],
+        );
+        app.reporter = Some(super::report::Reporter::with_tallies(&[
+            ("FT8", 47),
+            ("CW", 12),
+        ]));
+        app.cursor = 4000.0;
+        app.zoom = 4.0;
+        app.ppm = 1.2;
+        app.biast = true;
+
+        let [l1, l2, l3] = status_text(&app, 78);
+        assert!(
+            l1.starts_with("  14078.00"),
+            "tuned freq missing or unpadded: {l1:?}"
+        );
+        assert!(l1.contains("20m"), "{l1:?}");
+        assert!(l1.contains("cursor"), "cursor missing: {l1:?}");
+        assert!(l2.contains("cpu"), "cpu dropped: {l2:?}");
+        assert!(l3.contains("drop 12"), "drop alert dropped: {l3:?}");
+        for (i, line) in [&l1, &l2, &l3].iter().enumerate() {
+            assert!(
+                spans_width_of(line) <= 78,
+                "line {} overruns 80-col inner: {} {line:?}",
+                i + 1,
+                spans_width_of(line)
+            );
+        }
+
+        let drawn = pane_text(&app, 80, 24);
+        assert!(
+            drawn.contains("14078.00"),
+            "freq missing from frame:\n{drawn}"
+        );
+        assert!(drawn.contains("20m"), "band missing from frame:\n{drawn}");
+        assert!(drawn.contains("cpu"), "cpu missing from frame:\n{drawn}");
+        assert!(drawn.contains("drop"), "drop missing from frame:\n{drawn}");
+        assert!(drawn.contains("hfscan"), "title missing:\n{drawn}");
+        assert!(
+            !drawn.contains("press ?"),
+            "help chrome still in title:\n{drawn}"
+        );
+    }
+
+    fn spans_width_of(s: &str) -> usize {
+        s.chars().count()
+    }
+
+    /// A 40-column terminal still names the frequency and the band.
+    #[test]
+    fn status_fits_frequency_and_band_at_40_cols() {
+        let mut app = App::new(14_074_000.0, 192_000.0, Mode::Auto);
+        app.cpu.set_display(28.0, &[(identify::Kind::Cw, 14.0)]);
+        app.dropped_blocks = 3;
+        let [l1, l2, _l3] = status_text(&app, 38);
+        assert!(
+            l1.starts_with("  14074.00"),
+            "frequency must be padded: {l1:?}"
+        );
+        assert!(l1.contains("20m"), "{l1:?}");
+        assert!(
+            spans_width_of(&l1) <= 38,
+            "line 1 overruns 40-col inner: {} {l1:?}",
+            spans_width_of(&l1)
+        );
+        assert!(
+            l1.contains("centre") || l1.contains("cursor") || l1.contains("20m"),
+            "{l1:?}"
+        );
+        assert!(l2.contains("cpu"), "{l2:?}");
+        // 12 rows is not enough for the 5-pane layout; the identity line
+        // still has to render once the terminal is tall enough to keep it.
+        let _ = pane_text(&app, 40, 12);
+        let drawn = pane_text(&app, 40, 24);
+        assert!(drawn.contains("14074.00"), "freq missing:\n{drawn}");
+        assert!(drawn.contains("20m"), "band missing:\n{drawn}");
+    }
+
+    /// Occupancy is feed time over wall time, in the same units as the benches.
+    #[test]
+    fn cpu_meter_reports_percent_of_real_time() {
+        let mut m = super::CpuMeter::new();
+        let mut kind_ns = [0u128; 5];
+        kind_ns[0] = 140_000_000;
+        m.apply_sample(280_000_000, kind_ns, 1_000_000_000);
+        assert!(
+            (m.overall.unwrap() - 28.0).abs() < 0.01,
+            "overall {}",
+            m.overall.unwrap()
+        );
+        assert!((m.kind[0] - 14.0).abs() < 0.01, "cw {}", m.kind[0]);
+        assert_eq!(m.kind[1], 0.0);
     }
 }
-
-
 
 #[cfg(test)]
 mod psk_auto_tests {
@@ -7520,7 +8338,6 @@ mod psk_auto_tests {
         let scale = 10f32.powf(-db / 20.0) / in_bw;
         decoders::tests::gen_psk31_at("CQ CQ DE W1AW W1AW K ", fs, offset, scale, secs)
     }
-
 
     fn rtty_span(offset: f64, db: f32, shift: f32, fs: f64, secs: f64) -> Vec<Complex32> {
         // Same SNR convention as `psk_span`, referenced to the RTTY shift.
@@ -7577,7 +8394,12 @@ mod psk_auto_tests {
     #[ignore]
     fn bench_rtty_shifts_in_auto_mode() {
         let fs = 192_000.0f64;
-        for (shift, db) in [(170.0f32, 20.0f32), (170.0, 10.0), (425.0, 20.0), (850.0, 20.0)] {
+        for (shift, db) in [
+            (170.0f32, 20.0f32),
+            (170.0, 10.0),
+            (425.0, 20.0),
+            (850.0, 20.0),
+        ] {
             let iq = rtty_span(1_500.0, db, shift, fs, 14.0);
             let mut app = App::new(7_045_000.0, fs, Mode::Auto);
             app.agc = AgcMode::Off;
@@ -7594,7 +8416,11 @@ mod psk_auto_tests {
                     .collect::<Vec<_>>(),
             );
             for r in &app.rows {
-                println!("  row {:<5} {:?}", r.mode, r.copy.chars().take(60).collect::<String>());
+                println!(
+                    "  row {:<5} {:?}",
+                    r.mode,
+                    r.copy.chars().take(60).collect::<String>()
+                );
             }
         }
     }
@@ -7619,7 +8445,10 @@ mod psk_auto_tests {
         assert!(
             app.auto.iter().any(|s| s.kind == identify::Kind::Psk31),
             "no PSK31 slot for a 10 dB signal; idents were {:?}",
-            app.idents.iter().map(|i| i.kind.label()).collect::<Vec<_>>()
+            app.idents
+                .iter()
+                .map(|i| i.kind.label())
+                .collect::<Vec<_>>()
         );
         let copy: String = app
             .rows
@@ -7706,8 +8535,7 @@ mod psk_auto_tests {
         // Offsets chosen clear of the FT8/FT4 windows above 14.074, which
         // veto narrowband classification for their own good reasons.
         for off in [200.0f64, 400.0, 800.0, 1_500.0, 2_500.0, 3_500.0, 20_000.0] {
-            let base = decoders::tests::gen_psk31_at(
-                "CQ CQ DE W1AW W1AW K ", fs, off, scale, 12.0);
+            let base = decoders::tests::gen_psk31_at("CQ CQ DE W1AW W1AW K ", fs, off, scale, 12.0);
             let mut row = Vec::new();
             for spike in [0.0f32, 1.0, 5.0] {
                 let mut iq = base.clone();
@@ -7726,7 +8554,9 @@ mod psk_auto_tests {
             println!(
                 "{:>12}{:>10}{:>10}{:>10}",
                 format!("{:+.0} Hz", off),
-                row[0], row[1], row[2]
+                row[0],
+                row[1],
+                row[2]
             );
         }
     }
@@ -7748,13 +8578,11 @@ mod psk_auto_tests {
         let scale = 10f32.powf(-20.0 / 20.0) / in_bw;
         // A PSK31 signal 60 Hz above the dial: inside the blanked region if
         // the receiver is parked on the dial frequency.
-        let iq = decoders::tests::gen_psk31_at(
-            "CQ CQ DE W1AW W1AW K ", fs, 60.0, scale, 12.0);
+        let iq = decoders::tests::gen_psk31_at("CQ CQ DE W1AW W1AW K ", fs, 60.0, scale, 12.0);
 
         let mut on_top = App::new(14_070_000.0, fs, Mode::Auto);
         on_top.agc = AgcMode::Off;
-        let seen_on_top =
-            run_auto_watching(&mut on_top, &iq, fs).contains(&identify::Kind::Psk31);
+        let seen_on_top = run_auto_watching(&mut on_top, &iq, fs).contains(&identify::Kind::Psk31);
 
         // The same IQ, with the receiver 10 kHz lower: the signal now sits
         // clear of the LO and everything about it is otherwise identical.
@@ -7798,10 +8626,15 @@ mod psk_auto_tests {
         let in_bw = n_total * (31.25 / fs as f32).sqrt();
         let scale = 10f32.powf(-20.0 / 20.0) / in_bw;
         for sep in [200.0f64, 120.0, 80.0, 50.0] {
-            let want = decoders::tests::gen_psk31_at(
-                "CQ CQ DE W1AW W1AW K ", fs, 1_500.0, scale, 20.0);
+            let want =
+                decoders::tests::gen_psk31_at("CQ CQ DE W1AW W1AW K ", fs, 1_500.0, scale, 20.0);
             let other = decoders::tests::gen_psk31_at(
-                "TEST DE G4XYZ G4XYZ K ", fs, 1_500.0 + sep, 0.0, 20.0);
+                "TEST DE G4XYZ G4XYZ K ",
+                fs,
+                1_500.0 + sep,
+                0.0,
+                20.0,
+            );
             let mut iq = want;
             for (i, s) in iq.iter_mut().enumerate() {
                 if let Some(o) = other.get(i) {
@@ -7872,9 +8705,7 @@ mod psk_auto_tests {
             let narrow: Vec<String> = app
                 .idents
                 .iter()
-                .filter(|i| {
-                    matches!(i.kind, identify::Kind::Psk31 | identify::Kind::Cw)
-                })
+                .filter(|i| matches!(i.kind, identify::Kind::Psk31 | identify::Kind::Cw))
                 .map(|i| format!("{} @{:+.0}", i.kind.label(), i.offset_hz))
                 .collect();
             let copy: usize = app
@@ -7899,13 +8730,8 @@ mod psk_auto_tests {
             let n_total = (1.0f32 / 6.0).sqrt();
             let in_bw = n_total * (31.25 / fs as f32).sqrt();
             let scale = 10f32.powf(-(db as f32) / 20.0) / in_bw;
-            let iq = decoders::tests::gen_psk31_at(
-                "CQ CQ DE W1AW W1AW K ",
-                fs,
-                offset,
-                scale,
-                20.0,
-            );
+            let iq =
+                decoders::tests::gen_psk31_at("CQ CQ DE W1AW W1AW K ", fs, offset, scale, 20.0);
 
             let mut app = App::new(center, fs, Mode::Auto);
             app.agc = AgcMode::Off;
@@ -7985,9 +8811,15 @@ mod scout_cost {
             // A full narrowband fleet, which is what a busy band produces.
             for k in 0..MAX_AUTO_SLOTS {
                 let dial = b.2 - rate / 6.0 + k as f64 * (rate / 100.0);
-                if let Some(sl) =
-                    AutoSlot::new(identify::Kind::Cw, dial, app.center, app.rate, false, None, app.channelizer.hop())
-                {
+                if let Some(sl) = AutoSlot::new(
+                    identify::Kind::Cw,
+                    dial,
+                    app.center,
+                    app.rate,
+                    false,
+                    None,
+                    app.channelizer.hop(),
+                ) {
                     app.auto.push(sl);
                 }
             }
@@ -8187,8 +9019,7 @@ mod band_plan_tests {
         let in_bw = n_total * (31.25 / fs as f32).sqrt();
         let scale = 10f32.powf(-15.0 / 20.0) / in_bw;
         // 800 Hz into the passband: inside FT4's window as well.
-        let iq =
-            decoders::tests::gen_psk31_at("CQ CQ DE W1AW W1AW K ", fs, 800.0, scale, 14.0);
+        let iq = decoders::tests::gen_psk31_at("CQ CQ DE W1AW W1AW K ", fs, 800.0, scale, 14.0);
         let mut app = App::new(center, fs, Mode::Auto);
         app.agc = AgcMode::Off;
         super::psk_auto_tests::run_auto(&mut app, &iq, fs);
@@ -8202,7 +9033,10 @@ mod band_plan_tests {
         assert!(
             copy.contains("W1AW"),
             "30 m PSK31 produced no copy; idents were {:?}",
-            app.idents.iter().map(|i| i.kind.label()).collect::<Vec<_>>()
+            app.idents
+                .iter()
+                .map(|i| i.kind.label())
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -8259,7 +9093,12 @@ mod slot_cost {
             for k in 0..slots {
                 let dial = 14_030_000.0 - 16_000.0 + k as f64 * 800.0;
                 if let Some(sl) = AutoSlot::new(
-                    identify::Kind::Cw, dial, app.center, app.rate, false, None,
+                    identify::Kind::Cw,
+                    dial,
+                    app.center,
+                    app.rate,
+                    false,
+                    None,
                     app.channelizer.hop(),
                 ) {
                     app.auto.push(sl);

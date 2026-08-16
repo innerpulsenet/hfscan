@@ -186,15 +186,27 @@ pub fn run(device_args: &str, sweep_freq: f64) -> Result<()> {
     let dev = soapysdr::Device::new(device_args).context("opening device")?;
 
     println!("== receiver ==");
-    println!("  driver: {}", dev.driver_key().unwrap_or_else(|_| "?".into()));
-    println!("  hardware: {}", dev.hardware_key().unwrap_or_else(|_| "?".into()));
     println!(
-        "  {}",
-        ranges("sample rates", &dev.get_sample_rate_range(Rx, 0).unwrap_or_default())
+        "  driver: {}",
+        dev.driver_key().unwrap_or_else(|_| "?".into())
+    );
+    println!(
+        "  hardware: {}",
+        dev.hardware_key().unwrap_or_else(|_| "?".into())
     );
     println!(
         "  {}",
-        ranges("bandwidths", &dev.bandwidth_range(Rx, 0).unwrap_or_default())
+        ranges(
+            "sample rates",
+            &dev.get_sample_rate_range(Rx, 0).unwrap_or_default()
+        )
+    );
+    println!(
+        "  {}",
+        ranges(
+            "bandwidths",
+            &dev.bandwidth_range(Rx, 0).unwrap_or_default()
+        )
     );
     let elements = dev.list_gains(Rx, 0).unwrap_or_default();
     for e in &elements {
@@ -205,11 +217,17 @@ pub fn run(device_args: &str, sweep_freq: f64) -> Result<()> {
     if elements.is_empty()
         && let Ok(r) = dev.gain_range(Rx, 0)
     {
-        println!("  gain: {:.0}..{:.0} dB (single element)", r.minimum, r.maximum);
+        println!(
+            "  gain: {:.0}..{:.0} dB (single element)",
+            r.minimum, r.maximum
+        );
     }
 
     println!("\n== band plan vs driver ==");
-    println!("  {:>5} {:>9} {:>9} {:>9}  result", "band", "asked", "got", "filter");
+    println!(
+        "  {:>5} {:>9} {:>9} {:>9}  result",
+        "band", "asked", "got", "filter"
+    );
     let mut failures = 0;
     for b in bands::BANDS {
         if b.name == "WWV" {
@@ -279,10 +297,7 @@ pub fn run(device_args: &str, sweep_freq: f64) -> Result<()> {
                 dev.set_gain(Rx, 0, k.gain_db)?;
                 let rfgr = dev.gain_element(Rx, 0, "RFGR").unwrap_or(f64::NAN);
                 let ifgr = dev.gain_element(Rx, 0, "IFGR").unwrap_or(f64::NAN);
-                let span = points
-                    .iter()
-                    .map(|p| p.floor_dbfs)
-                    .fold(f32::MIN, f32::max)
+                let span = points.iter().map(|p| p.floor_dbfs).fold(f32::MIN, f32::max)
                     - points.iter().map(|p| p.floor_dbfs).fold(f32::MAX, f32::min);
                 println!(
                     "  {:>5} {:>8.1}dB {:>8.1}dB {:>7.0} {:>7.0}  {:.0} dB of travel",
@@ -338,7 +353,10 @@ mod tests {
     use super::*;
 
     fn pt(gain_db: f64, floor_dbfs: f32) -> GainPoint {
-        GainPoint { gain_db, floor_dbfs }
+        GainPoint {
+            gain_db,
+            floor_dbfs,
+        }
     }
 
     /// The knee is where the floor starts following gain. Below it the

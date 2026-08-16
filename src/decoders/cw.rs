@@ -799,6 +799,119 @@ impl CwDecoder {
         self.hold_tune = 0;
         // Keep dit — the next station may be a similar speed.
     }
+
+    fn step_envelope(&mut self, env: f32) {
+        if !self.have_env {
+            self.peak = env;
+            self.floor = env;
+            self.have_env = true;
+        }
+
+        if env > self.peak {
+            self.peak = env;
+        } else {
+            self.peak += (env - self.peak) * self.peak_decay;
+        }
+        if !self.key_down {
+            let a = if env < self.floor {
+                self.floor_decay
+            } else if self.pending == 0.0 && self.run > 0.3 * self.dit {
+                self.floor_attack
+            } else {
+                0.0
+            };
+            self.floor += (env - self.floor) * a;
+        }
+
+        let span = (self.peak - self.floor).max(1e-9);
+        let on_thr = self.floor + 0.52 * span;
+        let off_thr = self.floor + 0.32 * span;
+        let snr_ok = self.peak > 2.8 * self.floor.max(1e-9);
+
+        let next = if self.key_down {
+            env > off_thr
+        } else {
+            env > on_thr && snr_ok
+        };
+        self.on_thr = on_thr;
+        self.off_thr = off_thr;
+
+        let settled = if self.key_down {
+            env > on_thr
+        } else {
+            env < off_thr
+        };
+        if settled && self.pending == 0.0 && self.run > 0.4 * self.dit {
+            let (level, clean_is_up) = if self.key_down {
+                (&mut self.mark_env, true)
+            } else {
+                (&mut self.space_env, false)
+            };
+            if *level <= 0.0 {
+                *level = env;
+            } else {
+                let a = if (env > *level) == clean_is_up { 0.05 } else { 0.002 };
+                *level += (env - *level) * a;
+            }
+        }
+
+        let norm = ((env - self.floor) / span).clamp(0.0, 1.0);
+        self.env_hist.push_back(norm);
+        self.key_hist.push_back(next);
+        while self.env_hist.len() > ENV_HIST {
+            self.env_hist.pop_front();
+            self.key_hist.pop_front();
+        }
+
+        if next == self.key_down {
+            self.run += 1.0 + self.pending;
+            self.pending = 0.0;
+        } else {
+            self.pending += 1.0;
+            if self.pending >= self.debounce_env() {
+                let len = self.run;
+                self.run = self.pending;
+                self.pending = 0.0;
+                if self.key_down {
+                    if len > 0.010 * self.env_rate {
+                        self.on_mark_end(len);
+                    }
+                } else if self.started {
+                    self.on_space_end(len);
+                }
+                self.started = true;
+                self.idle = 0.0;
+                self.key_down = next;
+            }
+        }
+
+        if !self.key_down {
+            self.idle += 1.0;
+            if self.idle > 8.0 * self.dit {
+                if !self.symbol.is_empty() {
+                    self.push_symbol();
+                }
+                if (self.idle - 8.0 * self.dit) <= 1.0 {
+                    self.scan.push(' ');
+                }
+            }
+            if self.idle > 1.6 * self.env_rate {
+                self.acquire = self.acquire.max(12);
+                if !self.warming {
+                    if !self.symbol.is_empty() {
+                        self.push_symbol();
+                    }
+                    self.warming = true;
+                    self.marks.clear();
+                }
+            }
+            if self.warming && !self.warmup.is_empty() && self.idle > 3.0 * self.env_rate {
+                self.flush_warmup();
+                self.warming = true;
+                self.warmup.clear();
+            }
+        }
+    }
 }
 
 impl Decoder for CwDecoder {
@@ -819,21 +932,10 @@ impl Decoder for CwDecoder {
     }
 
     fn wants_agc(&self) -> bool {
-        // No. This decoder tracks the keying envelope's own peak and floor
-        // and strikes every threshold as a fraction of the span between
-        // them, so it is already indifferent to level — and a block-rate AGC
-        // does not merely fail to help, it actively fights the measurement.
-        // Its gain settles over roughly the same time a dit lasts, so on a
-        // keyed signal it turns down during marks and back up during spaces,
-        // flattening the very on/off contrast the slicer works from.
-        // Measured across 15-28 WPM and 30 down to 8 dB, it cost 2 to 7
-        // points of accuracy everywhere and gained nothing anywhere.
         false
     }
 
     fn squelched(&self) -> bool {
-        // The passband scout has to keep hearing, or it cannot find a
-        // nearby tone when the cursor is sitting on noise.
         false
     }
 
@@ -924,13 +1026,10 @@ impl Decoder for CwDecoder {
 
         for &raw in samples {
             let mixed = self.mix(raw);
-            // Everything downstream — the discriminator as much as the
-            // envelope — sees only the wanted channel.
             let s = self.post.process(mixed);
             if self.have_mixed && s.norm() > 1e-9 && self.prev_mixed.norm() > 1e-9 {
                 let d = s * self.prev_mixed.conj();
                 let inst = d.arg() * self.fs / (2.0 * PI);
-                // Only trust the discriminator while the key is down.
                 if self.key_down {
                     self.tune_err = 0.92 * self.tune_err + 0.08 * inst.clamp(-80.0, 80.0);
                 }
@@ -945,9 +1044,11 @@ impl Decoder for CwDecoder {
             }
             self.decim_ctr = 0;
 
-            // A one-dit boxcar is the matched filter for the shortest Morse
-            // element. Re-size it continuously as the recovered clock moves;
-            // the state/debounce pass below then removes isolated excursions.
+            if self.settle > 0 {
+                self.settle -= 1;
+                continue;
+            }
+
             let matched_n = (0.35 * self.dit).round().clamp(4.0, self.env_rate * DIT_MAX_S) as usize;
             self.matched.push_back(raw_env);
             self.matched_sum += raw_env;
@@ -958,168 +1059,7 @@ impl Decoder for CwDecoder {
                 self.matched_sum = self.matched.iter().sum();
             }
             let env = self.matched_sum / self.matched.len().max(1) as f32;
-
-            // The envelope smoother, the channel filter and the tuning
-            // chain in front of them all start at zero, so the first tens of
-            // milliseconds are a ramp up to the band noise rather than a
-            // measurement of it. Slicing that ramp keys the decoder and
-            // prepends a phantom mark to the first real character; seeding
-            // the trackers from it is just as wrong, because everything
-            // sampled during the ramp reads far below the true floor.
-            //
-            // So: drop the ramp, then seed both trackers from real noise.
-            // With `floor` starting at the noise instead of at zero, the
-            // snr_ok guard below can finally tell a signal from the band.
-            if self.settle > 0 {
-                self.settle -= 1;
-                continue;
-            }
-            if !self.have_env {
-                self.peak = env;
-                self.floor = env;
-                self.have_env = true;
-            }
-
-            if env > self.peak {
-                self.peak = env;
-            } else {
-                self.peak += (env - self.peak) * self.peak_decay;
-            }
-            // The floor is the band, so it is measured from the band: only
-            // while the key is up, and only when the element has settled past
-            // the ring-down tail of the mark.
-            if !self.key_down {
-                let a = if env < self.floor {
-                    self.floor_decay
-                } else if self.pending == 0.0 && self.run > 0.3 * self.dit {
-                    self.floor_attack
-                } else {
-                    0.0
-                };
-                self.floor += (env - self.floor) * a;
-            }
-
-            let span = (self.peak - self.floor).max(1e-9);
-            let on_thr = self.floor + 0.52 * span;
-            let off_thr = self.floor + 0.32 * span;
-            // Noise is not flat: the envelope of a Rayleigh-distributed band
-            // peaks 2.5-3x its own mean over the peak tracker's window, so a
-            // 2.2x gate let an empty frequency key the slicer and spell a
-            // phantom letter before every transmission. 2.8x clears that
-            // while the post-mix filter's narrower noise bandwidth keeps a
-            // real signal well above it — measured flat to 10 dB and 90%+ at
-            // 6 dB, where 3.2x and above start costing weak copy.
-            let snr_ok = self.peak > 2.8 * self.floor.max(1e-9);
-
-            let next = if self.key_down {
-                env > off_thr
-            } else {
-                env > on_thr && snr_ok
-            };
-            self.on_thr = on_thr;
-            self.off_thr = off_thr;
-            // Sample the element's settled middle, which takes three guards.
-            // `run` clears the edge behind, where the smoother and the one-dit
-            // boxcar are still sliding off the last element. `pending` clears
-            // the edge ahead, where the raw slicer has already changed its
-            // mind but the debounce has not committed it. And the thresholds
-            // clear the keying ramp itself: a mark rising toward `on_thr` is
-            // still filed as a space by the state alone, so without this the
-            // space level reads the ramp instead of the band and lands two
-            // orders of magnitude high.
-            let settled = if self.key_down {
-                env > on_thr
-            } else {
-                env < off_thr
-            };
-            if settled && self.pending == 0.0 && self.run > 0.4 * self.dit {
-                // What survives the guards is still biased one way, and only
-                // one way: the last stretch of a gap is the envelope climbing
-                // into a mark the slicer has not called yet, so it can only
-                // push the space level up, never down — and symmetrically the
-                // start of a mark can only pull the mark level down. Averaging
-                // fast toward the clean side and slowly toward the dirty one
-                // settles each level where the element really sits instead of
-                // partway up its own ramp.
-                let (level, clean_is_up) = if self.key_down {
-                    (&mut self.mark_env, true)
-                } else {
-                    (&mut self.space_env, false)
-                };
-                if *level <= 0.0 {
-                    *level = env;
-                } else {
-                    let a = if (env > *level) == clean_is_up { 0.05 } else { 0.002 };
-                    *level += (env - *level) * a;
-                }
-            }
-
-            let norm = ((env - self.floor) / span).clamp(0.0, 1.0);
-            self.env_hist.push_back(norm);
-            self.key_hist.push_back(next);
-            while self.env_hist.len() > ENV_HIST {
-                self.env_hist.pop_front();
-                self.key_hist.pop_front();
-            }
-
-            if next == self.key_down {
-                // Any sub-debounce flicker is folded back into the element
-                // it interrupted, so its length is not lost.
-                self.run += 1.0 + self.pending;
-                self.pending = 0.0;
-            } else {
-                // Tentative edge: only commit it once the new state has
-                // outlived the debounce.
-                self.pending += 1.0;
-                if self.pending >= self.debounce_env() {
-                    let len = self.run;
-                    self.run = self.pending;
-                    self.pending = 0.0;
-                    if self.key_down {
-                        if len > 0.010 * self.env_rate {
-                            self.on_mark_end(len);
-                        }
-                    } else if self.started {
-                        self.on_space_end(len);
-                    }
-                    self.started = true;
-                    self.idle = 0.0;
-                    self.key_down = next;
-                }
-            }
-
-            if !self.key_down {
-                self.idle += 1.0;
-                if self.idle > 8.0 * self.dit {
-                    if !self.symbol.is_empty() {
-                        self.push_symbol();
-                    }
-                    if (self.idle - 8.0 * self.dit) <= 1.0 {
-                        self.scan.push(' ');
-                    }
-                }
-                // A pause this long means the next thing heard is very
-                // likely a different station: hold their first elements and
-                // re-learn the clock rather than reading them against the
-                // last operator's speed.
-                if self.idle > 1.6 * self.env_rate {
-                    self.acquire = self.acquire.max(12);
-                    if !self.warming {
-                        if !self.symbol.is_empty() {
-                            self.push_symbol();
-                        }
-                        self.warming = true;
-                        self.marks.clear();
-                    }
-                }
-                // Whatever is still held when the band goes quiet has to be
-                // released, or a short transmission is never shown at all.
-                if self.warming && !self.warmup.is_empty() && self.idle > 3.0 * self.env_rate {
-                    self.flush_warmup();
-                    self.warming = true;
-                    self.warmup.clear();
-                }
-            }
+            self.step_envelope(env);
         }
         std::mem::take(&mut self.text)
     }

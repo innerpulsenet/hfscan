@@ -89,7 +89,11 @@ impl Spectrum {
     ///
     /// Segments hop by half an FFT so successive estimates overlap; that
     /// Welch average is what keeps the noise floor from boiling.
-    pub fn power_db(&mut self, input: &[Complex32], out: &mut Vec<f32>) {
+    /// Returns whether a fresh estimate was produced. A large FFT needs more
+    /// samples than one IQ block carries, so `out` is often left holding the
+    /// previous estimate — and anything integrating this over time needs to
+    /// know that, or it folds the same observation in several times over.
+    pub fn power_db(&mut self, input: &[Complex32], out: &mut Vec<f32>) -> bool {
         self.pending.extend_from_slice(input);
         let hop = (self.size / 2).max(1);
         let nseg = if self.pending.len() >= self.size {
@@ -101,7 +105,7 @@ impl Spectrum {
             if out.is_empty() {
                 out.resize(self.size, -140.0);
             }
-            return;
+            return false;
         }
         out.clear();
         out.resize(self.size, 0.0);
@@ -128,6 +132,7 @@ impl Spectrum {
             let src = (i + half) % self.size;
             out[i] = 10.0 * (self.acc[src] * scale + 1e-20).log10();
         }
+        true
     }
 }
 
@@ -135,24 +140,110 @@ impl Spectrum {
 /// observation arrives but rises slowly enough that traffic cannot become its
 /// own reference level.
 pub struct NoiseFloor {
+    /// Raw minimum-following estimate, which sits below the noise level.
     bins: Vec<f32>,
+    /// ...and the same thing with the measured bias put back.
+    corrected: Vec<f32>,
+    bias: f32,
+    seen: bool,
 }
 
-impl NoiseFloor {
-    pub fn new() -> Self { Self { bins: Vec::new() } }
+/// How fast the estimate follows the spectrum down, and back up.
+///
+/// In seconds, deliberately. These used to be per-*call* blend coefficients,
+/// which made the time constant a function of how often `feed` happened to
+/// run — and that is set by the sample rate and the block size, so the same
+/// numbers meant 43 s of upward memory on a 192 kS/s span and 21 s on a
+/// 384 kS/s one. A detection parameter must not change because the operator
+/// pressed `b`.
+const TAU_DOWN_S: f32 = 0.30;
+const TAU_UP_S: f32 = 43.0;
 
-    pub fn update<'a>(&'a mut self, power_db: &[f32]) -> &'a [f32] {
+/// How quickly the measured bias correction follows.
+const TAU_BIAS_S: f32 = 8.0;
+
+impl NoiseFloor {
+    pub fn new() -> Self {
+        Self { bins: Vec::new(), corrected: Vec::new(), bias: 0.0, seen: false }
+    }
+
+    /// Fold in one fresh periodogram covering `dt` seconds.
+    ///
+    /// Returns the *bias-corrected* floor. An estimator that follows minima
+    /// quickly and maxima slowly necessarily settles below the mean of what it
+    /// watches — that is what makes it immune to signals, and it is also why
+    /// the raw number is not a noise floor. The offset is not a constant: it
+    /// grows as the periodogram gets noisier, and the periodogram gets noisier
+    /// as the FFT gets larger, because fewer Welch segments fit in a block.
+    /// Measured, it runs from about 11 dB at 4096 points to 19 dB at 32768.
+    ///
+    /// So it is measured rather than assumed. The median across bins of
+    /// `observation - floor` is that offset directly: signals occupy few bins
+    /// of a span, so the median is still describing noise even on a busy band,
+    /// which is the same reasoning the rest of the detection code uses medians
+    /// for. That makes the correction self-calibrating across FFT size, sample
+    /// rate and block size at once, with no constant to keep in step.
+    pub fn update<'a>(&'a mut self, power_db: &[f32], dt: f32) -> &'a [f32] {
         if self.bins.len() != power_db.len() {
             self.bins = power_db.to_vec();
-        } else {
-            for (floor, &x) in self.bins.iter_mut().zip(power_db) {
-                let a = if x < *floor { 0.25 } else { 0.002 };
-                *floor += a * (x - *floor);
+            self.corrected = power_db.to_vec();
+            self.bias = 0.0;
+            self.seen = false;
+            return &self.corrected;
+        }
+        let dt = dt.clamp(1e-4, 5.0);
+        let a_down = 1.0 - (-dt / TAU_DOWN_S).exp();
+        let a_up = 1.0 - (-dt / TAU_UP_S).exp();
+        for (floor, &x) in self.bins.iter_mut().zip(power_db) {
+            let a = if x < *floor { a_down } else { a_up };
+            *floor += a * (x - *floor);
+        }
+
+        // Subsampled median of the gap, for the same reason `sampled_median`
+        // subsamples: a full sort of every bin, every update, buys nothing.
+        let mut gaps: Vec<f32> = power_db
+            .iter()
+            .zip(&self.bins)
+            .step_by(7)
+            .map(|(x, f)| x - f)
+            .collect();
+        if !gaps.is_empty() {
+            let mid = gaps.len() / 2;
+            gaps.select_nth_unstable_by(mid, |a, b| {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let inst = gaps[mid].max(0.0);
+            if !self.seen {
+                self.bias = inst;
+                self.seen = true;
+            } else {
+                let a = 1.0 - (-dt / TAU_BIAS_S).exp();
+                self.bias += a * (inst - self.bias);
             }
         }
+
+        self.corrected.clear();
+        self.corrected.extend(self.bins.iter().map(|f| f + self.bias));
         &self.bins
     }
 
+    /// The same estimate with the measured bias put back — an actual noise
+    /// level in dB, for the cursor SNR readout and the waterfall's colour
+    /// scale.
+    ///
+    /// Detection deliberately does *not* use this. `scout_peaks` compares a
+    /// peak against `max(floor, local_median - 3)`, and with the raw estimate
+    /// sitting well below the noise that clamp is what wins, which puts the
+    /// candidate gate at roughly zero prominence — permissive on purpose,
+    /// because the scouts' mix-down-and-match stage is the real false-alarm
+    /// filter and a candidate costs almost nothing. Feeding the corrected
+    /// level in instead raises the bar by the whole bias and loses weak
+    /// signals the scouts would have confirmed. The two callers want
+    /// genuinely different things: one wants a level, the other wants a
+    /// reference nothing on the air can pull upwards.
+    pub fn level(&self) -> &[f32] {
+        &self.corrected
+    }
 }
 
 /// Frequency-domain smooth. `taps` 1 = none, 3 = [1,2,1], 5 = [1,4,6,4,1].
@@ -216,6 +307,22 @@ impl Rotator {
             step: Complex32::new(cos, sin),
             n: 0,
         }
+    }
+
+    /// Change the rate without disturbing the phase.
+    ///
+    /// A decoder tracking a drifting signal retunes its mixer constantly, and
+    /// building a fresh `Rotator` for each new rate would restart it at 1+0j —
+    /// a phase step in the middle of the very signal the AFC is trying to hold.
+    pub(crate) fn set_rate(&mut self, rad_per_sample: f32) {
+        let (sin, cos) = rad_per_sample.sin_cos();
+        self.step = Complex32::new(cos, sin);
+    }
+
+    /// Restart the phase at zero, for a genuine change of signal.
+    pub(crate) fn reset_phase(&mut self) {
+        self.cur = Complex32::new(1.0, 0.0);
+        self.n = 0;
     }
 
     #[inline]
@@ -562,6 +669,280 @@ impl DecodeChain {
     }
 }
 
+/// Frame size the channeliser transforms.
+///
+/// Divisible by 24 and 16 — the decimations a 192 kS/s span uses for its
+/// 8 kHz and 12 kHz audio rates — and by 48 and 32 for a 384 kS/s one. That
+/// divisibility is what lets a tap decimate by folding the spectrum instead
+/// of inverse-transforming the whole frame and throwing away most of it.
+const CHAN_N: usize = 3072;
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// One forward transform of the wideband stream, shared by every decoder.
+///
+/// Each `DecodeChain` mixes and filters the *whole* span independently: an
+/// NCO over every input sample, then an overlap-save FIR whose forward FFT is
+/// recomputed from scratch. Twenty-four slots therefore ran twenty-four
+/// identical 4096-point transforms of the same input, having first spent
+/// twenty-four passes of complex multiplies arriving at inputs that differ
+/// only by a frequency shift.
+///
+/// A frequency shift is a rotation of the spectrum, so all of that is one
+/// transform and a change of index. The channeliser does it once; each
+/// `ChannelTap` picks up the shared spectrum, rotates it to its own centre,
+/// multiplies by its filter and inverse-transforms.
+pub struct Channelizer {
+    fft: Arc<dyn Fft<f32>>,
+    buf: Vec<Complex32>,
+    /// Forward transforms of every frame produced by the last `push`, laid
+    /// end to end.
+    spectra: Vec<Complex32>,
+    /// Absolute index of the first sample of each frame.
+    starts: Vec<u64>,
+    next_start: u64,
+    hop: usize,
+}
+
+impl Channelizer {
+    pub fn new(fs_in: f64) -> Self {
+        // Frames advance by a whole number of output samples for *every*
+        // audio rate in use. A tap decimating by D produces samples at frame
+        // offsets 0, D, 2D…; if the hop were not a multiple of D the
+        // decimation phase would shift from frame to frame and the output
+        // would stop being a uniformly sampled signal.
+        let d8 = (fs_in / 8_000.0).round().max(1.0) as usize;
+        let d12 = (fs_in / 12_000.0).round().max(1.0) as usize;
+        let align = d8 / gcd(d8, d12) * d12;
+        let max_hop = CHAN_N - (RADIO_TAPS - 1);
+        let hop = (max_hop / align.max(1)).max(1) * align.max(1);
+        Self {
+            fft: FftPlanner::new().plan_fft_forward(CHAN_N),
+            buf: Vec::with_capacity(CHAN_N * 2),
+            spectra: Vec::new(),
+            starts: Vec::new(),
+            next_start: 0,
+            hop: hop.min(max_hop).max(1),
+        }
+    }
+
+    pub fn hop(&self) -> usize {
+        self.hop
+    }
+
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.spectra.clear();
+        self.starts.clear();
+        self.next_start = 0;
+    }
+
+    /// Transform every whole frame now available. Frames overlap by the
+    /// filter length, as overlap-save requires.
+    pub fn push(&mut self, input: &[Complex32]) -> usize {
+        self.buf.extend_from_slice(input);
+        self.spectra.clear();
+        self.starts.clear();
+        while self.buf.len() >= CHAN_N {
+            let at = self.spectra.len();
+            self.spectra.extend_from_slice(&self.buf[..CHAN_N]);
+            self.fft.process(&mut self.spectra[at..at + CHAN_N]);
+            self.starts.push(self.next_start);
+            self.buf.drain(..self.hop);
+            self.next_start += self.hop as u64;
+        }
+        self.starts.len()
+    }
+
+    pub fn frame(&self, i: usize) -> (&[Complex32], u64) {
+        (&self.spectra[i * CHAN_N..(i + 1) * CHAN_N], self.starts[i])
+    }
+}
+
+/// One decoder's view of the shared spectrum: an NCO and both filter stages,
+/// producing the same narrowband baseband a `DecodeChain` would.
+pub struct ChannelTap {
+    ifft: Arc<dyn Fft<f32>>,
+    response: Vec<Complex32>,
+    /// Bins where the filter is not effectively zero. A 400 Hz channel is a
+    /// hundred-odd bins of a 3072-point frame, so the fold below only has to
+    /// touch those — everywhere else it would be adding zeros.
+    active: Vec<usize>,
+    /// Folded spectrum, `CHAN_N / decim` long: decimation done by aliasing
+    /// the (already filtered) spectrum rather than by inverse-transforming
+    /// the whole frame and discarding all but every Dth sample.
+    folded: Vec<Complex32>,
+    decimated: Vec<Complex32>,
+    audio: DecimFir,
+    fs_in: f64,
+    fs_out: f64,
+    decim: usize,
+    m: usize,
+    hop: usize,
+    /// Whether decimation is done by folding the spectrum (fast) or by
+    /// inverse-transforming the frame and keeping every Dth sample.
+    fold: bool,
+    dec_phase: usize,
+    /// Whole bins of the wanted shift, and the sub-bin remainder.
+    k0: isize,
+    res_rot: Rotator,
+    /// Output samples still to swallow while the filter fills, so the tap
+    /// lines up with what a `DecodeChain` would have produced.
+    warm: usize,
+}
+
+impl ChannelTap {
+    pub fn new(fs_in: f64, bandwidth: f32, target_rate: f64, hop: usize) -> Self {
+        let decim = (fs_in / target_rate).round().max(1.0) as usize;
+        let fs_out = fs_in / decim as f64;
+        // Folding needs the frame and the hop to be whole numbers of output
+        // samples. Every rate in the band table obliges; a `--rate` override
+        // need not, and then the tap inverse-transforms the whole frame and
+        // decimates in time instead. Slower, still shares the forward
+        // transform, and always available.
+        let fold = CHAN_N.is_multiple_of(decim) && hop.is_multiple_of(decim);
+        let m = if fold { CHAN_N / decim } else { CHAN_N };
+        let mut tap = Self {
+            ifft: FftPlanner::new().plan_fft_inverse(m),
+            fold,
+            dec_phase: 0,
+            response: vec![Complex32::new(0.0, 0.0); CHAN_N],
+            active: Vec::new(),
+            folded: vec![Complex32::new(0.0, 0.0); m],
+            decimated: Vec::new(),
+            audio: DecimFir::new(bandwidth / 2.0, fs_out as f32, 1, AUDIO_TAPS_MIN),
+            fs_in,
+            fs_out,
+            decim,
+            m,
+            hop,
+            k0: 0,
+            res_rot: Rotator::new(0.0),
+            warm: if fold { (RADIO_TAPS - 1) / decim } else { RADIO_TAPS - 1 },
+        };
+        tap.set_bandwidth(bandwidth);
+        tap
+    }
+
+    pub fn fs_out(&self) -> f64 {
+        self.fs_out
+    }
+
+    /// Split the wanted shift into whole bins — free, because rotating the
+    /// shared spectrum is only a change of index — and the remainder, which
+    /// is applied as an ordinary rotation on the output.
+    pub fn set_offset(&mut self, hz: f64) {
+        let bin = self.fs_in / CHAN_N as f64;
+        self.k0 = (hz / bin).round() as isize;
+        let residual = hz - self.k0 as f64 * bin;
+        // Advanced once per sample the inverse transform yields — which is an
+        // output sample when folding and an input-rate sample when not.
+        let per = if self.fold { self.fs_out } else { self.fs_in };
+        self.res_rot
+            .set_rate(-2.0 * std::f64::consts::PI as f32 * residual as f32 / per as f32);
+    }
+
+    pub fn set_bandwidth(&mut self, bw: f32) {
+        let fs_out = self.fs_out as f32;
+        let half = (bw * 0.5).clamp(10.0, fs_out * 0.45);
+        // Identical sizing to `DecodeChain::set_bandwidth`; the two have to
+        // realise the same filter or a slot would change character depending
+        // on which one happened to drive it.
+        let tr = transition_hz(self.fs_in as f32, RADIO_TAPS);
+        let lo = half + tr * 0.5;
+        let hi = (fs_out - half - tr * 0.5).max(lo);
+        let radio_cut = (fs_out * 0.5).clamp(lo, hi);
+        let taps = lowpass_taps(radio_cut, self.fs_in as f32, RADIO_TAPS);
+        self.response.iter_mut().for_each(|v| *v = Complex32::new(0.0, 0.0));
+        for (dst, &t) in self.response.iter_mut().zip(&taps) {
+            dst.re = t;
+        }
+        let fft = FftPlanner::new().plan_fft_forward(CHAN_N);
+        fft.process(&mut self.response);
+        // Everything the filter has already removed contributes nothing to
+        // the fold. 100 dB below the passband is far past what the taps'
+        // own stopband reaches.
+        let peak = self.response.iter().map(|v| v.norm()).fold(0.0f32, f32::max);
+        let floor = peak * 1e-5;
+        self.active.clear();
+        self.active
+            .extend((0..CHAN_N).filter(|&k| self.response[k].norm() > floor));
+
+        let want_tr = (0.03 * bw).max(0.01 * fs_out);
+        let ntaps = taps_for_transition(fs_out, want_tr, AUDIO_TAPS_MIN, AUDIO_TAPS_MAX);
+        self.audio.set_taps(half, fs_out, ntaps);
+    }
+
+    /// Filter one shared frame down to this tap's channel, appending audio.
+    pub fn process_frame(&mut self, spec: &[Complex32], start: u64, out: &mut Vec<Complex32>) {
+        let n = CHAN_N;
+        // Rotating the shared spectrum by k0 bins *is* the frequency shift,
+        // and folding it onto `m` bins is the decimation: sample the result
+        // every D samples and the bins alias exactly this way. Both together
+        // reduce a tap to one pass over the hundred-odd bins its filter
+        // actually passes, plus a short inverse transform.
+        let k0 = self.k0.rem_euclid(n as isize) as usize;
+        self.folded.iter_mut().for_each(|v| *v = Complex32::new(0.0, 0.0));
+        if self.fold {
+            for &k in &self.active {
+                let src = k + k0;
+                let src = if src >= n { src - n } else { src };
+                self.folded[k % self.m] += spec[src] * self.response[k];
+            }
+        } else {
+            for &k in &self.active {
+                let src = k + k0;
+                let src = if src >= n { src - n } else { src };
+                self.folded[k] = spec[src] * self.response[k];
+            }
+        }
+        self.ifft.process(&mut self.folded);
+
+        // The rotation was taken about the frame's own origin, but the signal
+        // does not restart at each frame: the shift has to be referred to
+        // absolute time, which is one phase per frame.
+        let ang = -2.0 * std::f32::consts::PI
+            * (self.k0 as f64 * (start % n as u64) as f64 / n as f64) as f32;
+        let block_phase = Complex32::from_polar(1.0 / n as f32, ang);
+
+        // Overlap-save: only the tail of the frame is free of wrap-around.
+        self.decimated.clear();
+        if self.fold {
+            let first = (n - self.hop) / self.decim;
+            for r in first..self.m {
+                let v = self.folded[r] * block_phase * self.res_rot.next();
+                if self.warm > 0 {
+                    self.warm -= 1;
+                    continue;
+                }
+                self.decimated.push(v);
+            }
+        } else {
+            for i in (n - self.hop)..n {
+                let v = self.folded[i] * block_phase * self.res_rot.next();
+                if self.warm > 0 {
+                    self.warm -= 1;
+                    continue;
+                }
+                if self.dec_phase == 0 {
+                    self.decimated.push(v);
+                }
+                self.dec_phase += 1;
+                if self.dec_phase == self.decim {
+                    self.dec_phase = 0;
+                }
+            }
+        }
+        let mut audio = Vec::new();
+        let decimated = std::mem::take(&mut self.decimated);
+        self.audio.process(&decimated, &mut audio);
+        self.decimated = decimated;
+        out.extend_from_slice(&audio);
+    }
+}
+
 /// Hang AGC for the decoder path. Measures each block, ducks quickly when
 /// the signal is hot, then holds and only creeps gain back up after a hang
 /// so static crashes and FT8 bursts do not pump the audio.
@@ -789,6 +1170,84 @@ impl OnePole {
 mod tests {
     use super::*;
 
+    /// Run pure noise through `Spectrum` into `NoiseFloor` at a given rate
+    /// and block size, and return (settled floor, true mean) in dB.
+    fn settled_floor(fs: f64, block: usize, fft: usize, secs: f64) -> (f32, f32) {
+        let mut rng = 0x5eed_1234u32;
+        let n = (fs * secs) as usize;
+        let iq: Vec<Complex32> = (0..n)
+            .map(|_| Complex32::new(frontend_tests::noise(&mut rng), frontend_tests::noise(&mut rng)))
+            .collect();
+        let mut spec = Spectrum::new(fft);
+        let mut nf = NoiseFloor::new();
+        let mut power = Vec::new();
+        let mut dt = 0.0f32;
+        let mut floor_mean = 0.0f32;
+        // One periodogram is a single noisy draw per bin — at a large FFT
+        // only one Welch segment fits in a block — so the reference is
+        // averaged over the settled tail rather than read off the last one.
+        let mut ref_sum = 0.0f64;
+        let mut ref_n = 0usize;
+        let total = iq.len() / block;
+        for (b, chunk) in iq.chunks(block).enumerate() {
+            let fresh = spec.power_db(chunk, &mut power);
+            dt += chunk.len() as f32 / fs as f32;
+            if fresh {
+                nf.update(&power, dt);
+                dt = 0.0;
+                let f = nf.level();
+                floor_mean = f.iter().sum::<f32>() / f.len() as f32;
+                if b * 3 >= total * 2 {
+                    ref_sum += (power.iter().sum::<f32>() / power.len() as f32) as f64;
+                    ref_n += 1;
+                }
+            }
+        }
+        (floor_mean, (ref_sum / ref_n.max(1) as f64) as f32)
+    }
+
+    /// The tracker's memory must be a length of time, not a number of calls.
+    ///
+    /// These coefficients used to be applied per `feed`, and `feed` runs once
+    /// per IQ block — so doubling the sample rate halved every time constant
+    /// and moved a detection threshold that nothing had asked to move.
+    #[test]
+    fn noise_floor_settles_the_same_at_any_sample_rate() {
+        let (a, _) = settled_floor(192_000.0, 16_384, 8192, 60.0);
+        let (b, _) = settled_floor(384_000.0, 16_384, 8192, 60.0);
+        assert!(
+            (a - b).abs() < 0.5,
+            "floor settled at {a:.2} dB at 192 kS/s but {b:.2} dB at 384 kS/s"
+        );
+    }
+
+    /// And once the bias is put back, it must read as the noise level rather
+    /// than as some number below it.
+    #[test]
+    fn noise_floor_reads_the_actual_noise_level() {
+        let (floor, mean) = settled_floor(192_000.0, 16_384, 8192, 60.0);
+        assert!(
+            (floor - mean).abs() < 2.0,
+            "floor settled {:.2} dB from the true noise level ({floor:.2} vs {mean:.2}); \
+             the bias correction is not doing its job",
+            floor - mean
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_noise_floor_bias() {
+        for (fs, label) in [(192_000.0f64, "192 kS/s"), (384_000.0, "384 kS/s")] {
+            for fft in [4096usize, 8192, 32768] {
+                let (floor, mean) = settled_floor(fs, 16_384, fft, 60.0);
+                println!(
+                    "  {label}, {fft}-point: floor {floor:6.2} dB, mean {mean:6.2} dB, residual {:+.2} dB",
+                    floor - mean
+                );
+            }
+        }
+    }
+
     #[test]
     fn smooth_bins_keeps_a_peak_and_calms_the_floor() {
         let mut src = vec![-80.0f32; 32];
@@ -882,6 +1341,78 @@ mod tests {
         assert!(
             (tone_pwr_out / tone_pwr_in - 1.0).abs() < 0.20,
             "tone altered significantly: {tone_pwr_in} -> {tone_pwr_out}"
+        );
+    }
+
+    /// A tap has to be the chain it replaces.
+    ///
+    /// The whole point is that twenty-four decoders can share one transform,
+    /// which is only worth anything if what each of them gets out is what it
+    /// got before. A tone somewhere in the span, tuned by both paths, has to
+    /// come out at the same frequency and the same amplitude.
+    #[test]
+    fn a_channel_tap_matches_the_chain_it_replaces() {
+        let fs = 192_000.0f64;
+        let offset = 37_500.0f64;
+        let n = 400_000usize;
+        let mut rng = 0x77aa_1133u32;
+        // A tone at the tuned offset, plus noise and a strong neighbour that
+        // both filters have to reject.
+        let iq: Vec<Complex32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / fs as f32;
+                Complex32::from_polar(0.3, 2.0 * PI * offset as f32 * t)
+                    + Complex32::from_polar(3.0, 2.0 * PI * (offset as f32 + 9000.0) * t)
+                    + Complex32::new(frontend_tests::noise(&mut rng), frontend_tests::noise(&mut rng)) * 0.02
+            })
+            .collect();
+
+        let mut chain = DecodeChain::new(fs, 400.0, 8000.0);
+        chain.set_offset(offset);
+        let mut chain_out = Vec::new();
+        let mut scratch = Vec::new();
+        for c in iq.chunks(16_384) {
+            chain.process(c, &mut scratch);
+            chain_out.extend_from_slice(&scratch);
+        }
+
+        let mut ch = Channelizer::new(fs);
+        let mut tap = ChannelTap::new(fs, 400.0, 8000.0, ch.hop());
+        tap.set_offset(offset);
+        let mut tap_out = Vec::new();
+        for c in iq.chunks(16_384) {
+            let frames = ch.push(c);
+            for f in 0..frames {
+                let (spec, start) = ch.frame(f);
+                tap.process_frame(spec, start, &mut tap_out);
+            }
+        }
+
+        // The two buffer internally at different block sizes, so they can
+        // finish up to one audio-FIR block apart; what matters is that the
+        // tap keeps up with the stream rather than quietly losing samples.
+        assert!(
+            tap_out.len() as f32 > chain_out.len() as f32 * 0.9,
+            "tap emitted {} samples against the chain's {}",
+            tap_out.len(),
+            chain_out.len()
+        );
+        // The tuned tone must land at DC in both, at the same level.
+        let take = tap_out.len().min(chain_out.len());
+        let lo = take / 3;
+        let p_chain = frontend_tests::power_at(&chain_out[lo..take], 8000.0, 0.0);
+        let p_tap = frontend_tests::power_at(&tap_out[lo..take], 8000.0, 0.0);
+        let db = 10.0 * (p_tap / p_chain.max(1e-30)).log10();
+        assert!(
+            db.abs() < 0.5,
+            "tap delivered the tuned tone {db:+.2} dB against the chain ({p_chain:.6} vs {p_tap:.6})"
+        );
+        // ...and the strong neighbour must be just as absent from both.
+        let n_chain = frontend_tests::power_at(&chain_out[lo..take], 8000.0, 1000.0);
+        let n_tap = frontend_tests::power_at(&tap_out[lo..take], 8000.0, 1000.0);
+        assert!(
+            n_tap <= n_chain * 4.0 + 1e-12,
+            "tap let through more of the neighbour than the chain ({n_chain:.3e} vs {n_tap:.3e})"
         );
     }
 
@@ -1030,13 +1561,17 @@ pub struct NoiseBlanker {
     fs: f32,
     background: f32,
     level: u8,
-    tail: usize,
     window_seen: usize,
     window_blanked: usize,
     window_triggers: usize,
     last_rate: usize,
     inhibited: bool,
     trained: usize,
+    /// Which samples of the current block are to be replaced.
+    mask: Vec<bool>,
+    /// Last sample that survived, so a run reaching a block edge has
+    /// something to interpolate from.
+    last_good: Complex32,
 }
 
 impl NoiseBlanker {
@@ -1045,13 +1580,14 @@ impl NoiseBlanker {
             fs: fs as f32,
             background: 1e-3,
             level: 2,
-            tail: 0,
             window_seen: 0,
             window_blanked: 0,
             window_triggers: 0,
             last_rate: 0,
             inhibited: false,
             trained: 0,
+            mask: Vec::new(),
+            last_good: Complex32::new(0.0, 0.0),
         }
     }
 
@@ -1072,8 +1608,16 @@ impl NoiseBlanker {
     fn process(&mut self, iq: &mut [Complex32]) {
         let a = 1.0 - (-1.0 / (0.075 * self.fs)).exp();
         let threshold = [f32::INFINITY, 6.0, 5.0, 4.0][self.level as usize];
-        for i in 0..iq.len() {
-            let mag = iq[i].norm();
+        let n = iq.len();
+        if n == 0 {
+            return;
+        }
+        // Detection first, over the untouched block, so the background is
+        // never measured against samples the blanker has already altered.
+        self.mask.clear();
+        self.mask.resize(n, false);
+        for (i, sample) in iq.iter().enumerate() {
+            let mag = sample.norm();
             if self.trained == 0 {
                 self.background = mag.max(1e-6);
             }
@@ -1091,24 +1635,12 @@ impl NoiseBlanker {
             if trigger {
                 self.window_triggers += 1;
             }
-            let hot = trigger && !self.inhibited;
-            if hot {
-                for back in 0..=2 {
-                    if let Some(s) = i.checked_sub(back).and_then(|j| iq.get_mut(j)) {
-                        if s.norm_sqr() != 0.0 {
-                            *s = Complex32::new(0.0, 0.0);
-                            self.window_blanked += 1;
-                        }
-                    }
+            if trigger && !self.inhibited {
+                // An impulse has skirts: the samples either side of the one
+                // that tripped are already contaminated.
+                for j in i.saturating_sub(2)..=(i + 2).min(n - 1) {
+                    self.mask[j] = true;
                 }
-                self.tail = 3;
-            } else if self.tail > 0 {
-                // Raised-cosine-like return to full amplitude prevents the
-                // blanking edge itself from becoming a broadband click.
-                let weight = [1.0, 0.75, 0.25, 0.0][self.tail];
-                iq[i] *= weight;
-                self.window_blanked += 1;
-                self.tail -= 1;
             }
             self.window_seen += 1;
             self.trained = self.trained.saturating_add(1);
@@ -1120,6 +1652,33 @@ impl NoiseBlanker {
                 self.window_triggers = 0;
             }
         }
+
+        // Then replace each run by a straight line between the last good
+        // sample before it and the first after. Zeroing a run instead leaves
+        // a rectangular hole, and a hole is a step at each end — which the
+        // narrow channel filters downstream ring on, turning a four-sample
+        // impulse into a many-millisecond thump of a different shape.
+        let mut i = 0;
+        while i < n {
+            if !self.mask[i] {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < n && self.mask[i] {
+                i += 1;
+            }
+            let end = i;
+            let before = if start > 0 { iq[start - 1] } else { self.last_good };
+            let after = if end < n { iq[end] } else { before };
+            let span = (end - start + 1) as f32;
+            for (k, j) in (start..end).enumerate() {
+                let t = (k + 1) as f32 / span;
+                iq[j] = before * (1.0 - t) + after * t;
+            }
+            self.window_blanked += end - start;
+        }
+        self.last_good = iq[n - 1];
     }
 }
 
@@ -1197,8 +1756,12 @@ impl FrontEnd {
         }
 
         self.warm = self.warm.saturating_add(iq.len() as u32);
-        self.correct_images(iq);
+        // Blank *before* estimating the image correction. An impulse is
+        // broadband and, by definition, the loudest thing in the block, so
+        // leaving it in means the cross-correlation the imbalance estimate is
+        // built from is dominated by something that is not a signal at all.
         self.blanker.process(iq);
+        self.correct_images(iq);
     }
 
     fn correct_block(&mut self, block: &mut [Complex32]) {
@@ -1257,8 +1820,26 @@ impl FrontEnd {
 
     fn correct_images(&mut self, iq: &mut [Complex32]) {
         const N: usize = 4096;
-        for block in iq.chunks_exact_mut(N) {
+        let mut chunks = iq.chunks_exact_mut(N);
+        for block in chunks.by_ref() {
             self.correct_block(block);
+        }
+        // Whatever is left over is shorter than the transform, and it used to
+        // be passed through with no correction at all — silently, and
+        // depending on a block size chosen three files away. The per-band
+        // solve cannot run on it, but the bands it has already learned can
+        // still be applied as their mean, which is exactly the scalar
+        // correction this front end used to do for everything.
+        let tail = chunks.into_remainder();
+        if !tail.is_empty() && self.warm >= self.settle {
+            let mut mean = Complex32::new(0.0, 0.0);
+            for a in &self.image {
+                mean += *a;
+            }
+            mean /= self.image.len() as f32;
+            for s in tail.iter_mut() {
+                *s -= mean * s.conj();
+            }
         }
     }
 }
@@ -1346,7 +1927,11 @@ pub(crate) mod frontend_tests {
         let mut nb = NoiseBlanker::new(fs as f64);
         for block in blanked.chunks_mut(4096) { nb.process(block); }
         let improvement = 10.0 * (error_power(&dirty, &clean) / error_power(&blanked, &clean)).log10();
-        assert!(improvement >= 10.0, "impulse error improved only {improvement:.1} dB");
+        // Interpolating across a blanked run rather than zeroing it is worth
+        // about 2 dB of this on its own: a zeroed run is a rectangular hole,
+        // and its edges are steps that the narrow channel filters downstream
+        // ring on.
+        assert!(improvement >= 12.0, "impulse error improved only {improvement:.1} dB");
 
         let (_, mut untouched) = impulse_case(fs, false);
         let before = power_at(&untouched, fs, 1500.0);
@@ -1460,6 +2045,61 @@ pub(crate) mod frontend_tests {
         let scalar_rej = worst_rejection(&scalar, fs, hz);
         let per_band = worst_rejection(&run_subband_only(&iq, fs), fs, hz);
         println!("frequency-dependent IQ: worst-band scalar {scalar_rej:.1} dB, 12-band {per_band:.1} dB ({:.1} dB gain)", per_band - scalar_rej);
+    }
+
+    /// The same frequency-dependent imbalance, with static crashes on top.
+    fn imbalance_with_impulses(fs: f32) -> (Vec<Complex32>, [f32; 2]) {
+        let (mut iq, hz) = frequency_dependent_case(fs);
+        for (i, s) in iq.iter_mut().enumerate() {
+            if i > fs as usize / 10 && i % 1700 < 4 {
+                *s += Complex32::new(9.0, -7.0);
+            }
+        }
+        (iq, hz)
+    }
+
+    /// The whole front end, blanker included, in the blocks the app uses.
+    fn run_full(iq: &[Complex32], fs: f32) -> Vec<Complex32> {
+        let mut fe = FrontEnd::new(fs as f64);
+        let mut out = Vec::new();
+        for chunk in iq.chunks(16_384) {
+            let mut block = chunk.to_vec();
+            fe.process(&mut block);
+            out.extend(block);
+        }
+        out.split_off(out.len() * 3 / 4)
+    }
+
+    /// Order matters: blank, then estimate the imbalance.
+    ///
+    /// The image estimate is a cross-correlation between each bin and the
+    /// conjugate of its mirror, accumulated over whole blocks. An impulse is
+    /// broadband and is the loudest thing in the block by a wide margin, so
+    /// running the estimator over unblanked IQ builds the correction mostly
+    /// out of static crashes — and the correction is then applied to every
+    /// sample, all the time, on a band where crashes are what HF sounds like.
+    #[test]
+    fn impulses_do_not_poison_the_image_estimate() {
+        let fs = 48_000.0;
+        let (iq, hz) = imbalance_with_impulses(fs);
+        let rej = worst_rejection(&run_full(&iq, fs), fs, hz);
+        assert!(
+            rej >= 40.0,
+            "image rejection through static crashes was only {rej:.1} dB"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_blank_before_image_estimate() {
+        let fs = 48_000.0;
+        let (iq, hz) = imbalance_with_impulses(fs);
+        let rej = worst_rejection(&run_full(&iq, fs), fs, hz);
+        let (clean, _) = frequency_dependent_case(fs);
+        let clean_rej = worst_rejection(&run_full(&clean, fs), fs, hz);
+        println!(
+            "worst-band image rejection: {clean_rej:.1} dB without impulses, {rej:.1} dB with them"
+        );
     }
 
     /// And clean IQ must come out unharmed — the correction has to be a

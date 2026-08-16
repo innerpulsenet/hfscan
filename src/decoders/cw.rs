@@ -8,7 +8,7 @@
 
 use super::callscan::{utc_hhmmss, CallScanner};
 use super::{CwView, Decoder, FtMessage};
-use crate::dsp::{mix_decim, OnePole};
+use crate::dsp::{mix_decim, OnePole, Rotator};
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::collections::VecDeque;
@@ -51,6 +51,38 @@ const SETTLE_MS: u32 = 60;
 const POST_MIX_HZ: f32 = 150.0;
 const POST_MIX_POLES: usize = 4;
 
+/// Corner frequency per second of dit, once the clock is known.
+///
+/// 150 Hz is the right answer only for a fist fast enough to need it. A
+/// four-pole 150 Hz filter passes about 147 Hz of noise, while the keying it
+/// has to carry occupies roughly `2/T` — 33 Hz at 20 WPM. That gap is the
+/// single largest weak-signal loss in this decoder: measured, narrowing the
+/// filter onto the tracked clock takes 20 WPM copy at 0 dB from 15% to 60%,
+/// and 25 WPM from 20% to 65%, with no cost at any SNR above it.
+///
+/// The constant is a bandwidth-per-baud, not a frequency: `K / dit_seconds`
+/// gives 37 Hz at 18 WPM and 73 Hz at 35 WPM, which is what the sweep across
+/// both speeds asked for. Measured at 2.0, 2.5 and 3.0; 2.5 was the value
+/// that cost nothing at 20 dB and gained the most at 0.
+const POST_MIX_K: f32 = 2.5;
+/// The narrowest the filter is ever allowed to get.
+///
+/// This is a safety floor, not a tuning parameter, and it is set by a failure
+/// mode rather than by a measurement. Narrowing onto the tracked clock closes
+/// a loop through the very estimator that sets it: if the filter is ever too
+/// narrow for the fist actually being sent, the keying smears, the marks
+/// merge, the clock reads *slower* — and a slower clock asks for a narrower
+/// filter still. A station going from 15 to 32 WPM drove exactly that spiral
+/// down to a 7.9 WPM estimate with no way back out.
+///
+/// 70 Hz is wide enough for any fist up to about 34 WPM, so the loop can only
+/// ever run in the safe direction — widening. It also happens to bank almost
+/// all of the available gain: measured against the adaptive corner, a fixed
+/// 70 Hz gives 60%/65% copy at 0 dB for 18/25 WPM against the adaptive
+/// version's 55%/70%. Above 34 WPM the corner opens beyond this and the
+/// clock match earns its keep, in the direction that cannot trap.
+const POST_MIX_MIN_HZ: f32 = 70.0;
+
 /// Cascaded complex one-poles: the post-mix channel filter.
 struct NarrowLpf {
     z: [Complex32; POST_MIX_POLES],
@@ -76,6 +108,12 @@ impl NarrowLpf {
 
     fn reset(&mut self) {
         self.z = [Complex32::new(0.0, 0.0); POST_MIX_POLES];
+    }
+
+    /// Retune the corner, keeping the filter state so the change does not
+    /// click. Only called when the tracked speed has moved materially.
+    fn set_corner(&mut self, hz: f32, fs: f32) {
+        self.a = 1.0 - (-2.0 * PI * hz / fs).exp();
     }
 }
 
@@ -232,9 +270,15 @@ pub struct CwDecoder {
     hold_tune: u32,
 
     mix_hz: f32,
-    mix_phase: f32,
-    /// Rejects the neighbours the 400 Hz chain filter lets through.
+    /// Mixer that brings the locked tone to DC. A rotator rather than a
+    /// `sin_cos` per audio sample, retuned in place when the lock moves.
+    mix_rot: Rotator,
+    mix_rate_hz: f32,
+    /// Rejects the neighbours the 400 Hz chain filter lets through, and the
+    /// noise outside the keying bandwidth once the clock is known.
     post: NarrowLpf,
+    /// Corner currently programmed into `post`.
+    post_hz: f32,
     locked: bool,
     lock_score: f32,
     hits: Vec<CwHit>,
@@ -263,6 +307,7 @@ impl CwDecoder {
             matched: VecDeque::new(),
             matched_sum: 0.0,
             post: NarrowLpf::new(fs),
+            post_hz: POST_MIX_HZ,
             peak: 0.0,
             floor: 0.0,
             peak_decay: 1.0 - (-1.0f32 / (2.5 * env_rate)).exp(),
@@ -297,7 +342,8 @@ impl CwDecoder {
             settle: SETTLE_MS,
             hold_tune: 0,
             mix_hz: 0.0,
-            mix_phase: 0.0,
+            mix_rot: Rotator::new(0.0),
+            mix_rate_hz: 0.0,
             locked: false,
             lock_score: 0.0,
             hits: Vec::new(),
@@ -322,14 +368,30 @@ impl CwDecoder {
         if self.mix_hz.abs() < 0.05 {
             return s;
         }
-        let (sin, cos) = self.mix_phase.sin_cos();
-        self.mix_phase += -2.0 * PI * self.mix_hz / self.fs;
-        if self.mix_phase > PI {
-            self.mix_phase -= 2.0 * PI;
-        } else if self.mix_phase < -PI {
-            self.mix_phase += 2.0 * PI;
+        if (self.mix_hz - self.mix_rate_hz).abs() > 0.01 {
+            self.mix_rate_hz = self.mix_hz;
+            self.mix_rot.set_rate(-2.0 * PI * self.mix_hz / self.fs);
         }
-        s * Complex32::new(cos, sin)
+        s * self.mix_rot.next()
+    }
+
+    /// Match the post-mix filter to the tracked keying speed.
+    ///
+    /// Held wide while the clock is still being learned: a filter narrowed
+    /// onto the wrong speed distorts the very envelope the speed is estimated
+    /// from, and the decoder would have no way back out of that. The 8%
+    /// hysteresis stops an idling estimator retuning the filter every mark.
+    fn update_post_mix(&mut self) {
+        let want = if self.warming {
+            POST_MIX_HZ
+        } else {
+            let dit_s = (self.dit / self.env_rate).max(1e-3);
+            (POST_MIX_K / dit_s).clamp(POST_MIX_MIN_HZ, POST_MIX_HZ)
+        };
+        if (want - self.post_hz).abs() > 0.08 * self.post_hz {
+            self.post_hz = want;
+            self.post.set_corner(want, self.fs);
+        }
     }
 
     fn clamp_dit(&mut self) {
@@ -734,7 +796,7 @@ impl CwDecoder {
         }
         if let Some(h) = self.hits.first().cloned() {
             if (h.offset_hz - self.mix_hz).abs() > 12.0 {
-                self.mix_phase = 0.0;
+                self.mix_rot.reset_phase();
                 self.post.reset();
             }
             self.mix_hz = h.offset_hz;
@@ -767,10 +829,12 @@ impl CwDecoder {
     fn clear_lock_state(&mut self) {
         self.scan.reset();
         self.mix_hz = 0.0;
-        self.mix_phase = 0.0;
+        self.mix_rot.reset_phase();
         self.post.reset();
         self.locked = false;
         self.lock_score = 0.0;
+        self.post_hz = POST_MIX_HZ;
+        self.post.set_corner(POST_MIX_HZ, self.fs);
         self.hits.clear();
         self.search_buf.clear();
         self.since_search = 0;
@@ -801,6 +865,7 @@ impl CwDecoder {
     }
 
     fn step_envelope(&mut self, env: f32) {
+        self.update_post_mix();
         if !self.have_env {
             self.peak = env;
             self.floor = env;
@@ -966,7 +1031,7 @@ impl Decoder for CwDecoder {
             self.mix_hz = h.offset_hz;
             self.lock_score = h.score;
             self.locked = true;
-            self.mix_phase = 0.0;
+            self.mix_rot.reset_phase();
             self.post.reset();
             self.symbol.clear();
             self.acquire = 12;
@@ -1153,8 +1218,10 @@ pub fn scan_span(iq: &[Complex32], fs: f64, peaks: &[(f64, f32)]) -> Vec<CwHit> 
 /// Mix `buf` by `hz` and decide whether the envelope is keyed Morse rather
 /// than a dead carrier, noise, or PSK31. Returns (quality, snr).
 fn score_cw(buf: &[Complex32], fs: f32, hz: f32) -> Option<(f32, f32)> {
-    let step = -2.0 * PI * hz / fs;
-    let mut phase = 0.0f32;
+    // This is the scout path `Rotator` was written for: it mixes the whole
+    // buffer once per candidate, and a `sin_cos` per sample here was costing
+    // a quarter of a second per pass on a busy band.
+    let mut osc = Rotator::new(-2.0 * PI * hz / fs);
     let decim = (fs / 1000.0).round().max(1.0) as usize;
     let mut env = Vec::with_capacity(buf.len() / decim + 1);
     let mut acc = 0.0f32;
@@ -1164,9 +1231,7 @@ fn score_cw(buf: &[Complex32], fs: f32, hz: f32) -> Option<(f32, f32)> {
     let lpf_a = 1.0 - (-2.0 * PI * 180.0 / fs).exp();
     let mut lpf = Complex32::new(0.0, 0.0);
     for &s in buf {
-        let (sin, cos) = phase.sin_cos();
-        phase += step;
-        let mixed = s * Complex32::new(cos, sin);
+        let mixed = s * osc.next();
         lpf += (mixed - lpf) * lpf_a;
         acc += lpf.norm();
         n += 1;

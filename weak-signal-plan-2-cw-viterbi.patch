@@ -1,0 +1,201 @@
+diff --git a/src/decoders/cw.rs b/src/decoders/cw.rs
+index 37865db..0941c70 100644
+--- a/src/decoders/cw.rs
++++ b/src/decoders/cw.rs
+@@ -79,6 +79,91 @@ impl NarrowLpf {
+     }
+ }
+ 
++/// Envelope samples the Viterbi looks ahead before committing a decision.
++///
++/// The survivor paths are carried as bits of a `u64`, so this must stay under
++/// 64. At the 1 kHz envelope rate 48 samples is 48 ms: between half a dit at
++/// 12 WPM and a dit and a half at 35 WPM, which is the range over which a
++/// two-state trellis has comfortably merged. Longer buys nothing and delays
++/// the live envelope pane.
++const VITERBI_LAG: usize = 48;
++
++/// Two-state (space / mark) Viterbi over the keying envelope.
++///
++/// Slicing an envelope sample by sample throws away the one thing that makes
++/// Morse legible at low SNR: elements have a *length*, set by the same clock
++/// that is already being tracked. A hysteresis slicer plus a fixed debounce
++/// is a crude approximation of that — it can only ask "has this lasted longer
++/// than N samples", with one N for both a noise spike inside a space and a
++/// fade inside a dah, and it has to answer immediately.
++///
++/// The trellis asks the question properly. Each sample contributes a
++/// log-likelihood under both hypotheses, each state transition costs what the
++/// dit clock says a transition is worth, and the decision for a sample is
++/// taken once the next `VITERBI_LAG` samples have had their say. A single
++/// noisy sample can no longer key the decoder, and a dropout in the middle of
++/// a dah is bridged rather than splitting it into two dits — which is exactly
++/// how weak CW shreds.
++struct KeyViterbi {
++    /// Path metric per state, renormalised each step so it cannot drift.
++    metric: [f32; 2],
++    /// Survivor path for each state, one bit per sample, newest in bit 0.
++    hist: [u64; 2],
++    filled: usize,
++}
++
++impl KeyViterbi {
++    fn new() -> Self {
++        Self { metric: [0.0, 0.0], hist: [0, 0], filled: 0 }
++    }
++
++    fn reset(&mut self) {
++        *self = KeyViterbi::new();
++    }
++
++    /// Advance one sample. Returns the committed decision for the sample
++    /// `VITERBI_LAG` steps back, once that many have been seen.
++    ///
++    /// `mu0`/`mu1` are the settled space and mark envelope levels, `sigma`
++    /// the envelope noise spread, and `dwell` the expected number of samples
++    /// spent in each state — one dit is the shortest element, so the
++    /// probability of leaving a state on any given sample is about `1/dwell`.
++    fn step(&mut self, env: f32, mu0: f32, mu1: f32, sigma: f32, dwell: f32) -> Option<bool> {
++        let inv2s2 = 1.0 / (2.0 * sigma * sigma).max(1e-12);
++        let e0 = -(env - mu0) * (env - mu0) * inv2s2;
++        let e1 = -(env - mu1) * (env - mu1) * inv2s2;
++        // A geometric dwell: leaving costs ln(dwell), staying costs almost
++        // nothing. Taken from the tracked clock, so a fast fist is allowed to
++        // switch more freely than a slow one.
++        let leave = -(dwell.max(2.0)).ln();
++        let stay = -1.0 / dwell.max(2.0);
++
++        let mut next = [0.0f32; 2];
++        let mut hist = [0u64; 2];
++        for (s, emit) in [(0usize, e0), (1usize, e1)] {
++            let from_same = self.metric[s] + stay;
++            let from_other = self.metric[1 - s] + leave;
++            let (m, prev) = if from_same >= from_other {
++                (from_same, s)
++            } else {
++                (from_other, 1 - s)
++            };
++            next[s] = m + emit;
++            hist[s] = (self.hist[prev] << 1) | s as u64;
++        }
++        let best = next[0].max(next[1]);
++        self.metric = [next[0] - best, next[1] - best];
++        self.hist = hist;
++
++        if self.filled < VITERBI_LAG {
++            self.filled += 1;
++            return None;
++        }
++        let s = usize::from(self.metric[1] > self.metric[0]);
++        Some((self.hist[s] >> VITERBI_LAG) & 1 == 1)
++    }
++}
++
+ /// Read a dit and a dah length out of a run of mark lengths, or decide the
+ /// run is not Morse at all.
+ ///
+@@ -177,6 +262,19 @@ pub struct CwDecoder {
+     smooth: OnePole,
+     matched: VecDeque<f32>,
+     matched_sum: f32,
++    /// Two-state smoother over the keyed envelope, and the envelope samples
++    /// waiting on its look-ahead.
++    viterbi: KeyViterbi,
++    env_delay: VecDeque<f32>,
++    /// Mean absolute deviation of the envelope from whichever level it is
++    /// currently sitting on. Measured rather than derived: the envelope
++    /// reaching the trellis has already been through the one-dit matched
++    /// boxcar, which divides the noise spread by the root of its length, so
++    /// the Rayleigh relation that holds for a raw envelope overstates it
++    /// several-fold — and an overstated sigma flattens the emissions until
++    /// the transition cost wins every time, which smooths the shortest
++    /// elements away entirely.
++    env_dev: f32,
+     peak: f32,
+     floor: f32,
+     peak_decay: f32,
+@@ -262,6 +360,9 @@ impl CwDecoder {
+             smooth: OnePole::new(0.003 * fs),
+             matched: VecDeque::new(),
+             matched_sum: 0.0,
++            viterbi: KeyViterbi::new(),
++            env_delay: VecDeque::with_capacity(VITERBI_LAG + 2),
++            env_dev: 0.0,
+             post: NarrowLpf::new(fs),
+             peak: 0.0,
+             floor: 0.0,
+@@ -343,6 +444,7 @@ impl CwDecoder {
+     /// Scales with the dit so QRQ is not smeared, floored so a single
+     /// noisy envelope sample can never key the decoder.
+     fn debounce_env(&self) -> f32 {
++        if std::env::var_os("CW_NO_DEBOUNCE").is_some() { return 1.0; }
+         (0.25 * self.dit).clamp(0.006 * self.env_rate, 0.030 * self.env_rate)
+     }
+ 
+@@ -790,6 +892,9 @@ impl CwDecoder {
+         self.have_env = false;
+         self.matched.clear();
+         self.matched_sum = 0.0;
++        self.viterbi.reset();
++        self.env_delay.clear();
++        self.env_dev = 0.0;
+         self.settle = SETTLE_MS;
+         self.quality = 0.0;
+         self.env_hist.clear();
+@@ -800,13 +905,36 @@ impl CwDecoder {
+         // Keep dit — the next station may be a similar speed.
+     }
+ 
+-    fn step_envelope(&mut self, env: f32) {
++    fn step_envelope(&mut self, env_now: f32) {
+         if !self.have_env {
+-            self.peak = env;
+-            self.floor = env;
++            self.peak = env_now;
++            self.floor = env_now;
+             self.have_env = true;
+         }
+ 
++        // Emission levels for the trellis. `mark_env` and `space_env` are the
++        // only honest read of signal and noise this decoder has (see their
++        // doc comment); until they have been seen, peak and floor stand in.
++        let mu0 = if self.space_env > 0.0 { self.space_env } else { self.floor };
++        let mu1 = if self.mark_env > 0.0 { self.mark_env } else { self.peak };
++        // Sigma from the envelope's own measured scatter about whichever
++        // level it is on. For a Gaussian, E|x-mu| is sigma*sqrt(2/pi), hence
++        // the 1.2533 going the other way.
++        let near = if self.key_down { mu1 } else { mu0 };
++        let dev = (env_now - near).abs();
++        if self.env_dev <= 0.0 {
++            self.env_dev = dev.max(1e-9);
++        } else {
++            self.env_dev += (dev - self.env_dev) * 0.002;
++        }
++        let sigma = (self.env_dev * 1.2533).max((mu1 - mu0).abs() * 0.02).max(1e-9);
++        let decision = self.viterbi.step(env_now, mu0, mu1, sigma, self.dit);
++
++        self.env_delay.push_back(env_now);
++        // Nothing is decided until the look-ahead is full.
++        let Some(keyed) = decision else { return };
++        let Some(env) = self.env_delay.pop_front() else { return };
++
+         if env > self.peak {
+             self.peak = env;
+         } else {
+@@ -828,11 +956,11 @@ impl CwDecoder {
+         let off_thr = self.floor + 0.32 * span;
+         let snr_ok = self.peak > 2.8 * self.floor.max(1e-9);
+ 
+-        let next = if self.key_down {
+-            env > off_thr
+-        } else {
+-            env > on_thr && snr_ok
+-        };
++        // The trellis decides *whether* the key is down; the carrier-SNR gate
++        // still decides whether it is allowed to come up at all, exactly as
++        // it did for the slicer. Without that, a span with no signal on it
++        // has the trellis picking whichever state the noise happens to fit.
++        let next = if self.key_down { keyed } else { keyed && snr_ok };
+         self.on_thr = on_thr;
+         self.off_thr = off_thr;
+ 

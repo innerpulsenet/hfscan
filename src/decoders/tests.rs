@@ -529,6 +529,52 @@ fn rtty_matched_filters_survive_selective_fading() {
     assert!(out.contains("TEST"), "-20 dB space fade was not copyable: {out:?} ({})", d.status());
 }
 
+/// `snr_scale` for a wanted SNR in dB measured in the bit-rate bandwidth —
+/// 45.45 Hz, which is the noise bandwidth a matched filter for one bit has,
+/// and therefore the figure the demodulator's own performance is set by.
+fn rtty_scale_for_snr(db: f32) -> f32 {
+    let n_total = (1.0f32 / 6.0).sqrt();
+    let in_bw = n_total * (45.45 / FS as f32).sqrt();
+    let wanted = 10f32.powf(-db / 20.0);
+    wanted / in_bw
+}
+
+/// The tone filters have to be matched to a bit.
+///
+/// What stood here was a one-pole leaky integrator with a time constant of a
+/// third of a bit — several times the noise bandwidth the signal occupies,
+/// and most of the coherent gain an FSK tone offers thrown away. Replacing it
+/// with an integrate-and-dump across exactly one bit, dumped on the framer's
+/// own boundary, took 12 dB copy from 73% to 95% and 8 dB from 32% to 50%.
+#[test]
+fn rtty_copies_at_twelve_db() {
+    let msg = "RYRY CQ DE W1AW W1AW K";
+    let sig = gen_rtty_snr(msg, 45.45, 170.0, rtty_scale_for_snr(12.0));
+    let got = decode_rtty(&sig);
+    let acc = accuracy(msg, &got);
+    assert!(
+        acc >= 0.85,
+        "12 dB RTTY copied {:.0}%, was 73% with the leaky integrator: {got:?}",
+        acc * 100.0
+    );
+}
+
+#[test]
+#[ignore]
+fn bench_rtty_snr() {
+    let msg = "RYRY CQ DE W1AW W1AW K";
+    println!("\nsent: {msg:?}");
+    println!("\n== character accuracy by SNR (in 45.45 Hz) ==");
+    for db in [20, 15, 12, 10, 8, 6, 4, 2] {
+        let sig = gen_rtty_snr(msg, 45.45, 170.0, rtty_scale_for_snr(db as f32));
+        let got = decode_rtty(&sig);
+        println!(
+            "  {db:>2} dB  {:>5}  {got:?}",
+            format!("{:.0}%", accuracy(msg, &got) * 100.0)
+        );
+    }
+}
+
 #[test]
 #[ignore]
 fn bench_rtty_matched_filter_fade() {
@@ -1215,6 +1261,43 @@ fn bench_cw_neighbour() {
     }
 }
 
+/// The post-mix filter has to be sized for the fist, not for the fastest
+/// fist imaginable.
+///
+/// A four-pole 150 Hz filter passes ~147 Hz of noise to the envelope
+/// detector while a 20 WPM signal's keying occupies about 33 Hz. That is
+/// most of a 6 dB gap, and it showed up exactly where it should: copy held
+/// at 90% down to 3 dB and then collapsed to 15-20% at 0 dB, which is a
+/// signal-to-noise wall rather than anything about Morse.
+///
+/// Narrowing onto the tracked clock (floored at `POST_MIX_MIN_HZ`, for the
+/// spiral described there) is worth about 3 dB of copy threshold.
+#[test]
+fn cw_copies_at_zero_db() {
+    let msg = "CQ CQ DE W1AW W1AW K";
+    for wpm in [18.0f32, 25.0] {
+        let sig = gen_cw(msg, wpm, scale_for_snr(0.0));
+        let acc = accuracy(msg, &decode_cw(&sig, 0.0));
+        assert!(
+            acc >= 0.40,
+            "{wpm:.0} WPM at 0 dB copied {:.0}%, was 15-20% before the filter matched the clock",
+            acc * 100.0
+        );
+    }
+    // ...without giving anything back where it already worked.
+    for wpm in [12.0f32, 18.0, 25.0, 35.0] {
+        for db in [15.0f32, 6.0] {
+            let sig = gen_cw(msg, wpm, scale_for_snr(db));
+            let acc = accuracy(msg, &decode_cw(&sig, 0.0));
+            assert!(
+                acc >= 0.85,
+                "{wpm:.0} WPM at {db:.0} dB regressed to {:.0}%",
+                acc * 100.0
+            );
+        }
+    }
+}
+
 #[test]
 #[ignore]
 fn bench_cw_accuracy() {
@@ -1223,13 +1306,13 @@ fn bench_cw_accuracy() {
 
     println!("== on frequency, by speed and SNR ==");
     print!("{:>6}", "WPM");
-    for db in [40, 20, 15, 10, 6, 3, 0] {
+    for db in [20, 15, 10, 6, 3, 0, -3] {
         print!("{:>8}", format!("{db}dB"));
     }
     println!();
     for wpm in [12.0f32, 18.0, 25.0, 35.0] {
         print!("{wpm:>6.0}");
-        for db in [40, 20, 15, 10, 6, 3, 0] {
+        for db in [20, 15, 10, 6, 3, 0, -3] {
             let sig = gen_cw(msg, wpm, scale_for_snr(db as f32));
             let got = decode_cw(&sig, 0.0);
             print!("{:>8}", format!("{:.0}%", accuracy(msg, &got) * 100.0));
@@ -1484,6 +1567,38 @@ fn decode_psk_dbg(sig: &[Complex32], tune: f32) -> (String, f32, bool) {
     (out.trim().to_string(), d.lock_hz(), d.locked())
 }
 
+/// PSK31 has to degrade, not stop.
+///
+/// Copy used to fall from 88% at 8 dB to *nothing* at 6 dB, and the reason
+/// was neither the demodulator nor the search: both were working. The
+/// candidate was being vetoed by `keys_at_other_baud`, which asks whether
+/// some other keying rate dominates the envelope spectrum — and on a signal
+/// too weak to raise its own 31.25 Hz line, the "other rate" was whichever
+/// noise bin happened to come top of 111 samples. The confirmation's own
+/// noise rejection then had to be carried by `DC_FOCUS_MIN` instead, which
+/// had been sitting close enough to noise to be no barrier at all.
+///
+/// 6 dB in 31 Hz is an ordinary weak PSK31 signal, well inside what the mode
+/// exists to work.
+#[test]
+fn psk31_still_copies_at_six_db() {
+    let msg = "CQ CQ DE W1AW W1AW PSE K";
+    let sig = gen_psk31_snr(msg, 0.0, psk_scale_for_snr(6.0));
+    let got = decode_psk(&sig, 0.0);
+    let acc = accuracy(msg, &got);
+    assert!(
+        acc >= 0.30,
+        "6 dB PSK31 copied {:.0}% of the message: {got:?}",
+        acc * 100.0
+    );
+    // ...and the strong cases must not have been traded away for it.
+    for db in [10.0f32, 15.0] {
+        let sig = gen_psk31_snr(msg, 0.0, psk_scale_for_snr(db));
+        let acc = accuracy(msg, &decode_psk(&sig, 0.0));
+        assert!(acc >= 0.85, "{db:.0} dB PSK31 regressed to {:.0}%", acc * 100.0);
+    }
+}
+
 #[test]
 #[ignore]
 fn bench_psk31_accuracy() {
@@ -1491,7 +1606,7 @@ fn bench_psk31_accuracy() {
     println!("\nsent: {msg:?}");
 
     println!("\n== on frequency, by SNR (in 31 Hz) ==");
-    for db in [40, 30, 20, 15, 10, 6, 3, 0] {
+    for db in [40, 30, 20, 15, 12, 10, 8, 6, 4, 2, 0] {
         let sig = gen_psk31_snr(msg, 0.0, psk_scale_for_snr(db as f32));
         let (got, lock, locked) = decode_psk_dbg(&sig, 0.0);
         println!(
@@ -1517,11 +1632,25 @@ fn bench_psk31_accuracy() {
 #[ignore]
 fn debug_psk31_gates() {
     let msg = "CQ CQ DE W1AW W1AW PSE K";
-    for db in [20, 10, 6, 3] {
-        eprintln!("--- {db} dB ---");
+    for db in [20, 12, 10, 8, 6, 4, 2, 0] {
+        eprintln!("===== {db} dB =====");
         let sig = gen_psk31_snr(msg, 0.0, psk_scale_for_snr(db as f32));
-        let got = decode_psk(&sig, 0.0);
-        eprintln!("  => {got:?}");
+        let mut d = psk31::Psk31Decoder::new(FS);
+        let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+        chain.set_offset(0.0 + d.offset_shift());
+        let mut audio = Vec::new();
+        let mut out = String::new();
+        for chunk in sig.chunks(4096) {
+            chain.process(chunk, &mut audio);
+            out.push_str(&d.process(&audio));
+        }
+        eprintln!(
+            "{db:>3} dB  conf {:.3}  locked {}  hits {:?}  => {:?}",
+            d.confidence().unwrap_or(-1.0),
+            d.locked(),
+            d.candidate_hz(),
+            out.trim()
+        );
     }
 }
 

@@ -14,7 +14,7 @@ use clap::Parser;
 use decoders::cw::{self, CwHit};
 use decoders::psk31::{self, PskHit};
 use decoders::{CwView, Decoder, FtMessage, Mode, PskView};
-use dsp::{smooth_bins, DecodeChain, SoftAgc, Spectrum};
+use dsp::{smooth_bins, ChannelTap, Channelizer, DecodeChain, SoftAgc, Spectrum};
 use num_complex::Complex32;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -159,16 +159,26 @@ const MAX_AUTO_SLOTS: usize = 24;
 /// Slots × sample rate the decode fleet may spend, which is the quantity that
 /// actually costs time.
 ///
-/// Every slot mixes and decimates from the full input rate, so its cost is
-/// linear in that rate: `bench_feed_cost_per_band` measures 24 slots at
-/// 14% of real time on a 192 kS/s span, 27% at 384 and 70% at 768. The UI is
-/// single-threaded and the radio drops blocks rather than blocking, so going
-/// much past a third of real time is dropped IQ and a stuttering waterfall.
+/// A slot's cost is linear in the input rate, so this is the quantity that
+/// actually costs time. The UI is single-threaded and the radio drops blocks
+/// rather than blocking, so going much past a third of real time is dropped
+/// IQ and a stuttering waterfall.
 ///
-/// 24 slots at 400 kS/s is that third. Below it the cap alone applies; above
-/// it the fleet shrinks so a wide span cannot outrun the stream. Nothing in
-/// the band table reaches that point — this is the guard for `--rate`.
-const SLOT_RATE_BUDGET: f64 = MAX_AUTO_SLOTS as f64 * 400_000.0;
+/// This used to sit at 24 slots × 400 kS/s, when every slot mixed and
+/// filtered the whole span for itself and a full fleet cost 14% of real time
+/// on a 192 kS/s span. Sharing one forward transform across the fleet and
+/// decimating by folding the spectrum took that to 1.8% — measured by
+/// `bench_feed_cost_per_band`, with `bench_slot_cost` putting a slot at
+/// 0.8 ms per second of IQ against the 2.9 ms it was.
+///
+/// The budget is sized for the *slower* of the two, deliberately. Folding
+/// needs the frame to divide by the decimation, which every rate in the band
+/// table does and an arbitrary `--rate` need not; a span that cannot fold
+/// costs about 96 ms per slot per second of IQ at 5 MS/s, and this guard
+/// exists precisely for the spans nobody planned. 24 slots at 700 kS/s keeps
+/// that worst case near a third of real time. Every band preset folds, and
+/// every band preset is capped by `MAX_AUTO_SLOTS` long before it gets here.
+const SLOT_RATE_BUDGET: f64 = MAX_AUTO_SLOTS as f64 * 700_000.0;
 /// Drop a narrowband slot whose signal the classifier has not seen for this
 /// long. FT8/FT4 slots are pinned to their calling frequencies instead.
 const AUTO_IDLE: Duration = Duration::from_secs(25);
@@ -319,7 +329,7 @@ struct AutoSlot {
     /// Set for FT8/FT4 slots, which are pinned to a calling frequency and
     /// must not be retired just because the band went quiet for a slot.
     pinned: bool,
-    chain: DecodeChain,
+    tap: ChannelTap,
     agc: SoftAgc,
     decoder: Box<dyn Decoder>,
     audio: Vec<Complex32>,
@@ -338,6 +348,7 @@ impl AutoSlot {
         rate: f64,
         pinned: bool,
         shift_hz: Option<f32>,
+        chan_hop: usize,
     ) -> Option<Self> {
         let mode = match kind {
             identify::Kind::Cw => Mode::Cw,
@@ -347,21 +358,21 @@ impl AutoSlot {
             identify::Kind::Ft4 => Mode::Ft4,
             _ => return None,
         };
-        let mut chain = DecodeChain::new(rate, 400.0, mode.audio_rate());
-        let mut decoder = mode.make(chain.fs_out())?;
+        let mut tap = ChannelTap::new(rate, 400.0, mode.audio_rate(), chan_hop);
+        let mut decoder = mode.make(tap.fs_out())?;
         // Before the bandwidth is read: for RTTY the shift *is* the bandwidth.
         if let Some(hz) = shift_hz {
             decoder.set_shift(hz);
         }
-        chain.set_bandwidth(decoder.bandwidth());
-        chain.set_offset(dial_hz - center + decoder.offset_shift());
+        tap.set_bandwidth(decoder.bandwidth());
+        tap.set_offset(dial_hz - center + decoder.offset_shift());
         let now = Instant::now();
         Some(Self {
             dial_hz,
             kind,
             pinned,
-            agc: SoftAgc::new(chain.fs_out()),
-            chain,
+            agc: SoftAgc::new(tap.fs_out()),
+            tap,
             decoder,
             audio: Vec::new(),
             partial: String::new(),
@@ -616,6 +627,11 @@ struct App {
 
     spectrum: Vec<f32>,
     noise_tracker: dsp::NoiseFloor,
+    /// Seconds of IQ accumulated since the last fresh periodogram.
+    spec_dt: f32,
+    /// The tracked floor with its bias put back: an actual noise level, for
+    /// the cursor SNR and the colour scale. Detection uses `noise_floor`.
+    noise_level: Vec<f32>,
     noise_floor: Vec<f32>,
     spec_work: Vec<f32>,
     smoothed: Vec<f32>,
@@ -634,6 +650,8 @@ struct App {
     mode: Mode,
     decoder: Option<Box<dyn Decoder>>,
     chain: DecodeChain,
+    /// One forward transform of the span, shared by every auto slot.
+    channelizer: Channelizer,
     text: String,
     /// One row per line of copy in `Mode::Auto`, newest last. Auto mode has
     /// many decoders talking at once, so its output is kept as records with
@@ -863,6 +881,8 @@ impl App {
             band_ifgr: bands::BANDS.iter().map(|b| b.ifgr).collect(),
             spectrum: Vec::new(),
             noise_tracker: dsp::NoiseFloor::new(),
+            spec_dt: 0.0,
+            noise_level: Vec::new(),
             noise_floor: Vec::new(),
             spec_work: Vec::new(),
             smoothed: Vec::new(),
@@ -878,6 +898,7 @@ impl App {
             mode: Mode::Off,
             decoder: None,
             chain: DecodeChain::new(rate, 400.0, Mode::Off.audio_rate()),
+            channelizer: Channelizer::new(rate),
             text: String::new(),
             decode_log: VecDeque::new(),
             front: dsp::FrontEnd::new(rate),
@@ -1278,8 +1299,22 @@ impl App {
             Vec::new();
         let floor = self.copy_floor;
 
+        // One transform of the span, then every slot picks its own channel
+        // out of it. Each slot used to mix and filter the whole block for
+        // itself, so a full fleet ran two dozen identical FFTs of the same
+        // input.
+        let frames = self.channelizer.push(block);
         for slot in &mut self.auto {
-            slot.chain.process(block, &mut slot.audio);
+            slot.audio.clear();
+        }
+        for f in 0..frames {
+            let (spec, start) = self.channelizer.frame(f);
+            for slot in &mut self.auto {
+                slot.tap.process_frame(spec, start, &mut slot.audio);
+            }
+        }
+
+        for slot in &mut self.auto {
             if soft && slot.decoder.wants_agc() {
                 slot.agc.process(&mut slot.audio);
             }
@@ -1360,7 +1395,7 @@ impl App {
                         lines.push(row(&signal, line));
                     }
                 }
-                let idle = slot.quiet as f64 >= AUTO_FLUSH_SECS * slot.chain.fs_out();
+                let idle = slot.quiet as f64 >= AUTO_FLUSH_SECS * slot.tap.fs_out();
                 if slot.partial.len() >= AUTO_LINE
                     || (idle && !slot.partial.trim().is_empty())
                 {
@@ -1491,7 +1526,7 @@ impl App {
             if !pinned && self.auto.iter().filter(|s| !s.pinned).count() >= self.slot_budget() {
                 continue;
             }
-            if let Some(slot) = AutoSlot::new(kind, dial, self.center, self.rate, pinned, shift) {
+            if let Some(slot) = AutoSlot::new(kind, dial, self.center, self.rate, pinned, shift, self.channelizer.hop()) {
                 self.auto.push(slot);
             }
         }
@@ -1579,8 +1614,21 @@ impl App {
         self.front.process(&mut buf);
         let block: &[Complex32] = &buf;
 
-        spec.power_db(block, &mut self.spectrum);
-        self.noise_floor = self.noise_tracker.update(&self.spectrum).to_vec();
+        // The floor only integrates observations that are actually new. A
+        // 32768-point FFT needs more samples than one block carries, so
+        // `power_db` routinely leaves the previous estimate in place — and
+        // folding that same estimate in again on every block is what made the
+        // tracker's time constant depend on the FFT size as well as the rate.
+        let fresh = spec.power_db(block, &mut self.spectrum);
+        self.spec_dt += block.len() as f32 / self.rate as f32;
+        if fresh {
+            self.noise_floor = self
+                .noise_tracker
+                .update(&self.spectrum, self.spec_dt)
+                .to_vec();
+            self.noise_level = self.noise_tracker.level().to_vec();
+            self.spec_dt = 0.0;
+        }
         smooth_bins(
             &self.spectrum,
             SMOOTH_BINS[self.smooth_idx],
@@ -1624,7 +1672,7 @@ impl App {
 
         // Auto-range the colour scale from the current noise floor.
         if !self.smoothed.is_empty() {
-            let med = sampled_median(&self.noise_floor)
+            let med = sampled_median(&self.noise_level)
                 .or_else(|| sampled_median(&self.smoothed))
                 .unwrap_or(-140.0);
             let hi = self.smoothed.iter().copied().fold(f32::MIN, f32::max);
@@ -1703,10 +1751,10 @@ impl App {
                 .cloned()
                 .fold(f32::MIN, f32::max);
             let floor = self
-                .noise_floor
+                .noise_level
                 .get(lo..=hi.max(lo))
                 .and_then(|v| v.iter().copied().reduce(f32::max))
-                .or_else(|| sampled_median(&self.noise_floor))
+                .or_else(|| sampled_median(&self.noise_level))
                 .unwrap_or(-140.0);
             self.cursor_snr = peak - floor;
         }
@@ -3158,6 +3206,7 @@ fn retune(app: &mut App, radio: &radio::Radio, freq: f64) {
     // DC offset and IQ imbalance are both frequency-dependent, so what was
     // learned on the old centre is wrong for the new one.
     app.front.reset();
+    app.channelizer.reset();
     app.ident_at = Instant::now();
     // Every automatic slot was tuned relative to the old centre.
     app.auto.clear();
@@ -3478,9 +3527,12 @@ fn find_peaks_above(
     if n < 8 {
         return Vec::new();
     }
-    let mut sorted = spectrum.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let med = sorted[n / 2];
+    // A subsampled median, not a full sort of a copy of the whole spectrum.
+    // This runs on every call — including every step of a band scan — and the
+    // answer it needs is a level, which 256 samples pin down as well as 32768
+    // do. The tracked floor below is the real reference; this is the
+    // cold-start fallback and the clamp that keeps a stale floor honest.
+    let med = sampled_median(spectrum).unwrap_or(-140.0);
     // The LO leaks a spike at the centre of the span; it is not a signal.
     let dc = n / 2;
     let edge = (n / 50).max(2);
@@ -7896,11 +7948,19 @@ mod scout_cost {
     #[test]
     #[ignore]
     fn bench_feed_cost_per_band() {
-        for b in bands::BANDS {
-            if b.name == "WWV" {
+        // The band presets, then the two wide spans only a `--rate` override
+        // can reach — which is what `SLOT_RATE_BUDGET` exists to guard.
+        let extra = [("wide", 768_000.0f64), ("very wide", 5_000_000.0)];
+        let cases = bands::BANDS
+            .iter()
+            .map(|b| (b.name, b.span, b.default))
+            .chain(extra.iter().map(|&(n, r)| (n, r, 14_070_000.0)));
+        for (name, rate, default) in cases {
+            let b = (name, rate, default);
+            if b.0 == "WWV" {
                 continue;
             }
-            let rate = b.span;
+            let rate = b.1;
             let mut rng = 0x1234_5678u32;
             let mut noise = || {
                 rng ^= rng << 13;
@@ -7920,13 +7980,13 @@ mod scout_cost {
                     *s += Complex32::from_polar(0.3, ph as f32);
                 }
             }
-            let mut app = App::new(b.default, rate, Mode::Auto);
+            let mut app = App::new(b.2, rate, Mode::Auto);
             app.agc = AgcMode::Off;
             // A full narrowband fleet, which is what a busy band produces.
             for k in 0..MAX_AUTO_SLOTS {
-                let dial = b.default - rate / 6.0 + k as f64 * (rate / 100.0);
+                let dial = b.2 - rate / 6.0 + k as f64 * (rate / 100.0);
                 if let Some(sl) =
-                    AutoSlot::new(identify::Kind::Cw, dial, app.center, app.rate, false, None)
+                    AutoSlot::new(identify::Kind::Cw, dial, app.center, app.rate, false, None, app.channelizer.hop())
                 {
                     app.auto.push(sl);
                 }
@@ -7941,7 +8001,7 @@ mod scout_cost {
             let el = t.elapsed().as_secs_f64();
             println!(
                 "  {:>5} {:>8.0} kS/s  {slots:>2} slots  {:>6.0} ms for {secs:.0}s  = {:>5.1}% of real time{}",
-                b.name,
+                b.0,
                 rate / 1000.0,
                 el * 1000.0,
                 100.0 * el / secs,
@@ -8200,6 +8260,7 @@ mod slot_cost {
                 let dial = 14_030_000.0 - 16_000.0 + k as f64 * 800.0;
                 if let Some(sl) = AutoSlot::new(
                     identify::Kind::Cw, dial, app.center, app.rate, false, None,
+                    app.channelizer.hop(),
                 ) {
                     app.auto.push(sl);
                 }

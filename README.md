@@ -64,14 +64,19 @@ tightly to what it carries leaves the filter corner inside the view — which is
 what edge rolloff on the waterfall is. Every decoded segment sits inside the
 filter its span lands on.
 
-**Time.** Every decoder slot mixes and decimates from the full input rate, so
-the decode fleet costs CPU in proportion to it: a full fleet is 14% of real
-time on a 192 kS/s span, 27% at 384, 70% at 768 and 840% at 5 MS/s
-(`bench_feed_cost_per_band`). The UI is single-threaded and the radio drops
-blocks rather than blocking, so the last two stutter or cannot run. Sizing the
-span to the decoded segment rather than the allocation is what keeps almost
-every band at 192 kS/s. A hard budget on slots × sample rate backs this up, so
-a `--rate` override shrinks the fleet instead of overrunning the stream.
+**Time.** The decode fleet shares one forward transform of the span: a
+frequency shift is a rotation of the spectrum, so every slot picks its own
+channel out of the same FFT rather than mixing and filtering the whole span
+for itself, and decimates by folding that spectrum instead of
+inverse-transforming a frame and discarding most of it. A full 24-slot fleet
+costs 1.8% of real time on a 192 kS/s span, 2.5% at 384 and 3.8% at 768
+(`bench_feed_cost_per_band`); it was 14%, 27% and 70% when each slot ran its
+own chain. Folding needs the frame to divide by the decimation, which every
+span in the table does; an arbitrary `--rate` may not, and falls back to a
+whole-frame inverse transform — 5 MS/s costs 231% that way, against 840%
+before. The UI is single-threaded and the radio drops blocks rather than
+blocking, so a hard budget on slots × sample rate is sized for that fallback
+and shrinks the fleet instead of overrunning the stream.
 
 ### Measuring the receiver
 
@@ -255,10 +260,10 @@ to copy it.
 In auto mode every classified signal gets its own decoder, up to 24 narrowband
 ones at a time, spent strongest-first when the band offers more than that. FT8
 and FT4 do not count against the limit — their slots are pinned to the calling
-frequencies whether or not anyone is on them. A slot costs about 0.65% of a
-core (`bench_slot_cost`), so the limit is set by how much of a busy CW segment
-is worth carrying rather than by CPU; a signal that never gets a slot is a
-station nobody hears about.
+frequencies whether or not anyone is on them. A slot costs 0.8 ms per second
+of IQ at 192 kS/s (`bench_slot_cost`), under a tenth of one percent of a core,
+so the limit is set by how much of a busy CW segment is worth carrying rather
+than by CPU; a signal that never gets a slot is a station nobody hears about.
 
 The order the tests run in matters as much as the tests themselves, because
 the first one to confirm wins. FSK goes first: a signal alternating between
@@ -293,7 +298,11 @@ the other. The comparison survives that difference; the level does not.
 - **CW** — envelope detection with hysteresis and a peak/noise-floor tracker.
   Dit length is estimated from a short/long cluster of recent marks, so a
   station that speeds up or slows down is followed instead of being decoded
-  as garbage. After a pause the decoder re-acquires quickly for the next
+  as garbage — and the post-mix filter is then sized from that clock rather
+  than left wide enough for the fastest fist imaginable, which is worth about
+  3 dB of copy threshold. It only ever narrows onto a speed it has already
+  established: a filter too narrow for the fist being sent smears the keying,
+  which reads as a slower clock, which asks for a narrower filter still. After a pause the decoder re-acquires quickly for the next
   over. A passband scout finds keyed tones near the cursor (cyan ticks;
   `n` / `N` hop). `p` locks the next CW in the span or walks the band.
   Status shows estimated WPM and the lock offset. In CW mode the decode
@@ -302,12 +311,18 @@ the other. The comparison survives that difference; the level does not.
   with absolute RF, lock offset, a ±20 Hz centre-frequency meter, WPM,
   and the tones in the passband. `u` / `i` trim the lock 2 Hz; `g`
   centres the cursor on it.
-- **RTTY** — FM discriminator, start-bit clock recovery, 45.45 baud, ITA2 with
-  LTRS/FIGS shifts. Reports the percentage of correctly framed characters,
-  which is a good tuning indicator. The shift defaults to 170 Hz; in auto mode
-  the classifier measures it and the slot is built with it, snapped to the
-  nearest standard (170 / 425 / 850) so a noisy measurement cannot detune the
-  matched filters.
+- **RTTY** — a matched filter per tone, each integrating across exactly one
+  bit and dumped on the framer's own bit boundary, with per-tone envelope
+  normalisation so a selective fade that takes one tone 20 dB down still
+  slices correctly. Start-bit clock recovery, 45.45 baud, ITA2 with LTRS/FIGS
+  shifts. Tuning is found rather than assumed: a quarter-second transform
+  looks for two tones a known shift apart and centres on their midpoint,
+  scoring each candidate by its *weaker* tone, so a lone carrier or a pile-up
+  of FT8 signals cannot pass for an FSK pair however loud it is. Reports the
+  percentage of correctly framed characters, which is a good tuning indicator.
+  The shift defaults to 170 Hz; in auto mode the classifier measures it and
+  the slot is built with it, snapped to the nearest standard
+  (170 / 425 / 850) so a noisy measurement cannot detune the filters.
 - **PSK31** — differential BPSK, so no carrier recovery loop is needed. The
   decoder identifies a nearby PSK31 signal (within ~180 Hz of the cursor) by
   squaring the baseband — that wipes the modulation and leaves a tone at

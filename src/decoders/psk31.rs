@@ -61,6 +61,43 @@ const NOISE_Q: f32 = 2.0 / PI;
 /// and the point at which its own sampling error stops being worth
 /// discounting. Matches the 0.03 smoothing it runs at once warmed up.
 const Q_WINDOW: usize = 64;
+/// Confidence below which a lock is *considered* stale.
+const LOCK_DROP: f32 = 0.10;
+/// ...and how many consecutive settled symbols must agree before it is acted
+/// on.
+///
+/// `q_raw` is an exponential average with a 0.03 coefficient, so it sees
+/// about 33 symbols, and the per-symbol |cos| it averages has a standard
+/// deviation near 0.3. Its own sampling error is therefore ±0.14 on the
+/// calibrated scale — which is larger than the gap between `LOCK_DROP` and
+/// the confidence a genuine 6 dB signal produces (0.24, measured). Compared
+/// against a bare threshold the average dips under the bar every few seconds
+/// on a signal that is being copied perfectly well, the lock drops, and
+/// `push_bit` goes silent until `confirm_psk` happens to re-acquire — which
+/// is a stricter test than the demodulator actually needs. That is the whole
+/// reason copy fell off a cliff below 8 dB rather than degrading.
+///
+/// Two seconds of sustained agreement is longer than the estimator's own
+/// noise can fake and far shorter than a real transmission ending.
+const LOCK_DROP_SYMBOLS: u32 = 64;
+/// How concentrated at DC a confirmed candidate's energy has to be.
+///
+/// This is the test that separates a weak carrier from an empty frequency,
+/// and it used to sit at 0.25 — close enough to what noise produces that the
+/// baud-rate veto was left doing the rejecting, and that veto fires on the
+/// largest of 111 noise samples (see `keys_at_other_baud`). Loosening the
+/// veto so real 6 dB signals survive therefore needs this bar to carry its
+/// own weight instead.
+///
+/// Measured on the span-scout path: pure noise reads 0.29 and 0.34, while
+/// every real signal in the suite reads 0.71 to 0.90, and a 6 dB signal
+/// through the decoder's own baseband reads 0.58 to 0.66. Half-way is a wide
+/// gap on both sides.
+///
+/// Deliberately *not* solved by raising `BPSK_QUALITY`: a genuine PSK31
+/// signal on 30m scores 0.367 there against noise's 0.378, so that gate has
+/// no separation left to spend and raising it would cost real copy.
+const DC_FOCUS_MIN: f32 = 0.50;
 
 /// Put a raw differential-symbol concentration on the 0 = noise, 1 = clean
 /// scale. Only ever applied to an *averaged* raw value: clamping individual
@@ -109,7 +146,10 @@ pub struct Psk31Decoder {
     afc: f32,
     /// Identified carrier offset, Hz, relative to the cursor.
     mix_hz: f32,
-    mix_phase: f32,
+    /// Mixer bringing the identified carrier to DC — a rotator rather than a
+    /// `sin_cos` per audio sample, retuned in place as the AFC walks it.
+    mix_rot: Rotator,
+    mix_rate_hz: f32,
     locked: bool,
     lock_score: f32,
     code: String,
@@ -125,6 +165,8 @@ pub struct Psk31Decoder {
     /// zero for a second — a second in which the copy floor would be
     /// swallowing the start of every transmission.
     q_n: f32,
+    /// Consecutive settled symbols whose confidence was under `LOCK_DROP`.
+    weak: u32,
     reversals: f32,
     have_prev: bool,
     /// Low-pass after the search mix so the demod sees ~PSK31 bandwidth.
@@ -186,7 +228,8 @@ impl Psk31Decoder {
             prev: Complex32::new(0.0, 0.0),
             afc: 0.0,
             mix_hz: 0.0,
-            mix_phase: 0.0,
+            mix_rot: Rotator::new(0.0),
+            mix_rate_hz: 0.0,
             locked: false,
             lock_score: 0.0,
             code: String::new(),
@@ -195,6 +238,7 @@ impl Psk31Decoder {
             symbols: 0,
             q_raw: 0.0,
             q_n: 0.0,
+            weak: 0,
             reversals: 0.0,
             have_prev: false,
             lpf: Complex32::new(0.0, 0.0),
@@ -231,14 +275,11 @@ impl Psk31Decoder {
     }
 
     fn mix(&mut self, s: Complex32) -> Complex32 {
-        let (sin, cos) = self.mix_phase.sin_cos();
-        self.mix_phase += -2.0 * PI * self.mix_hz / self.fs;
-        if self.mix_phase > PI {
-            self.mix_phase -= 2.0 * PI;
-        } else if self.mix_phase < -PI {
-            self.mix_phase += 2.0 * PI;
+        if (self.mix_hz - self.mix_rate_hz).abs() > 0.01 {
+            self.mix_rate_hz = self.mix_hz;
+            self.mix_rot.set_rate(-2.0 * PI * self.mix_hz / self.fs);
         }
-        let mixed = s * Complex32::new(cos, sin);
+        let mixed = s * self.mix_rot.next();
         self.lpf += (mixed - self.lpf) * self.lpf_a;
         self.lpf
     }
@@ -266,6 +307,7 @@ impl Psk31Decoder {
             // good lock vouch for whatever the search jumped to next.
             self.q_raw = 0.0;
             self.q_n = 0.0;
+            self.weak = 0;
         }
     }
 
@@ -391,7 +433,7 @@ impl Psk31Decoder {
 
     fn clear_lock_state(&mut self) {
         self.mix_hz = 0.0;
-        self.mix_phase = 0.0;
+        self.mix_rot.reset_phase();
         self.afc = 0.0;
         self.locked = false;
         self.lock_score = 0.0;
@@ -409,6 +451,7 @@ impl Psk31Decoder {
         self.scan.reset();
         self.q_raw = 0.0;
         self.q_n = 0.0;
+        self.weak = 0;
         self.reversals = 0.0;
         self.sym_hist.clear();
         self.env_hist.clear();
@@ -460,8 +503,19 @@ impl Psk31Decoder {
 
         // Drop a stale lock if the demod has been garbage for a while.
         // Identification (vs CW / cross-terms) is search's job.
-        if self.locked && self.conf() < 0.10 && self.symbols > 120 {
+        //
+        // Only a *settled* average gets a vote: an estimate still climbing
+        // out of its own start-up discount says nothing about the signal, and
+        // judging it there is what dropped the lock immediately after every
+        // retune. See `LOCK_DROP_SYMBOLS` for why the run length matters.
+        if self.q_n >= Q_WINDOW as f32 && self.conf() < LOCK_DROP {
+            self.weak = self.weak.saturating_add(1);
+        } else {
+            self.weak = 0;
+        }
+        if self.locked && self.weak >= LOCK_DROP_SYMBOLS && self.symbols > 120 {
             self.locked = false;
+            self.weak = 0;
         }
 
         self.push_bit(bit);
@@ -507,7 +561,7 @@ fn confirm_psk(buf: &[Complex32], fs: f32, hz: f32, sps: usize) -> Option<(f32, 
     if q < BPSK_QUALITY || !(REV_MIN..=REV_MAX).contains(&rev) {
         return None;
     }
-    if dc_focus(buf, fs, hz) < 0.25 {
+    if dc_focus(buf, fs, hz) < DC_FOCUS_MIN {
         return None;
     }
     // Idle-like reversal rate is also what a CW tone at ±baud/2 produces.
@@ -726,7 +780,21 @@ fn keys_at_other_baud(buf: &[Complex32], fs: f32, hz: f32) -> bool {
     if peak <= 0.0 {
         return false;
     }
-    at_baud < 3.0 && peak > 3.0 * at_baud
+    // A veto needs a line, not merely a winner. `baud_line` returns the
+    // largest of 111 half-hertz samples over its envelope spectrum, and on
+    // noise the largest of 111 draws sits around 3× the median all by
+    // itself — so a signal too weak to raise its own 31.25 Hz line above the
+    // grass got vetoed by whichever noise bin happened to come top. That is
+    // what stopped copy dead below 8 dB: at 6 dB the "competing mode" was a
+    // 27.5 Hz fluctuation reading 3.07 against a 31.25 Hz line of 0.69.
+    //
+    // The real interferers this veto exists for are far louder than that.
+    // Measured in the cases documented above: 5.2 for a mid-shift RTTY tone,
+    // 7.9 for keyed CW, 12.3 for an RTTY mark, 25.2 for the RY pattern. A
+    // floor of 4.5 clears every one of them and sits well above what noise
+    // alone produces.
+    const VETO_MIN_LINE: f32 = 4.5;
+    peak >= VETO_MIN_LINE && at_baud < 3.0 && peak > 3.0 * at_baud
 }
 
 fn env_notch(buf: &[Complex32], fs: f32, hz: f32, sps: usize) -> f32 {

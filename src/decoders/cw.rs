@@ -545,9 +545,9 @@ impl CwDecoder {
             self.acquire -= 1;
         }
         let dah_r = (self.dah / dit).clamp(2.0, 4.2);
-        if !is_dah && ratio < 1.45 && ratio > 0.60 {
+        if !is_dah && ratio < boundary && ratio > 0.50 {
             self.dit = (1.0 - alpha) * self.dit + alpha * len;
-        } else if is_dah && ratio < 4.2 && ratio > 2.0 {
+        } else if is_dah && ratio >= boundary && ratio < 5.0 {
             let a = alpha * 0.5;
             self.dah = (1.0 - a) * self.dah + a * len;
             self.dit = (1.0 - a) * self.dit + a * (len / dah_r);
@@ -568,12 +568,15 @@ impl CwDecoder {
 
         let dah_count = self.marks.iter().filter(|&&m| m >= 1.7 * self.dit).count();
         let dit_count = self.marks.iter().filter(|&&m| m < 1.7 * self.dit).count();
-        let coherent = if self.marks.len() >= 6 {
-            dah_count >= 1 && dit_count >= 1
+        let single_type_consistent = if self.marks.len() >= 6 {
+            let mean = self.marks.iter().sum::<f32>() / self.marks.len() as f32;
+            let variance = self.marks.iter().map(|m| (m - mean).powi(2)).sum::<f32>() / self.marks.len() as f32;
+            variance.sqrt() <= 0.38 * mean
         } else {
             true
         };
-        let target_q = if coherent { sample_q } else { sample_q * 0.35 };
+        let coherent = (dah_count >= 1 && dit_count >= 1) || single_type_consistent;
+        let target_q = if coherent { sample_q } else { sample_q * 0.45 };
         let q_alpha = if self.acquire > 0 { 0.28 } else { 0.12 };
         self.quality = (1.0 - q_alpha) * self.quality + q_alpha * target_q;
     }

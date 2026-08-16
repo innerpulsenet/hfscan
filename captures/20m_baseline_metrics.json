@@ -1,0 +1,271 @@
+{
+  "timestamp_utc": 1786904509,
+  "dataset_file": "captures/20m_14060khz_192ksps_60s.iq",
+  "dataset_duration_secs": 60.0,
+  "dataset_samples": 11520000,
+  "frontend": {
+    "total_samples": 11520000,
+    "elapsed_ms": 176.37399000000002,
+    "throughput_msps": 65.31575319013875,
+    "speedup": 340.18621453197267,
+    "block_latency_us": 250.88620199146516
+  },
+  "fft": [
+    {
+      "fft_size": 1024,
+      "num_frames": 11250,
+      "elapsed_ms": 157.24406199999999,
+      "throughput_msps": 73.26190797589547,
+      "frame_latency_us": 13.977244444444445,
+      "speedup": 381.57243737445555
+    },
+    {
+      "fft_size": 2048,
+      "num_frames": 5625,
+      "elapsed_ms": 154.718042,
+      "throughput_msps": 74.45802603939364,
+      "frame_latency_us": 27.505422222222222,
+      "speedup": 387.80221895517525
+    },
+    {
+      "fft_size": 4096,
+      "num_frames": 2812,
+      "elapsed_ms": 162.243877,
+      "throughput_msps": 70.99159742096153,
+      "frame_latency_us": 57.69665718349929,
+      "speedup": 369.7479032341746
+    },
+    {
+      "fft_size": 8192,
+      "num_frames": 1406,
+      "elapsed_ms": 162.45074100000002,
+      "throughput_msps": 70.90119705886721,
+      "frame_latency_us": 115.54054054054055,
+      "speedup": 369.2770680149334
+    },
+    {
+      "fft_size": 16384,
+      "num_frames": 703,
+      "elapsed_ms": 169.494486,
+      "throughput_msps": 67.95472980755257,
+      "frame_latency_us": 241.1009957325747,
+      "speedup": 353.9308844143363
+    },
+    {
+      "fft_size": 32768,
+      "num_frames": 351,
+      "elapsed_ms": 177.272134,
+      "throughput_msps": 64.88085713460188,
+      "frame_latency_us": 505.048433048433,
+      "speedup": 337.9211309093848
+    },
+    {
+      "fft_size": 65536,
+      "num_frames": 175,
+      "elapsed_ms": 186.429424,
+      "throughput_msps": 61.51818609920717,
+      "frame_latency_us": 1065.3085714285714,
+      "speedup": 320.40721926670403
+    }
+  ],
+  "channelizer": [
+    {
+      "num_slots": 1,
+      "elapsed_ms": 70.433517,
+      "throughput_msps": 163.5584944593921,
+      "speedup": 851.8671586426673,
+      "cpu_pct": 0.117389195,
+      "per_slot_cost_us": 100.1891891891892
+    },
+    {
+      "num_slots": 4,
+      "elapsed_ms": 93.492166,
+      "throughput_msps": 123.21888017868791,
+      "speedup": 641.7650009306662,
+      "cpu_pct": 0.15582027666666665,
+      "per_slot_cost_us": 33.2475106685633
+    },
+    {
+      "num_slots": 8,
+      "elapsed_ms": 132.202972,
+      "throughput_msps": 87.13873694155681,
+      "speedup": 453.84758823727503,
+      "cpu_pct": 0.22033828666666666,
+      "per_slot_cost_us": 23.506756756756758
+    },
+    {
+      "num_slots": 16,
+      "elapsed_ms": 199.003928,
+      "throughput_msps": 57.888304596681124,
+      "speedup": 301.50158644104755,
+      "cpu_pct": 0.3316732133333333,
+      "per_slot_cost_us": 17.692300853485065
+    },
+    {
+      "num_slots": 24,
+      "elapsed_ms": 262.328886,
+      "throughput_msps": 43.91434041312553,
+      "speedup": 228.72052298502882,
+      "cpu_pct": 0.43721480999999995,
+      "per_slot_cost_us": 15.548127074442863
+    },
+    {
+      "num_slots": 32,
+      "elapsed_ms": 331.449278,
+      "throughput_msps": 34.75644922056521,
+      "speedup": 181.0231730237771,
+      "cpu_pct": 0.5524154633333334,
+      "per_slot_cost_us": 14.733685988620199
+    }
+  ],
+  "ft8": {
+    "total_decodes": 174,
+    "total_slots": 3,
+    "avg_slot_latency_ms": 3067.4698780000003,
+    "avg_speedup": 4.890023568798676,
+    "slots": [
+      {
+        "slot_index": 1,
+        "window_str": "11.0s-26.0s",
+        "decode_time_ms": 2737.136555,
+        "speedup": 5.480179632469962,
+        "decodes_count": 55,
+        "sample_messages": [
+          "+25dB IK4LZH WA2MBP EM73",
+          "+5dB TA2EE MM0GTU -24",
+          "+13dB KG7KDJ KE4ZXY EM86"
+        ]
+      },
+      {
+        "slot_index": 2,
+        "window_str": "26.0s-41.0s",
+        "decode_time_ms": 4026.361571,
+        "speedup": 3.7254478355937994,
+        "decodes_count": 57,
+        "sample_messages": [
+          "+3dB VA3MWT N3EQF -14",
+          "-1dB KI7DAN W4KWS EL94",
+          "+13dB KJ4PIU KS4OT 73"
+        ]
+      },
+      {
+        "slot_index": 3,
+        "window_str": "41.0s-56.0s",
+        "decode_time_ms": 2438.9115079999997,
+        "speedup": 6.150284645751896,
+        "decodes_count": 62,
+        "sample_messages": [
+          "+25dB IK4LZH WA2MBP EM73",
+          "+14dB W0DC DA0LH RR73",
+          "+13dB KG7KDJ KE4ZXY R-04"
+        ]
+      }
+    ]
+  },
+  "cw": {
+    "candidate_count": 8,
+    "avg_audio_msps": 20.27542856920122,
+    "signals": [
+      {
+        "dial_khz": 14000.09375,
+        "snr_db": 14.396664,
+        "demod_time_ms": 23.50127,
+        "audio_msps": 20.373792565252856,
+        "speedup": 2546.7240706566067,
+        "max_confidence_pct": 88.55809,
+        "wpm": 50.0,
+        "text_snippet": "AEEEB EIE E ETI*EHEE SSE"
+      },
+      {
+        "dial_khz": 14000.0,
+        "snr_db": 13.476952,
+        "demod_time_ms": 23.106427999999998,
+        "audio_msps": 20.72193936682901,
+        "speedup": 2590.242420853626,
+        "max_confidence_pct": 81.57478,
+        "wpm": 50.0,
+        "text_snippet": "M EEEI& SE E EII*ESEE IU"
+      },
+      {
+        "dial_khz": 14061.78125,
+        "snr_db": 10.863209,
+        "demod_time_ms": 24.385381000000002,
+        "audio_msps": 19.635124831553792,
+        "speedup": 2454.3906039442236,
+        "max_confidence_pct": 98.78168,
+        "wpm": 18.603668,
+        "text_snippet": "GK E CQ CQ QRP TEST DE N"
+      },
+      {
+        "dial_khz": 14024.0,
+        "snr_db": 8.608154,
+        "demod_time_ms": 24.109488,
+        "audio_msps": 19.85981618522965,
+        "speedup": 2482.4770231537063,
+        "max_confidence_pct": 73.82889,
+        "wpm": 27.380587,
+        "text_snippet": "IET TTEEE *TTT EEY E TET"
+      },
+      {
+        "dial_khz": 14055.0078125,
+        "snr_db": 8.212219,
+        "demod_time_ms": 22.928016999999997,
+        "audio_msps": 20.883184097429798,
+        "speedup": 2610.3980121787245,
+        "max_confidence_pct": 97.25505,
+        "wpm": 17.14276,
+        "text_snippet": "T EES E E E E UTT TT TTT"
+      },
+      {
+        "dial_khz": 14038.0859375,
+        "snr_db": 8.10252,
+        "demod_time_ms": 24.071489,
+        "audio_msps": 19.89116668270916,
+        "speedup": 2486.3958353386447,
+        "max_confidence_pct": 88.956505,
+        "wpm": 16.90085,
+        "text_snippet": "NW*ATENI TNI E NFB CW*O "
+      },
+      {
+        "dial_khz": 14002.5078125,
+        "snr_db": 8.050812,
+        "demod_time_ms": 23.083441,
+        "audio_msps": 20.742574731384284,
+        "speedup": 2592.8218414230355,
+        "max_confidence_pct": 92.58773,
+        "wpm": 32.181797,
+        "text_snippet": "CE TEST T EWH I ZW B I E"
+      },
+      {
+        "dial_khz": 14028.0078125,
+        "snr_db": 7.947418,
+        "demod_time_ms": 23.826336,
+        "audio_msps": 20.095830093221213,
+        "speedup": 2511.978761652652,
+        "max_confidence_pct": 96.36224,
+        "wpm": 20.306372,
+        "text_snippet": "CGCVA PT6T PT TEST E E E"
+      }
+    ]
+  },
+  "demodulators": [
+    {
+      "mode": "PSK31",
+      "elapsed_ms": 8.968441,
+      "audio_msps": 53.43537410794139,
+      "speedup": 6679.421763492674
+    },
+    {
+      "mode": "RTTY",
+      "elapsed_ms": 18.775720999999997,
+      "audio_msps": 25.50155064617758,
+      "speedup": 3187.693830772198
+    }
+  ],
+  "end_to_end": {
+    "duration_rf_secs": 60.0,
+    "process_time_secs": 0.837183704,
+    "speedup": 71.66885799774239,
+    "cpu_occupancy_pct": 1.3953061733333334
+  }
+}

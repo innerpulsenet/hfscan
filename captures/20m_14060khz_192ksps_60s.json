@@ -1,0 +1,22 @@
+{
+  "format": "Complex32_LE",
+  "sample_format": "2 x float32 (I, Q)",
+  "bytes_per_sample": 8,
+  "center_frequency_hz": 14060000.0,
+  "sample_rate_hz": 192000.0,
+  "analog_bandwidth_hz": 200000.0,
+  "duration_seconds": 60.102,
+  "total_samples": 11520000,
+  "timestamp_utc": 1786904509,
+  "receiver": {
+    "driver": "SDRplay",
+    "hardware": "RSP1A",
+    "ifgr_db": 48.0,
+    "rfgr_db": 0.0,
+    "biast": true
+  },
+  "spectrum_stats": {
+    "median_noise_floor_dbfs": -50.96,
+    "prominent_carriers_count": 75
+  }
+}

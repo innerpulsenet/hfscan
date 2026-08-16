@@ -171,9 +171,8 @@ impl FtDecoder {
         self.pending = false;
     }
 
-    /// Decode one prepared slot directly, returning transcript lines. Used by
-    /// the tests, which cannot wait on the wall clock.
-    #[cfg(test)]
+    /// Decode one prepared slot directly, returning transcript lines.
+    #[allow(dead_code)]
     pub fn decode_audio(audio: &[i16], ft4: bool) -> Vec<String> {
         let mut hash = CallsignHashTable::new();
         decode_slot(audio, ft4, "", &mut hash, true)
@@ -182,13 +181,20 @@ impl FtDecoder {
             .collect()
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn decode_audio_depth(audio: &[i16], ft4: bool, deep: bool) -> Vec<String> {
         let mut hash = CallsignHashTable::new();
         decode_slot(audio, ft4, "", &mut hash, deep)
             .iter()
             .map(|m| m.format())
             .collect()
+    }
+
+    /// Decode one prepared slot directly, returning full FtMessage structures.
+    #[allow(dead_code)]
+    pub fn decode_slot_messages(audio: &[i16], ft4: bool, deep: bool) -> Vec<FtMessage> {
+        let mut hash = CallsignHashTable::new();
+        decode_slot(audio, ft4, "", &mut hash, deep)
     }
 
     #[cfg(test)]
@@ -276,7 +282,7 @@ impl FtDecoder {
 /// entire slot; after narrowing a 192 kHz span down to 3 kHz the residual
 /// amplitude is tiny, so a fixed absolute scale would quantise weak signals
 /// into nothing.
-fn quantize(buf: &[f32], nmax: usize) -> Vec<i16> {
+pub fn quantize(buf: &[f32], nmax: usize) -> Vec<i16> {
     let mut audio = buf.to_vec();
     audio.resize(nmax, 0.0);
     let sum_sq: f32 = audio.iter().map(|v| v * v).sum();

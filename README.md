@@ -117,6 +117,54 @@ What it cannot do is give a noise figure or an MDS in absolute terms — both
 need a calibrated source. The floor is known relative to full scale, which is
 enough to find the knee and not enough to put a number in dBm on it.
 
+### Replay Benchmarks & Baseline Tracking
+
+To benchmark receiver DSP and decoders against identical, repeatable real-world signals, `hfscan` includes live RF recording and replay benchmarking tools.
+
+#### 1. Recording Live Spectrum Activity
+
+`record_iq` captures calibrated, uncompressed IQ samples directly from the connected SDR device:
+
+```bash
+cargo run --release --bin record_iq
+```
+
+By default, it records 60 seconds from the 20m startup band (14.060 MHz @ 192 kS/s, IFGR = 48 dB, RFGR = 0 dB, Bias-T = ON) and saves:
+- `captures/20m_14060khz_192ksps_60s.iq` (11.52M `Complex32` samples)
+- `captures/20m_14060khz_192ksps_60s.json` (UTC timestamp and capture parameters)
+
+#### 2. Running the Replay Benchmark Suite
+
+`bench_replay` replays the 60s live recording and evaluates the receiver front-end, FFT transforms, multi-channel scaling, and digital decoders:
+
+```bash
+cargo run --release --bin bench_replay
+```
+
+The benchmark profiles 7 key subsystems:
+1. **DSP Front-End**: DC offset removal, IQ imbalance correction, and noise blanking (>65 MS/s, ~340x real-time speedup).
+2. **Spectrum FFT & Floor**: FFT transforms (1024 to 65536) and dynamic noise floor tracking (61–73 MS/s).
+3. **Channelizer Fleet Scaling**: 1 to 32 concurrent 8 kHz channel taps (16 slots at 58 MS/s, 0.33% CPU; 32 slots at 35 MS/s, 0.55% CPU).
+4. **FT8 Live Multi-Pass**: Evaluates 15s UTC-aligned slots on 14.074 MHz (174 worldwide stations decoded across 60s, ~3.0s latency per slot).
+5. **CW Decoder**: Tests candidate CW transmissions across 14.000–14.070 MHz (e.g. 14061.8 kHz QRP decoded at 99% confidence, >2400x real-time speedup).
+6. **PSK31 & RTTY Demodulators**: Audio baseband demodulation throughput (>53 MS/s and >25 MS/s).
+7. **End-to-End Pipeline**: Full real-time stream simulation running front-end, spectrum FFT, 16-channel channelizer, and 16 CW decoders (71.7x real-time, 1.40% 1-core CPU).
+
+#### 3. Baseline Comparisons & Regression Flags
+
+Whenever `captures/20m_baseline_metrics.json` is present, `bench_replay` prints a side-by-side diff table with color-coded deltas and regression flags:
+
+```bash
+# Compare current build against reference baseline
+cargo run --release --bin bench_replay
+
+# Fail build if any throughput or accuracy metric drops beyond tolerance
+cargo run --release --bin bench_replay -- --fail-on-regression --tolerance 5.0
+
+# Save current run as the new reference baseline
+cargo run --release --bin bench_replay -- --save-baseline
+```
+
 ## Keys
 
 | key | action |
@@ -504,15 +552,16 @@ sits in the gap. `decoders::tests::bench_psk31_confidence` prints the curve.
 cargo test --release
 ```
 
-Every decoder is tested by synthesising a signal for that mode — shaped CW
-keying, Baudot FSK, raised-cosine BPSK31 with a frequency offset, and encoded
-FT8/FT4 slots including an off-centre one — pushing it through the decoder and
-checking the text comes back. This is what actually validates the DSP; on-air
-behaviour additionally depends on your antenna and conditions.
+Testing includes both synthetic unit test vectors and real-world RF regression tests:
 
-`cargo test --release -- --ignored --nocapture` also runs a PSK31 diagnostic
-that prints the transmitted and recovered bit streams side by side, which is the
-fastest way to spot a timing-recovery regression.
+1. **Synthetic DSP & Decoder Unit Tests**: Every decoder is tested against synthesised signals — shaped CW keying, Baudot FSK, raised-cosine BPSK31 with frequency offsets, and encoded FT8/FT4 slots (including off-centre signals) — pushing them through the DSP chain to verify mathematical and decoding integrity.
+2. **Live 20m RF Regression Suite (`tests/live_replay.rs`)**: When the 60s reference capture (`captures/20m_14060khz_192ksps_60s.iq`) and baseline JSON are present, `cargo test` automatically executes real-world replay assertions ensuring:
+   - Front-end DSP throughput and numerical stability.
+   - Polyphase channelizer filter warm-up and frame slicing.
+   - Live CW decoding on QRP transmissions (maintaining $\ge 85\%$ copy confidence).
+   - Multi-station FT8 message decoding in real time.
+
+`cargo test --release -- --ignored --nocapture` also runs extended diagnostics including PSK31 timing-recovery bitstreams and matched-filter CW envelope tests.
 
 ## Licence
 

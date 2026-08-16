@@ -146,7 +146,7 @@ The benchmark profiles 7 key subsystems:
 2. **Spectrum FFT & Floor**: FFT transforms (1024 to 65536) and dynamic noise floor tracking (61–73 MS/s).
 3. **Channelizer Fleet Scaling**: 1 to 32 concurrent 8 kHz channel taps (16 slots at 58 MS/s, 0.33% CPU; 32 slots at 35 MS/s, 0.55% CPU).
 4. **FT8 Live Multi-Pass**: Evaluates 15s UTC-aligned slots on 14.074 MHz (174 worldwide stations decoded across 60s, ~3.0s latency per slot).
-5. **CW Decoder**: Tests candidate CW transmissions across 14.000–14.070 MHz (e.g. 14061.8 kHz QRP decoded at 99% confidence, >2400x real-time speedup).
+5. **CW Decoder**: Tests candidate CW transmissions across 14.000–14.070 MHz (e.g. 14061.8 kHz QRP decoded at 99% confidence). Throughput on the Stage 0 slicer was >2400× real time; the Stage 2 HSMM has not been re-timed.
 6. **PSK31 & RTTY Demodulators**: Audio baseband demodulation throughput (>53 MS/s and >25 MS/s).
 7. **End-to-End Pipeline**: Full real-time stream simulation running front-end, spectrum FFT, 16-channel channelizer, and 16 CW decoders (71.7x real-time, 1.40% 1-core CPU).
 
@@ -343,22 +343,25 @@ the other. The comparison survives that difference; the level does not.
 
 ### The decoders
 
-- **CW** — envelope detection with hysteresis and a peak/noise-floor tracker.
-  Dit length is estimated from a short/long cluster of recent marks, so a
-  station that speeds up or slows down is followed instead of being decoded
-  as garbage — and the post-mix filter is then sized from that clock rather
-  than left wide enough for the fastest fist imaginable, which is worth about
-  3 dB of copy threshold. It only ever narrows onto a speed it has already
-  established: a filter too narrow for the fist being sent smears the keying,
-  which reads as a slower clock, which asks for a narrower filter still. After a pause the decoder re-acquires quickly for the next
-  over. A passband scout finds keyed tones near the cursor (cyan ticks;
-  `n` / `N` hop). `p` locks the next CW in the span or walks the band.
-  Status shows estimated WPM and the lock offset. In CW mode the decode
-  pane becomes three views, like FT8: a live **envelope** of the keying
-  (green while the key is down), the **copy** transcript, and a **tuner**
-  with absolute RF, lock offset, a ±20 Hz centre-frequency meter, WPM,
-  and the tones in the passband. `u` / `i` trim the lock 2 Hz; `g`
-  centres the cursor on it.
+- **CW** — mix the locked tone to DC, a four-pole post-mix LPF, then an
+  explicit-duration HMM (HSMM) over a 5–50 WPM dit-period grid. Detection
+  and timing are scored jointly so a speed change cannot close a loop
+  through a slicer. WPM is the winning grid period; confidence is a
+  likelihood ratio against an all-space null. The post-mix filter still
+  narrows from that period (floored at 60 Hz) rather than staying wide
+  enough for the fastest fist imaginable. A passband scout finds keyed
+  tones near the cursor (cyan ticks; `n` / `N` hop). `p` locks the next
+  CW in the span or walks the band. Status shows estimated WPM and the
+  lock offset. In CW mode the decode pane becomes three views, like FT8:
+  a live **envelope** of the keying (green on the HSMM's committed
+  marks), the **copy** transcript, and a **tuner** with absolute RF, lock
+  offset, a ±20 Hz centre-frequency meter, WPM, and the tones in the
+  passband. Threshold lines on the envelope are the normalised mark and
+  space level estimates, not a hysteresis slicer. `u` / `i` trim the
+  lock 2 Hz; `g` centres the cursor on it. The HSMM lives on
+  `weak-signal-stage2-hsmm` and has not met the Stage 2 band/flat bars
+  in `weak-signal-plan-3-cw.md` — `main` still ships the older
+  hysteresis slicer.
 - **RTTY** — a matched filter per tone, each integrating across exactly one
   bit and dumped on the framer's own bit boundary, with per-tone envelope
   normalisation so a selective fade that takes one tone 20 dB down still

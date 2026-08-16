@@ -3,6 +3,8 @@
 > **STATUS: FINISHED — 2026-08-14.** Items 1–8 were implemented, measured,
 > regression-tested, and committed. The optional/later ideas in item 9 remain
 > explicitly deferred; they are not required for this plan's completion.
+> Successors: `weak-signal-plan-2.md` (done), `weak-signal-plan-3-cw.md`
+> (Stage 2 HSMM implemented on `weak-signal-stage2-hsmm`, not accepted).
 >
 > Measured outcomes: impulse blanking 14.2 dB; tracked-floor candidate gate
 > 4.0 dB; frequency-dependent IQ correction 29.8 dB better than scalar in the

@@ -1,12 +1,13 @@
-//! Morse (CW) decoder with adaptive speed tracking and nearby-tone lock.
+//! Morse (CW) decoder with nearby-tone lock and an HSMM element decoder.
 //!
-//! Envelope detection with hysteresis slices the keying. Dit length is
-//! estimated from a short/long cluster of recent marks so a station that
-//! speeds up or slows down is followed instead of being decoded as
-//! garbage. A passband scout (FFT + keyed-envelope score) finds CW tones
-//! near the cursor and mixes the best one to DC; `n` hops to the next.
+//! Detection and timing are solved jointly by an explicit-duration HMM
+//! scored over a grid of dit periods, so a speed change cannot close a
+//! loop through a slicer. Stage 2 of `weak-signal-plan-3-cw.md` — in the
+//! tree, not yet at that plan's band/flat bars. A passband scout finds CW
+//! tones near the cursor and mixes the best one to DC; `n` hops to the next.
 
 use super::callscan::{CallScanner, utc_hhmmss};
+use super::cw_hsmm::{HsmmDecoder, MorseEvent};
 use super::{CwView, Decoder, FtMessage};
 use crate::dsp::{OnePole, Rotator, mix_decim_into};
 use num_complex::Complex32;
@@ -20,27 +21,10 @@ const SEARCH_HZ: f32 = 180.0;
 const BANDWIDTH: f32 = 400.0;
 const FFT_SIZE: usize = 4096;
 const SCAN_AUDIO: f32 = 8000.0;
-const MARK_HIST: usize = 24;
-/// Marks the speed tracker clusters over.
-///
-/// `MARK_HIST` is sized for the structure check in `morse_clock`, which wants
-/// as long a run as it can get before deciding a fist is not Morse. The speed
-/// tracker wants the opposite: when an operator changes speed, every mark
-/// still in the window from the old fist drags the clusters toward the old
-/// clock, and with 24 marks a 15→32 WPM change takes longer to flush than a
-/// short over lasts — the tracker settles halfway, at 18 WPM, where the new
-/// dahs look like slow dits and hold it there. Clustering over the most
-/// recent marks only shortens that to about a word.
-const RECLUSTER_MARKS: usize = 10;
 /// Envelope history for the scope pane (~0.7 s at 1 kHz).
 const ENV_HIST: usize = 700;
-/// 5–50 WPM. Below that is not Morse; above it noise ripples chop.
-const DIT_MIN_S: f32 = 0.024; // ~50 WPM
-const DIT_MAX_S: f32 = 0.24; // ~5 WPM
-/// Marks held before the clock is trusted and the copy starts flowing.
-/// Enough to cluster a dit and a dah from — about two characters — without
-/// making a station that sends only "K" wait forever.
-const WARMUP_MARKS: usize = 8;
+/// 5 WPM upper bound on the matched-filter window.
+const DIT_MAX_S: f32 = 0.24;
 /// Envelope samples discarded at start-up and after a re-lock, while the
 /// filter chain fills. At the 1 kHz envelope rate this is 60 ms — an order
 /// of magnitude past the settling time of everything in front of it, and
@@ -105,31 +89,6 @@ const POST_MIX_K: f32 = 2.5;
 /// narrow costs the station.
 const POST_MIX_MIN_HZ: f32 = 60.0;
 
-/// Where the slicer arms and releases, as a fraction of the span between the
-/// tracked floor and peak.
-///
-/// These were 0.52 and 0.32, which are the right numbers if `peak` is the
-/// level of a mark. It is not: `peak` attacks instantly and decays over 2.5 s,
-/// so it is a max-hold, and a max-hold over a noisy envelope sits well above
-/// the marks it is supposed to be measuring. The bias grows as the signal
-/// weakens, which is precisely when it hurts — the span inflates, the arming
-/// threshold rides up with it, and real marks stop reaching it. Copy did not
-/// degrade gracefully at 0 dB so much as fall through the floor.
-///
-/// Compensating in the coefficients is not elegant, but it is what measures
-/// best. Slicing against `mark_env`/`space_env` instead — the levels that are
-/// honestly a mark and a space — was tried and is worse (87.4 % against
-/// 89.2 %): those settle slowly and only under conditions the slicer itself
-/// has to establish first, so they lag exactly when the signal is moving.
-///
-/// Swept jointly over a four-seed grid, the surface is a broad plateau across
-/// roughly 0.38–0.46 arming and 0.28–0.32 releasing, all of it 1.5 to 2.4
-/// points above the old pair; these sit in the middle of it. The release
-/// threshold must not go much below 0.28 — at 0.24 the score collapses,
-/// because a mark that never releases runs into the next one.
-const ON_SPAN_K: f32 = 0.40;
-const OFF_SPAN_K: f32 = 0.30;
-
 /// Cascaded complex one-poles: the post-mix channel filter.
 struct NarrowLpf {
     z: [Complex32; POST_MIX_POLES],
@@ -158,110 +117,10 @@ impl NarrowLpf {
     }
 
     /// Retune the corner, keeping the filter state so the change does not
-    /// click. Only called when the tracked speed has moved materially.
+    /// click. Only called when the HSMM's winning period has moved materially.
     fn set_corner(&mut self, hz: f32, fs: f32) {
         self.a = 1.0 - (-2.0 * PI * hz / fs).exp();
     }
-}
-
-/// Read a dit and a dah length out of a run of mark lengths, or decide the
-/// run is not Morse at all.
-///
-/// Keyed Morse puts its marks in two tight clusters about three units apart.
-/// Noise sliced by a threshold sitting inside it produces marks with an
-/// exponential-looking spread and no such structure, so requiring the
-/// structure is what separates a real fist from an empty frequency — the
-/// difference between copy and the letters that noise spells.
-///
-/// Returns `(dit, dah)` in envelope samples.
-fn morse_clock(marks: &[f32], gaps: &[f32]) -> Option<(f32, f32)> {
-    if marks.len() < 3 {
-        return None;
-    }
-    let mut v: Vec<f32> = marks.to_vec();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let (c1_init, c2_init) = (v[0], v[v.len() - 1]);
-    if c2_init <= c1_init * 1.55 {
-        // Homogeneous mark sequence (all dits or all dahs with human jitter).
-        let med = v[v.len() / 2];
-        if med < 1e-6 {
-            return None;
-        }
-        let near = v.iter().filter(|&&x| (x - med).abs() <= 0.35 * med).count();
-        if near * 10 >= v.len() * 7 {
-            // Disambiguate all-dits vs all-dahs using inter-element gaps if available:
-            if gaps.len() >= 2 {
-                let mut g = gaps.to_vec();
-                g.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let short_gap = g[g.len() / 4];
-                if short_gap > 0.0 && short_gap <= 0.55 * med {
-                    // Marks are dahs (~3 dits), inter-element gaps are dits (~1 dit)
-                    let dit = (med / 3.0).max(short_gap);
-                    return Some((dit, med));
-                }
-            }
-            return Some((med, 3.0 * med));
-        }
-    }
-    // Two-mean cluster, seeded at the extremes.
-    let (mut c1, mut c2) = (c1_init, c2_init);
-    for _ in 0..12 {
-        let (mut s1, mut n1, mut s2, mut n2) = (0.0, 0.0, 0.0, 0.0);
-        for &x in &v {
-            if (x - c1).abs() <= (x - c2).abs() {
-                s1 += x;
-                n1 += 1.0;
-            } else {
-                s2 += x;
-                n2 += 1.0;
-            }
-        }
-        if n1 > 0.0 {
-            c1 = s1 / n1;
-        }
-        if n2 > 0.0 {
-            c2 = s2 / n2;
-        }
-    }
-    let (short, long) = if c1 <= c2 { (c1, c2) } else { (c2, c1) };
-    if short < 1e-6 {
-        return None;
-    }
-    // A dah is ~3 dits; allow heavy straight key (1.75) up to fast bug (5.0).
-    let r = long / short;
-    if !(1.75..=5.0).contains(&r) {
-        return None;
-    }
-    // Every mark must sit close to one of the two lengths.
-    let near = v
-        .iter()
-        .filter(|&&x| {
-            let d = (x - short).abs().min((x - long).abs());
-            d <= 0.38
-                * if (x - short).abs() < (x - long).abs() {
-                    short
-                } else {
-                    long
-                }
-        })
-        .count();
-    if near * 10 < v.len() * 7 {
-        return None;
-    }
-    Some((short, long))
-}
-
-/// Whether the gaps between marks are keyed by the same clock as the marks.
-fn gaps_match_clock(gaps: &[f32], dit: f32) -> bool {
-    if gaps.len() < 2 || dit <= 0.0 {
-        return true;
-    }
-    let mut v: Vec<f32> = gaps.to_vec();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    // The inter-element gap is the commonest, so the lower half of the
-    // distribution is the one to compare against a dit.
-    let short = v[v.len() / 4];
-    (0.35..=2.8).contains(&(short / dit))
 }
 
 /// A CW tone found by the span scout or the in-passband searcher.
@@ -278,35 +137,14 @@ pub struct CwDecoder {
     smooth: OnePole,
     matched: VecDeque<f32>,
     matched_sum: f32,
-    peak: f32,
-    floor: f32,
-    peak_decay: f32,
-    floor_attack: f32,
-    floor_decay: f32,
     decim_ctr: usize,
     key_down: bool,
-    run: f32,
-    /// Samples the raw slicer has disagreed with `key_down`. An edge is
-    /// only committed once this outlasts the debounce, so a QSB dropout
-    /// cannot split a dah and a static crash cannot invent a dit.
-    pending: f32,
     dit: f32,
-    /// Tracked dah length; with `dit` it sets the dit/dah boundary so a
-    /// heavy or light fist is classified by the operator's own weighting.
-    dah: f32,
-    marks: VecDeque<f32>,
-    /// Fast-adapt elements remaining after idle or a speed-change snap.
-    acquire: u32,
-    /// Elements held while the clock is still unknown, oldest first.
-    warmup: Vec<(f32, bool)>,
-    /// Whether `warmup` is collecting rather than the clock being trusted.
-    warming: bool,
+    hsmm: HsmmDecoder,
     symbol: String,
     text: String,
     /// Word scanner for pskreporter spots (`CQ ... CALL`, `DE CALL CALL`).
     scan: CallScanner,
-    idle: f32,
-    started: bool,
     quality: f32,
     env_hist: VecDeque<f32>,
     key_hist: VecDeque<bool>,
@@ -318,8 +156,6 @@ pub struct CwDecoder {
     space_env: f32,
     prev_mixed: Complex32,
     have_mixed: bool,
-    /// Whether the peak/floor trackers have been seeded.
-    have_env: bool,
     /// Envelope samples still to discard while the filters fill.
     settle: u32,
     /// Searches to skip after a manual nudge so AFC does not fight the user.
@@ -362,26 +198,13 @@ impl CwDecoder {
             matched_sum: 0.0,
             post: NarrowLpf::new(fs),
             post_hz: POST_MIX_HZ,
-            peak: 0.0,
-            floor: 0.0,
-            peak_decay: 1.0 - (-1.0f32 / (2.5 * env_rate)).exp(),
-            floor_attack: 1.0 - (-1.0f32 / (2.0 * env_rate)).exp(),
-            floor_decay: 1.0 - (-1.0f32 / (0.10 * env_rate)).exp(),
             decim_ctr: 0,
             key_down: false,
-            run: 0.0,
-            pending: 0.0,
             dit: 0.06 * env_rate, // start at 20 WPM
-            dah: 0.18 * env_rate,
-            marks: VecDeque::with_capacity(MARK_HIST + 1),
-            acquire: 16,
-            warmup: Vec::new(),
-            warming: true,
+            hsmm: HsmmDecoder::new(env_rate),
             symbol: String::new(),
             text: String::new(),
             scan: CallScanner::new(),
-            idle: 0.0,
-            started: false,
             quality: 0.0,
             env_hist: VecDeque::with_capacity(ENV_HIST + 1),
             key_hist: VecDeque::with_capacity(ENV_HIST + 1),
@@ -392,7 +215,6 @@ impl CwDecoder {
             space_env: 0.0,
             prev_mixed: Complex32::new(0.0, 0.0),
             have_mixed: false,
-            have_env: false,
             settle: SETTLE_MS,
             hold_tune: 0,
             mix_hz: 0.0,
@@ -425,9 +247,9 @@ impl CwDecoder {
         s * self.mix_rot.next()
     }
 
-    /// Match the post-mix filter to the tracked keying speed.
+    /// Match the post-mix filter to the winning dit period.
     fn update_post_mix(&mut self) {
-        let want = if self.warming {
+        let want = if !self.hsmm.have_period() {
             POST_MIX_HZ
         } else {
             let dit_s = (self.dit / self.env_rate).max(1e-3);
@@ -439,308 +261,40 @@ impl CwDecoder {
         }
     }
 
-    fn clamp_dit(&mut self) {
-        let lo = DIT_MIN_S * self.env_rate;
-        let hi = DIT_MAX_S * self.env_rate;
-        self.dit = self.dit.clamp(lo, hi);
-        self.dah = self.dah.clamp(2.0 * self.dit, 4.4 * self.dit);
-    }
-
-    /// How long the slicer must hold a new state before the edge is real.
-    fn debounce_env(&self) -> f32 {
-        (0.25 * self.dit).clamp(0.006 * self.env_rate, 0.030 * self.env_rate)
-    }
-
     fn push_symbol(&mut self) {
         if self.symbol.is_empty() {
             return;
         }
         let sym = std::mem::take(&mut self.symbol);
-        // Only emit symbols if there is carrier SNR
-        let snr_ok = self.peak > 1.8 * self.floor.max(1e-9);
-        if !snr_ok {
+        if self.mark_env < 1.25 * self.space_env.max(1e-9) {
             return;
         }
         if let Some(c) = morse_lookup(&sym) {
-            let is_dit = sym == ".";
-            if is_dit && self.quality < 0.40 {
-                return;
-            }
             self.text.push(c);
             self.scan.push(c);
-        } else {
+        } else if sym.len() <= 7 {
             self.text.push('*');
             self.scan.push('*');
-            self.quality *= 0.85;
         }
     }
 
-    fn on_mark_end(&mut self, len: f32) {
-        if len > 6.0 * self.dah || len > 1.4 * self.env_rate {
-            self.symbol.clear();
-            self.warmup.clear();
+    fn apply_events(&mut self, evs: &[MorseEvent]) {
+        // Without a tone lock, mark/space contrast is the only thing that
+        // separates a weak station from the HSMM explaining band noise.
+        if !self.locked && self.mark_env < 2.4 * self.space_env.max(1e-9) {
             return;
         }
-        if !self.warming && len < 0.012 * self.env_rate {
-            // Discard sub-12ms noise glitch
-            return;
-        }
-        if self.warming {
-            self.warmup.push((len, true));
-            let n_marks = self.warmup.iter().filter(|(_, m)| *m).count();
-            if n_marks >= WARMUP_MARKS {
-                self.flush_warmup();
-            }
-            return;
-        }
-        self.classify_mark(len);
-
-        if self.marks.len() >= 12 {
-            let recent: Vec<f32> = self.marks.iter().copied().collect();
-            let gaps: Vec<f32> = Vec::new();
-            if morse_clock(&recent, &gaps).is_none() {
-                if self.peak < 1.5 * self.floor.max(1e-9) || self.quality < 0.05 {
-                    self.symbol.clear();
-                    self.warmup.clear();
-                    self.warming = true;
-                    self.marks.clear();
-                }
-            }
-        }
-    }
-
-    /// Set the clock from the held elements, then replay them.
-    fn flush_warmup(&mut self) {
-        let marks: Vec<f32> = self
-            .warmup
-            .iter()
-            .filter(|(_, m)| *m)
-            .map(|(l, _)| *l)
-            .collect();
-        let gaps: Vec<f32> = self
-            .warmup
-            .iter()
-            .filter(|(_, m)| !*m)
-            .map(|(l, _)| *l)
-            .collect();
-        let clock = morse_clock(&marks, &gaps).filter(|(dit, _)| gaps_match_clock(&gaps, *dit));
-        let (dit, dah) = match clock {
-            Some((dit, dah)) => (dit, dah),
-            None => {
-                if marks.len() >= WARMUP_MARKS {
-                    if let Some(i) = self.warmup.iter().position(|(_, m)| *m) {
-                        self.warmup.drain(..=i);
-                    } else {
-                        self.warmup.clear();
+        for ev in evs {
+            match ev {
+                MorseEvent::Dit => self.symbol.push('.'),
+                MorseEvent::Dah => self.symbol.push('-'),
+                MorseEvent::CharGap => self.push_symbol(),
+                MorseEvent::WordGap => {
+                    self.push_symbol();
+                    self.scan.push(' ');
+                    if !self.text.ends_with(' ') && !self.text.is_empty() {
+                        self.text.push(' ');
                     }
-                    return;
-                } else if self.dit >= DIT_MIN_S * self.env_rate {
-                    (self.dit, self.dah)
-                } else {
-                    return;
-                }
-            }
-        };
-        self.dit = dit;
-        self.dah = dah;
-        self.clamp_dit();
-        self.marks.clear();
-        for &m in marks.iter().take(MARK_HIST) {
-            self.marks.push_back(m);
-        }
-
-        let mut held: Vec<(f32, bool)> = std::mem::take(&mut self.warmup);
-        if let Some(cut) = held.iter().position(|(l, m)| !*m && *l > 7.0 * dit)
-            && held[..cut].iter().filter(|(_, m)| *m).count() <= 2
-        {
-            held.drain(..=cut);
-        }
-        self.warming = false;
-        self.acquire = 8;
-        for (len, is_mark) in held {
-            if is_mark {
-                self.classify_mark(len);
-            } else {
-                self.on_space_end(len);
-            }
-        }
-    }
-
-    /// Classify one mark against the current clock and add it to the symbol.
-    fn classify_mark(&mut self, len: f32) {
-        let dit = self.dit.max(1e-6);
-        let ratio = len / dit;
-
-        if ratio < 0.40 {
-            return;
-        }
-
-        // Classify against the midpoint of the *tracked* dit and dah, not a
-        // fixed 2.0: a fist with light dahs (or stretched dits) moves the
-        // boundary with it instead of straddling it.
-        let boundary = ((self.dit + self.dah) / (2.0 * dit)).clamp(1.50, 2.75);
-        let is_dah = ratio >= boundary;
-        self.symbol.push(if is_dah { '-' } else { '.' });
-
-        self.marks.push_back(len);
-        if self.marks.len() > MARK_HIST {
-            self.marks.pop_front();
-        }
-
-        let alpha = if self.acquire > 0 { 0.20 } else { 0.08 };
-        if self.acquire > 0 {
-            self.acquire -= 1;
-        }
-        let dah_r = (self.dah / dit).clamp(2.0, 4.2);
-        // The lower gate matches the one that rejected the mark outright a few
-        // lines up. With the two set differently there was a band of lengths —
-        // 0.40 to 0.50 dits — good enough to be decoded as a dit but not good
-        // enough to say anything about the clock, and that band is exactly
-        // where a real dit lands when the operator has just doubled their
-        // speed: against the old clock a 32 WPM dit reads 0.47. The shorter
-        // dits were being decoded and then ignored while the same fist's dahs
-        // read 1.4 and were taken for slow dits, which pushes the estimate the
-        // wrong way. Letting them speak is worth a fifth of a point of score.
-        //
-        // It is not what rescues a doubled speed on its own — `RECLUSTER_MARKS`
-        // is — but it stops this loop pulling against that one.
-        if !is_dah && ratio < boundary && ratio > 0.40 {
-            self.dit = (1.0 - alpha) * self.dit + alpha * len;
-        } else if is_dah && ratio >= boundary && ratio < 5.0 {
-            let a = alpha * 0.5;
-            self.dah = (1.0 - a) * self.dah + a * len;
-            self.dit = (1.0 - a) * self.dit + a * (len / dah_r);
-        }
-        self.clamp_dit();
-
-        if self.marks.len() >= 6 {
-            self.recluster();
-        }
-
-        let fit = if is_dah {
-            1.0 - (len / self.dah.max(1e-6) - 1.0).abs().min(1.0)
-        } else {
-            1.0 - (ratio - 1.0).abs().min(1.0)
-        };
-        let snr_factor = ((self.peak / self.floor.max(1e-9) - 1.0) / 1.8).clamp(0.0, 1.0);
-        let sample_q = fit * snr_factor;
-
-        let dah_count = self.marks.iter().filter(|&&m| m >= 1.7 * self.dit).count();
-        let dit_count = self.marks.iter().filter(|&&m| m < 1.7 * self.dit).count();
-        let single_type_consistent = if self.marks.len() >= 6 {
-            let mean = self.marks.iter().sum::<f32>() / self.marks.len() as f32;
-            let variance = self.marks.iter().map(|m| (m - mean).powi(2)).sum::<f32>() / self.marks.len() as f32;
-            variance.sqrt() <= 0.38 * mean
-        } else {
-            true
-        };
-        let coherent = (dah_count >= 1 && dit_count >= 1) || single_type_consistent;
-        let target_q = if coherent { sample_q } else { sample_q * 0.45 };
-        let q_alpha = if self.acquire > 0 { 0.28 } else { 0.12 };
-        self.quality = (1.0 - q_alpha) * self.quality + q_alpha * target_q;
-    }
-
-    /// Two-mean cluster of recent mark lengths. If the short cluster is a
-    /// coherent dit and the long one is ~3×, snap toward it when the
-    /// operator has changed speed.
-    fn recluster(&mut self) {
-        let mut v: Vec<f32> = self.marks.iter().rev().take(RECLUSTER_MARKS).copied().collect();
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let c1_init = v[0];
-        let c2_init = *v.last().unwrap();
-        if (c2_init - c1_init).abs() < 1e-6 {
-            return;
-        }
-        if c2_init <= c1_init * 1.55 {
-            let med = v[v.len() / 2];
-            if med < 1e-6 {
-                return;
-            }
-            let is_dah_cluster = (med - self.dah).abs() < (med - self.dit).abs() && med > 1.8 * self.dit;
-            if is_dah_cluster {
-                self.dah = 0.75 * self.dah + 0.25 * med;
-                self.clamp_dit();
-            }
-            return;
-        }
-        let (mut c1, mut c2) = (c1_init, c2_init);
-        for _ in 0..8 {
-            let mut s1 = 0.0;
-            let mut n1 = 0.0;
-            let mut s2 = 0.0;
-            let mut n2 = 0.0;
-            for &x in &v {
-                if (x - c1).abs() <= (x - c2).abs() {
-                    s1 += x;
-                    n1 += 1.0;
-                } else {
-                    s2 += x;
-                    n2 += 1.0;
-                }
-            }
-            if n1 > 0.0 {
-                c1 = s1 / n1;
-            }
-            if n2 > 0.0 {
-                c2 = s2 / n2;
-            }
-        }
-        let (short, long, n_short) = if c1 <= c2 {
-            let n = v
-                .iter()
-                .filter(|&&x| (x - c1).abs() <= (x - c2).abs())
-                .count();
-            (c1, c2, n)
-        } else {
-            let n = v
-                .iter()
-                .filter(|&&x| (x - c2).abs() <= (x - c1).abs())
-                .count();
-            (c2, c1, n)
-        };
-        let n_long = v.len() - n_short;
-        if n_short < 2 || n_long < 1 || short < 1e-6 {
-            return;
-        }
-        let r = long / short;
-        if !(1.75..=4.8).contains(&r) {
-            return;
-        }
-        let rel = (short - self.dit).abs() / self.dit.max(1e-6);
-        if rel > 0.22 {
-            // Speed changed: adopt the new clock directly from the measured cluster
-            self.dit = short;
-            self.dah = long;
-            self.acquire = 8;
-        } else {
-            self.dit = 0.80 * self.dit + 0.20 * short;
-            self.dah = 0.80 * self.dah + 0.20 * long;
-        }
-        self.clamp_dit();
-    }
-
-    fn on_space_end(&mut self, len: f32) {
-        if self.warming {
-            if !self.warmup.is_empty() {
-                self.warmup.push((len, false));
-            }
-            return;
-        }
-        // Adaptive character boundary: 2.1 dits cleanly separates elements (1 dit) and characters (3 dits)
-        if len >= 2.1 * self.dit {
-            self.push_symbol();
-            // A character gap is 3 dits and a word gap 7, so the honest place
-            // to split them is 5. It sat at 5.5, which leant toward calling a
-            // word gap a character gap — and the slicer leans the same way:
-            // it arms below the middle of the span and releases below that
-            // again, so every mark reads a little long and every gap a little
-            // short. Two biases in the same direction ran words together on
-            // the live capture (`CVA PT6T` came out `CVAPT6T`). Five is the
-            // midpoint and measures a shade better than 5.5 as well.
-            if len >= 5.0 * self.dit {
-                self.scan.push(' ');
-                if !self.text.ends_with(' ') && !self.text.is_empty() {
-                    self.text.push(' ');
                 }
             }
         }
@@ -889,19 +443,9 @@ impl CwDecoder {
         self.search_buf.clear();
         self.since_search = 0;
         self.symbol.clear();
-        self.warmup.clear();
-        self.warming = true;
         self.key_down = false;
-        self.run = 0.0;
-        self.pending = 0.0;
-        self.started = false;
-        self.acquire = 16;
-        self.idle = 0.0;
-        self.peak = 0.0;
-        self.floor = 0.0;
         self.mark_env = 0.0;
         self.space_env = 0.0;
-        self.have_env = false;
         self.matched.clear();
         self.matched_sum = 0.0;
         self.settle = SETTLE_MS;
@@ -911,131 +455,29 @@ impl CwDecoder {
         self.tune_err = 0.0;
         self.have_mixed = false;
         self.hold_tune = 0;
+        self.hsmm.reset();
         // Keep dit — the next station may be a similar speed.
     }
 
     fn step_envelope(&mut self, env: f32) {
         self.update_post_mix();
-        if !self.have_env {
-            self.peak = env;
-            self.floor = env;
-            self.have_env = true;
-        }
-
-        if env > self.peak {
-            self.peak = env;
-        } else {
-            self.peak += (env - self.peak) * self.peak_decay;
-        }
-        if !self.key_down {
-            let a = if env < self.floor {
-                self.floor_decay
-            } else if self.pending == 0.0 && self.run > 0.3 * self.dit {
-                self.floor_attack
-            } else {
-                0.0
-            };
-            self.floor += (env - self.floor) * a;
-        }
-
-        let span = (self.peak - self.floor).max(1e-9);
-        let on_thr = self.floor + ON_SPAN_K * span;
-        let off_thr = self.floor + OFF_SPAN_K * span;
-        let snr_ok = self.peak > 2.8 * self.floor.max(1e-9);
-
-        let next = if self.key_down {
-            env > off_thr
-        } else {
-            env > on_thr && snr_ok
-        };
-
-        self.on_thr = on_thr;
-        self.off_thr = off_thr;
-
-        let settled = if self.key_down {
-            env > on_thr
-        } else {
-            env < off_thr
-        };
-        if settled && self.pending == 0.0 && self.run > 0.4 * self.dit {
-            let (level, clean_is_up) = if self.key_down {
-                (&mut self.mark_env, true)
-            } else {
-                (&mut self.space_env, false)
-            };
-            if *level <= 0.0 {
-                *level = env;
-            } else {
-                let a = if (env > *level) == clean_is_up {
-                    0.05
-                } else {
-                    0.002
-                };
-                *level += (env - *level) * a;
-            }
-        }
-
-        let norm = ((env - self.floor) / span).clamp(0.0, 1.0);
+        self.hsmm.push(env);
+        self.dit = self.hsmm.dit();
+        self.mark_env = self.hsmm.mu_mark();
+        self.space_env = self.hsmm.mu_space();
+        let span = (self.mark_env - self.space_env).max(1e-9);
+        let norm = ((env - self.space_env) / span).clamp(0.0, 1.0);
+        let keyed = env > self.space_env + 0.45 * span;
         self.env_hist.push_back(norm);
-        self.key_hist.push_back(next);
+        self.key_hist.push_back(keyed);
         while self.env_hist.len() > ENV_HIST {
             self.env_hist.pop_front();
             self.key_hist.pop_front();
         }
-
-        if next == self.key_down {
-            self.run += 1.0 + self.pending;
-            self.pending = 0.0;
-        } else {
-            self.pending += 1.0;
-            if self.pending >= self.debounce_env() {
-                let len = self.run;
-                self.run = self.pending;
-                self.pending = 0.0;
-                if self.key_down {
-                    if len >= 0.010 * self.env_rate {
-                        self.on_mark_end(len);
-                    }
-                } else if self.started {
-                    self.on_space_end(len);
-                }
-                self.started = true;
-                self.idle = 0.0;
-                self.key_down = next;
-            }
-        }
-
-        if !self.key_down {
-            self.idle += 1.0;
-            if self.idle > 6.0 * self.dit {
-                if !self.symbol.is_empty() {
-                    self.push_symbol();
-                }
-                if (self.idle - 6.0 * self.dit) <= 1.0 {
-                    self.scan.push(' ');
-                    if !self.text.ends_with(' ') && !self.text.is_empty() {
-                        self.text.push(' ');
-                    }
-                }
-            }
-            if self.idle > 6.0 * self.env_rate {
-                self.acquire = self.acquire.max(12);
-                if !self.warming {
-                    self.symbol.clear();
-                    self.warming = true;
-                    self.marks.clear();
-                }
-            }
-            if self.warming && !self.warmup.is_empty() {
-                let marks_count = self.warmup.iter().filter(|(_, m)| *m).count();
-                if marks_count >= 3 && self.started && self.idle > 6.0 * self.dit {
-                    self.flush_warmup();
-                } else if self.idle > 1.5 * self.env_rate {
-                    self.warmup.clear();
-                    self.warming = true;
-                }
-            }
-        }
+        self.on_thr = self.space_env + 0.55 * span;
+        self.off_thr = self.space_env + 0.35 * span;
+        self.key_down = keyed;
+        self.quality = self.hsmm.quality();
     }
 }
 
@@ -1096,7 +538,7 @@ impl Decoder for CwDecoder {
             self.mix_rot.reset_phase();
             self.post.reset();
             self.symbol.clear();
-            self.acquire = 12;
+            self.hsmm.reset();
             h.offset_hz
         })
     }
@@ -1114,12 +556,12 @@ impl Decoder for CwDecoder {
     }
 
     fn cw_view(&self) -> Option<CwView> {
-        let span = (self.peak - self.floor).max(1e-9);
+        let span = (self.mark_env - self.space_env).max(1e-9);
         Some(CwView {
             env: self.env_hist.iter().copied().collect(),
             keyed: self.key_hist.iter().copied().collect(),
-            on_thr: ((self.on_thr - self.floor) / span).clamp(0.0, 1.0),
-            off_thr: ((self.off_thr - self.floor) / span).clamp(0.0, 1.0),
+            on_thr: ((self.on_thr - self.space_env) / span).clamp(0.0, 1.0),
+            off_thr: ((self.off_thr - self.space_env) / span).clamp(0.0, 1.0),
             lock_hz: self.mix_hz,
             tune_err_hz: self.tune_err,
             wpm: self.wpm(),
@@ -1170,7 +612,7 @@ impl Decoder for CwDecoder {
                 continue;
             }
 
-            let matched_n = (0.35 * self.dit)
+            let matched_n = (0.22 * self.dit)
                 .round()
                 .clamp(4.0, self.env_rate * DIT_MAX_S) as usize;
             self.matched.push_back(raw_env);
@@ -1184,6 +626,10 @@ impl Decoder for CwDecoder {
             let env = self.matched_sum / self.matched.len().max(1) as f32;
             self.step_envelope(env);
         }
+        let evs = self.hsmm.flush();
+        self.apply_events(&evs);
+        self.quality = self.hsmm.quality();
+        self.dit = self.hsmm.dit();
         std::mem::take(&mut self.text)
     }
 
@@ -1201,9 +647,7 @@ impl Decoder for CwDecoder {
         }
     }
 
-    /// How cleanly recent marks fell into the dit and dah buckets. Keying that
-    /// is really noise through the slicer has random mark lengths, so they
-    /// straddle the boundary and this collapses; well-sent CW sits near 1.
+    /// Likelihood ratio of the HSMM's best path against an all-space null.
     fn confidence(&self) -> Option<f32> {
         Some(self.quality.clamp(0.0, 1.0))
     }
@@ -1233,9 +677,7 @@ impl Decoder for CwDecoder {
 
     fn reset(&mut self) {
         self.text.clear();
-        self.marks.clear();
         self.dit = 0.06 * self.env_rate;
-        self.dah = 0.18 * self.env_rate;
         self.clear_lock_state();
     }
 }

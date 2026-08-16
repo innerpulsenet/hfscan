@@ -1,31 +1,41 @@
 # CW plan, round 3 — the band, not the bench
 
-**Status:** Stage 0 complete and committed. Stage 1 attempted five ways and
-rejected; the tree contains none of it. Stage 2 is specified below and is the
-next piece of work.
+**Status:** Stage 0 complete and committed on `main`. Stage 1 attempted five
+ways and rejected; none of it is in the tree. Stage 2 (the HSMM in §5) is
+**implemented on `weak-signal-stage2-hsmm` and has not met §6.** Do not merge
+it as-is. Section 7 is the handback from that attempt.
 
-**This document is a handoff.** It is written so that someone who has not seen
-the preceding work can pick Stage 2 up, build it, and know whether it worked.
-Sections 1–4 are context and must be read before touching the decoder; section
-5 is the specification; section 6 is how to know you are done.
+**This document is a handoff.** Sections 1–4 are context; section 5 is the
+specification Stage 2 followed; section 6 is still how to know you are done;
+section 7 is what the first implementation measured.
 
 ---
 
 ## 0. Orientation
 
-The CW decoder is `src/decoders/cw.rs`. It is a chain of hard decisions:
+The CW decoder is `src/decoders/cw.rs` plus `src/decoders/cw_hsmm.rs`.
+Front-end (unchanged) and Stage 2 element decoder:
 
 ```
 IQ in → mix wanted tone to DC → 4-pole narrow LPF → magnitude → smooth
-      → decimate to 1 kHz → matched boxcar (0.35 dit)
-      → hysteresis slicer (step_envelope)
-      → mark/space durations (on_mark_end / on_space_end)
-      → per-element dit/dah classification against a tracked clock (classify_mark)
-      → symbol string "-.-" → table lookup (morse_lookup) → text
+      → decimate to 1 kHz → matched boxcar (0.22 dit)
+      → mean-referenced mu_mark / mu_space
+      → HSMM Viterbi on a 500 Hz trellis over a 5–50 WPM dit-period grid
+      → committed mark/dit-dah / gap segmentation → morse_lookup → text
 ```
 
-The tone search and lock (`search`, `score_cw`) sit alongside and are good;
-they are not in scope for Stage 2.
+`CwDecoder::wpm` and `CwView::dit_ms` come from the winning grid period.
+`confidence()` is the best-path score against an all-space null, not mark-bucket
+fit. The tone search and lock (`search`, `score_cw`) sit alongside and were
+not in scope for Stage 2.
+
+Stage 0, still the committed decoder on `main`, was the hard-decision chain:
+
+```
+… → matched boxcar (0.35 dit) → hysteresis slicer (step_envelope)
+  → on_mark_end / on_space_end → classify_mark against a tracked clock
+  → morse_lookup
+```
 
 ### Commands
 
@@ -52,11 +62,11 @@ machine that recorded it before trusting any real-band number.
 
 ### The three instruments
 
-| Instrument | What it measures | Now |
-|---|---|---|
-| `bench_cw_score` (41 cells) | flat carrier, AWGN — the laboratory | **90.22 %** |
-| `bench_cw_band` (16 cells) | Watterson channel, QRM, static — the band | **43.54 %** |
-| `tests/cw_capture.rs` | token recall on the real 20m recording | **81.9 %** |
+| Instrument | What it measures | Stage 0 (`main`) | Stage 2 (`weak-signal-stage2-hsmm`) |
+|---|---|---|---|
+| `bench_cw_score` (41 cells) | flat carrier, AWGN — the laboratory | **90.22 %** | **84.05 %** |
+| `bench_cw_band` (16 cells) | Watterson channel, QRM, static — the band | **43.54 %** | **41.84 %** |
+| `tests/cw_capture.rs` | token recall on the real 20m recording | **81.9 %** | not re-run |
 
 Both grids average every cell over four noise seeds. Single-trial cells near
 the copy threshold swing by tens of points on which noise burst lands in which
@@ -435,18 +445,99 @@ lower one is the finding, not the fix.
 
 ## 7. Handback
 
-Report:
+Stage 2 as specified in §5 is on `weak-signal-stage2-hsmm`. Isolated Viterbi
+on a clean
+0/1 envelope recovers `PARIS` / `CQ` at the right `T`. The loss is in the
+real envelope, windowing, and fade-following, not the grammar.
 
-1. `bench_cw_band` and `bench_cw_score` full cell listings, before and after.
-2. `cw_capture` table, before and after, including the density column.
-3. Which acceptance criteria are met and which are not, plainly.
-4. Anything tried and rejected, with its numbers — the table in section 3 is
-   the format, and it has already saved five re-runs.
-5. Measured throughput (the CW row of `cargo run --release --bin bench_replay`),
-   since Stage 2 will cost some of the current ~2500× real time.
+`captures/20m_baseline_metrics.json` was not touched.
 
-Do not update `captures/20m_baseline_metrics.json` without saying so; it is the
-reference point for `bench_replay --fail-on-regression`.
+### 7.1 `bench_cw_band` — before (Stage 0) and after (Stage 2)
+
+| Cell | Stage 0 | Stage 2 |
+|---|---:|---:|
+| chan flat 12dB | 100.0% | 97.3% |
+| chan good 12dB | 87.2% | 84.9% |
+| chan moderate 12dB | 45.7% | 45.3% |
+| chan poor 12dB | 26.6% | 21.4% |
+| chan flutter 12dB | 1.4% | 0.0% |
+| moderate 20dB | 48.6% | 49.3% |
+| moderate 6dB | 40.1% | 41.2% |
+| qrm x1 moderate | — | 45.3% |
+| qrm x2 moderate | — | 34.0% |
+| qrm x3 moderate | 25.2% | 25.9% |
+| qrm x3 poor | — | 13.7% |
+| crashes 2/s moderate | — | 43.9% |
+| crashes 6/s moderate | — | 43.9% |
+| the band, 10dB | 15.3% | 9.0% |
+| the band, 4dB | — | 14.2% |
+| empty, qrm only | 100.0% | 100.0% |
+| **mean** | **43.54%** | **41.84%** |
+
+Dashes are cells the Stage 0 write-up did not quote. The mean is over all
+16 cells. Fourteen extra dB on the moderate path still buy almost nothing
+(49.3 vs 41.2). Stage 2 has not earned its complexity.
+
+### 7.2 `bench_cw_score`
+
+Stage 0 mean **90.22%**. Stage 2 mean **84.05%** (gate 88%). Full 41-cell
+listing was not printed; worst cells:
+
+| Cell | Stage 2 |
+|---|---:|
+| short 12wpm −3dB | 0% |
+| short 18wpm −3dB | 0% |
+| short 25wpm −3dB | 4% |
+| short 35wpm −3dB | 8% |
+| short 35wpm +0dB | 48% |
+| short 12wpm +0dB | 50% |
+
+The give-back is at the noise wall, not a small robustness tax.
+
+### 7.3 `cw_capture`
+
+Not re-run. Stage 0 token recall remains the last measured figure (81.9%).
+
+### 7.4 Acceptance
+
+| Criterion | Need | Stage 2 | Met |
+|---|---|---|---|
+| Speed / adjacent / clean-start canaries | green | pass | yes |
+| `cw_copies_at_zero_db` | ≥ 60% at 0 dB | ~25% | **no** |
+| `cargo test --release` | green | 0 dB + 88% flat gate fail | **no** |
+| `bench_cw_band` | ≥ 60% | 41.84% | **no** |
+| `bench_cw_score` | ≥ 88% | 84.05% | **no** |
+| `cw_capture` recall / density | ≥ 82%, density not down | not run | unknown |
+| `empty, qrm only` | 100% | 100% | yes |
+| Flat `noise *` cells | 100% | not re-listed | unverified |
+| Raise `cw_*_does_not_regress` gates | just under new scores | not done | n/a — scores did not earn it |
+
+### 7.5 Tried on the Stage 2 branch (do not repeat)
+
+| Attempt | Effect | Verdict |
+|---|---|---|
+| Incremental window commit | First mark of each character dropped (`W`→`M`, `C`→`R`) | keep marks that straddle the commit point |
+| Period limits compared at 1 kHz vs 500 Hz trellis | Anything faster than ~25 WPM discarded | compare limits at the trellis rate |
+| 3× period (dits read as dahs) | 15 WPM locked at 46 WPM | penalize `T < 0.55 ×` mark-length hint |
+| Flush-on-every-chunk of lead-in | Locked 50 WPM on silence | wait ~1.15 s of envelope before first decode |
+| Word-gap threshold 3.9 T | Extra spaces (`W1 A W`) | 4.6 T |
+| Full-buffer idle-only emit | Clean copy; 0 dB never flushed | back to incremental flush |
+| Require tone lock to emit | Noise quiet; 0 dB → 0% | lock **or** mark/space contrast ≥ 2.4 |
+| Skip EM for speed | Band 40.84% | one same-`T` EM pass when contrast < 6 → 41.84% |
+
+### 7.6 Throughput
+
+Not re-measured. Stage 0 CW row of `bench_replay` was ~2500×. The Stage 2
+trellis is 500 Hz with a ~2.5 s window; expect to give some of that back.
+Do not quote 2500× as a Stage 2 number.
+
+### 7.7 What to do next
+
+1. Make `mu_mark(t)` follow QSB on a ~50–80 ms time constant *inside* the
+   window — the causal mean is still too sticky on the way down.
+2. Two full EM decode passes on fading cells, not a single same-`T` retry.
+3. Drive `POST_MIX_*` from grid `T` earlier so 0 dB sees the narrow filter.
+4. Re-run `cw_capture` and `bench_replay` before any merge.
 
 ---
 

@@ -351,9 +351,9 @@ impl CwDecoder {
             return;
         }
         let sym = std::mem::take(&mut self.symbol);
-        // Only emit symbols if there is a real carrier present
-        let snr_ok = self.peak > 2.2 * self.floor.max(1e-9);
-        if !snr_ok && self.quality < 0.25 {
+        // Only emit symbols if there is carrier SNR
+        let snr_ok = self.peak > 2.0 * self.floor.max(1e-9);
+        if !snr_ok {
             return;
         }
         let c = morse_lookup(&sym).unwrap_or('*');
@@ -395,7 +395,7 @@ impl CwDecoder {
             if morse_clock(&recent).is_none() {
                 // Only drop back to warm-up if the signal has truly collapsed into noise.
                 if self.peak < 2.3 * self.floor.max(1e-9) || self.quality < 0.15 {
-                    self.push_symbol();
+                    self.symbol.clear();
                     self.warmup.clear();
                     self.warming = true;
                     self.marks.clear();
@@ -473,7 +473,7 @@ impl CwDecoder {
         let mut dit = self.dit.max(1e-6);
         let mut ratio = len / dit;
 
-        // Fast tracking on sudden speed change (e.g. mid-stream speedup or slowdown)
+        // Fast tracking on sudden speed change (>1.5x speedup or slowdown)
         if ratio < 0.65 && len >= DIT_MIN_S * self.env_rate {
             self.dit = 0.25 * self.dit + 0.75 * len;
             self.dah = 0.25 * self.dah + 0.75 * (3.0 * len);
@@ -482,8 +482,8 @@ impl CwDecoder {
             ratio = len / dit;
         } else if ratio > 4.5 && len <= DIT_MAX_S * self.env_rate {
             let new_dit = (len / 3.0).clamp(DIT_MIN_S * self.env_rate, DIT_MAX_S * self.env_rate);
-            self.dit = 0.30 * self.dit + 0.70 * new_dit;
-            self.dah = 0.30 * self.dah + 0.70 * len;
+            self.dit = 0.25 * self.dit + 0.75 * new_dit;
+            self.dah = 0.25 * self.dah + 0.75 * len;
             self.acquire = 12;
             dit = self.dit.max(1e-6);
             ratio = len / dit;
@@ -898,9 +898,7 @@ impl CwDecoder {
             if self.idle > 1.6 * self.env_rate {
                 self.acquire = self.acquire.max(12);
                 if !self.warming {
-                    if !self.symbol.is_empty() {
-                        self.push_symbol();
-                    }
+                    self.symbol.clear();
                     self.warming = true;
                     self.marks.clear();
                 }

@@ -120,11 +120,13 @@ pub trait Decoder: Send {
     fn squelched(&self) -> bool {
         true
     }
-    /// Whether the soft AGC may ride this decoder's audio. Modes that
-    /// normalise a whole capture themselves must say no: a running gain
-    /// tracker moves the noise floor underneath their own soft metrics.
+    /// Whether the soft AGC may ride this decoder's audio. Digital mode
+    /// decoders (CW, FT8, PSK31, RTTY) have their own adaptive slicers or
+    /// whole-block normalizers, so running a dynamic gain tracker ahead of
+    /// them distorts symbol amplitudes and drops weak-signal lock. Defaults
+    /// to false.
     fn wants_agc(&self) -> bool {
-        true
+        false
     }
     /// Drain structured messages decoded since the last call. FT8/FT4 produce
     /// one per decode; PSK31 produces one when a CQ/DE callsign is recognised.

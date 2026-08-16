@@ -997,6 +997,7 @@ impl ChannelTap {
 /// so static crashes and FT8 bursts do not pump the audio.
 pub struct SoftAgc {
     gain: f32,
+    prev_gain: f32,
     hang: u32,
     hang_samples: u32,
     attack: f32,
@@ -1008,6 +1009,7 @@ impl SoftAgc {
         let fs = fs as f32;
         Self {
             gain: 4.0,
+            prev_gain: 4.0,
             hang: 0,
             hang_samples: (0.8 * fs) as u32,
             // Per-block blend toward the target. Blocks are ~80 ms of audio.
@@ -1018,6 +1020,7 @@ impl SoftAgc {
 
     pub fn reset(&mut self) {
         self.gain = 4.0;
+        self.prev_gain = 4.0;
         self.hang = 0;
     }
 
@@ -1061,10 +1064,18 @@ impl SoftAgc {
         }
         self.gain = self.gain.clamp(0.08, 60.0);
 
-        let g = self.gain;
-        for s in samples.iter_mut() {
+        let g_start = if self.gain < self.prev_gain {
+            self.gain
+        } else {
+            self.prev_gain
+        };
+        let g_end = self.gain;
+        let inv_n = 1.0 / n;
+        for (i, s) in samples.iter_mut().enumerate() {
+            let g = g_start + (g_end - g_start) * (i as f32 * inv_n);
             *s *= g;
         }
+        self.prev_gain = self.gain;
     }
 }
 

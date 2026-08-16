@@ -350,10 +350,15 @@ impl CwDecoder {
         if self.symbol.is_empty() {
             return;
         }
-        let c = morse_lookup(&self.symbol).unwrap_or('*');
+        let sym = std::mem::take(&mut self.symbol);
+        // Only emit symbols if there is a real carrier present
+        let snr_ok = self.peak > 2.2 * self.floor.max(1e-9);
+        if !snr_ok && self.quality < 0.25 {
+            return;
+        }
+        let c = morse_lookup(&sym).unwrap_or('*');
         self.text.push(c);
         self.scan.push(c);
-        self.symbol.clear();
     }
 
     fn on_mark_end(&mut self, len: f32) {
@@ -521,13 +526,15 @@ impl CwDecoder {
             self.recluster();
         }
 
-        // Confidence: how cleanly this mark sat in a dit or dah bucket.
+        // Confidence: how cleanly this mark sat in a dit or dah bucket,
+        // weighted by real carrier SNR so noise cannot score high quality.
         let fit = if is_dah {
             1.0 - (len / self.dah.max(1e-6) - 1.0).abs().min(1.0)
         } else {
             1.0 - (ratio - 1.0).abs().min(1.0)
         };
-        self.quality = 0.9 * self.quality + 0.1 * fit;
+        let snr_factor = ((self.peak / self.floor.max(1e-9) - 1.0) / 1.8).clamp(0.0, 1.0);
+        self.quality = 0.88 * self.quality + 0.12 * (fit * snr_factor);
     }
 
     /// Two-mean cluster of recent mark lengths. If the short cluster is a
@@ -1087,11 +1094,9 @@ impl Decoder for CwDecoder {
                     if !self.symbol.is_empty() {
                         self.push_symbol();
                     }
-                    // A gap this long ends a word even when nothing follows
-                    // it. Without this the last token of "DE K1ABC K1ABC" is
-                    // still being assembled when the station stops sending,
-                    // and the spot the announcement was for never lands.
-                    self.scan.push(' ');
+                    if (self.idle - 8.0 * self.dit) <= 1.0 {
+                        self.scan.push(' ');
+                    }
                 }
                 // A pause this long means the next thing heard is very
                 // likely a different station: hold their first elements and
@@ -1100,8 +1105,11 @@ impl Decoder for CwDecoder {
                 if self.idle > 1.6 * self.env_rate {
                     self.acquire = self.acquire.max(12);
                     if !self.warming {
-                        self.push_symbol();
+                        if !self.symbol.is_empty() {
+                            self.push_symbol();
+                        }
                         self.warming = true;
+                        self.marks.clear();
                     }
                 }
                 // Whatever is still held when the band goes quiet has to be
@@ -1109,6 +1117,7 @@ impl Decoder for CwDecoder {
                 if self.warming && !self.warmup.is_empty() && self.idle > 3.0 * self.env_rate {
                     self.flush_warmup();
                     self.warming = true;
+                    self.warmup.clear();
                 }
             }
         }

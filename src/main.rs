@@ -1623,13 +1623,11 @@ impl App {
         }
 
         // Auto-range the colour scale from the current noise floor.
-        let mut sorted = self.smoothed.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        if !sorted.is_empty() {
-            let mut floors = self.noise_floor.clone();
-            floors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let med = floors.get(floors.len() / 2).copied().unwrap_or(sorted[sorted.len() / 2]);
-            let hi = sorted[sorted.len() * 999 / 1000];
+        if !self.smoothed.is_empty() {
+            let med = sampled_median(&self.noise_floor)
+                .or_else(|| sampled_median(&self.smoothed))
+                .unwrap_or(-140.0);
+            let hi = self.smoothed.iter().copied().fold(f32::MIN, f32::max);
             self.floor_db = 0.94 * self.floor_db + 0.06 * (med - 4.0);
             self.ceil_db = 0.90 * self.ceil_db + 0.10 * (hi + 8.0).max(med + 18.0);
         }
@@ -1708,7 +1706,8 @@ impl App {
                 .noise_floor
                 .get(lo..=hi.max(lo))
                 .and_then(|v| v.iter().copied().reduce(f32::max))
-                .unwrap_or(sorted[sorted.len() / 2]);
+                .or_else(|| sampled_median(&self.noise_floor))
+                .unwrap_or(-140.0);
             self.cursor_snr = peak - floor;
         }
 
@@ -1870,9 +1869,8 @@ fn block_level_metrics(block: &[Complex32]) -> (f32, f32, f32) {
             levels.push(m);
         }
     }
-    levels.sort_unstable_by(f32::total_cmp);
-    let idx = ((levels.len() - 1) as f32 * 0.999).round() as usize;
-    let p999 = levels[idx.min(levels.len() - 1)];
+    let idx = (((levels.len() - 1) as f32 * 0.999).round() as usize).min(levels.len() - 1);
+    let (_, &mut p999, _) = levels.select_nth_unstable_by(idx, f32::total_cmp);
     let rms = (power / block.len() as f64).sqrt() as f32;
     (peak, p999, 20.0 * rms.max(1e-6).log10())
 }
@@ -1883,8 +1881,9 @@ fn sampled_median(values: &[f32]) -> Option<f32> {
     }
     let stride = (values.len() / 256).max(1);
     let mut sampled: Vec<f32> = values.iter().step_by(stride).copied().collect();
-    sampled.sort_unstable_by(f32::total_cmp);
-    Some(sampled[sampled.len() / 2])
+    let mid = sampled.len() / 2;
+    let (_, &mut med, _) = sampled.select_nth_unstable_by(mid, f32::total_cmp);
+    Some(med)
 }
 
 fn automatic_rf_notch(freq_hz: f64) -> bool {
@@ -1988,7 +1987,6 @@ fn run_app<B: Backend>(
             app.spec_work.clear();
             app.smoothed.clear();
             app.detect_spec.clear();
-    app.detect_spec.clear();
             app.wf_accum.clear();
             app.waterfall.clear();
         }
@@ -2450,9 +2448,7 @@ fn scout_idents(app: &App) -> Vec<identify::Ident> {
     }
     let n = app.detect_spec.len();
     let bin = app.rate as f32 / n as f32;
-    let mut sorted = app.detect_spec.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let med = sorted[n / 2];
+    let med = sampled_median(&app.detect_spec).unwrap_or(-140.0);
     // The scouts report an offset, not a level; read the level back off the
     // spectrum so a crowded span still spends its slots strongest-first.
     let snr_at = |off_hz: f32| {
@@ -4590,6 +4586,11 @@ fn axis_row(app: &App, w: usize) -> Line<'static> {
     ))
 }
 
+const QUADRANTS_STR: [&str; 16] = [
+    " ", "▘", "▝", "▀", "▖", "▌", "▞", "▛",
+    "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█",
+];
+
 fn draw_waterfall(f: &mut Frame, area: Rect, app: &App) {
     let (lo, hi) = app.view_range();
     let start = (app.center + lo) / 1000.0;
@@ -4651,22 +4652,26 @@ fn draw_waterfall(f: &mut Frame, area: Rect, app: &App) {
 
         let mut spans = Vec::with_capacity(w);
         for x in 0..w {
-            let (ch, fg, bg) = match app.wf_res {
-                WfRes::Quad => quad_cell([
-                    at(&upper, x * 2),
-                    at(&upper, x * 2 + 1),
-                    at(&lower, x * 2),
-                    at(&lower, x * 2 + 1),
-                ]),
-                WfRes::Freq => ('▌', at(&upper, x * 2), at(&upper, x * 2 + 1)),
-                WfRes::Time => ('▀', at(&upper, x), at(&lower, x)),
+            let (glyph, fg, bg) = match app.wf_res {
+                WfRes::Quad => {
+                    let (ch, fg, bg) = quad_cell([
+                        at(&upper, x * 2),
+                        at(&upper, x * 2 + 1),
+                        at(&lower, x * 2),
+                        at(&lower, x * 2 + 1),
+                    ]);
+                    let mask = QUADRANTS.iter().position(|&c| c == ch).unwrap_or(0);
+                    (QUADRANTS_STR[mask], fg, bg)
+                }
+                WfRes::Freq => ("▌", at(&upper, x * 2), at(&upper, x * 2 + 1)),
+                WfRes::Time => ("▀", at(&upper, x), at(&lower, x)),
             };
             let style = Style::default().fg(heat(fg)).bg(heat(bg));
             if x == cur {
                 // Keep the cursor readable against whatever is behind it.
                 spans.push(Span::styled("│", style.fg(Color::Magenta)));
             } else {
-                spans.push(Span::styled(ch.to_string(), style));
+                spans.push(Span::styled(glyph, style));
             }
         }
         lines.push(Line::from(spans));

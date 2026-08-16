@@ -206,7 +206,12 @@ impl Framer {
         match code {
             0x1F => self.figs = false, // LTRS
             0x1B => self.figs = true,  // FIGS
-            0x04 => self.text.push(' '),
+            0x04 => {
+                // USOS (Unshift On Space): revert to LTRS on space to prevent
+                // FIGS lockup from noise or lost shift characters.
+                self.figs = false;
+                self.text.push(' ');
+            }
             0x08 => self.text.push('\n'), // CR
             0x02 => {}                     // LF (CR already breaks the line)
             0x00 => {}

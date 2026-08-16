@@ -33,7 +33,7 @@ pub const FREQ_MIN: f32 = 200.0;
 /// Matches WSJT-X's default upper edge so stations at the top of the
 /// waterfall are not silently dropped.
 pub const FREQ_MAX: f32 = 3000.0;
-const MAX_CAND: usize = 500;
+const MAX_CAND: usize = 600;
 
 pub struct FtDecoder {
     ft4: bool,
@@ -226,7 +226,7 @@ fn decode_slot(
         // strong neighbour's occupied bandwidth — the situation a hot
         // front end (bias-T + LNA) creates. Local Costas EQ flattens
         // per-tone fading before the LLRs are built.
-        let (sync, cand, rounds) = if deep { (0.8, MAX_CAND, 5) } else { (0.9, 200, 3) };
+        let (sync, cand, rounds) = if deep { (0.75, MAX_CAND, 5) } else { (0.9, 200, 3) };
         let res = DecodeRequest::<Ft4>::new(audio, FREQ_MIN, FREQ_MAX, sync, cand)
             .sic_rounds(rounds)
             .eq_mode(EqMode::Local)
@@ -248,7 +248,7 @@ fn decode_slot(
         } else {
             None
         };
-        let (sync, cand) = if deep { (0.8, MAX_CAND) } else { (0.9, 200) };
+        let (sync, cand) = if deep { (0.75, MAX_CAND) } else { (0.9, 200) };
         let mut req = DecodeRequest::<Ft8>::new(audio, FREQ_MIN, FREQ_MAX, sync, cand)
             .sic_early()
             .eq_mode(EqMode::Local)

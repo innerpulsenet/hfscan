@@ -274,6 +274,75 @@ fn cw_decodes_a_sloppy_fist() {
     );
 }
 
+/// Farnsworth timing: characters sent at high speed (24 WPM) with stretched
+/// spacing (equivalent to 16 WPM spacing).
+#[test]
+fn cw_decodes_farnsworth_timing() {
+    let text = "CQ CQ DE W1AW K";
+    let dit_elem = (1.2 / 24.0 * FS as f32) as usize;
+    let dit_space = (1.2 / 16.0 * FS as f32) as usize;
+    let mut key: Vec<f32> = Vec::new();
+    key.extend(std::iter::repeat(0.0).take(dit_elem * 8));
+    for ch in text.chars() {
+        if ch == ' ' {
+            key.extend(std::iter::repeat(0.0).take(dit_space * 5));
+            continue;
+        }
+        for el in morse_for(ch).chars() {
+            let units = if el == '.' { 1.0 } else { 3.0 };
+            let n = ((dit_elem as f32) * units) as usize;
+            key.extend(std::iter::repeat(1.0).take(n));
+            key.extend(std::iter::repeat(0.0).take(dit_elem));
+        }
+        key.extend(std::iter::repeat(0.0).take(dit_space * 2));
+    }
+    key.extend(std::iter::repeat(0.0).take(dit_elem * 8));
+    let sig = key_to_iq(&key, 0.02, CW_TONE);
+    let mut d = cw::CwDecoder::new(FS);
+    let mut out = String::new();
+    for chunk in sig.chunks(4096) {
+        out.push_str(&d.process(chunk));
+    }
+    assert!(
+        out.contains("W1AW") && out.contains("CQ"),
+        "Farnsworth timing lost copy: {out:?} ({})",
+        d.status()
+    );
+}
+
+/// Semi-automatic bug keyer: long dahs (3.8x) with light jitter.
+#[test]
+fn cw_decodes_bug_keyer_weighting() {
+    let key = gen_cw_key("CQ CQ DE W1AW W1AW K", 22.0, 3.8, &[0.90, 1.15, 1.0, 0.95]);
+    let sig = key_to_iq(&key, 0.02, CW_TONE);
+    let mut d = cw::CwDecoder::new(FS);
+    let mut out = String::new();
+    for chunk in sig.chunks(4096) {
+        out.push_str(&d.process(chunk));
+    }
+    assert!(
+        out.contains("W1AW"),
+        "bug keyer weighting lost the callsign: {out:?} ({})",
+        d.status()
+    );
+}
+
+/// All-dit sequences (e.g. 5, H, S, E, I) must not trigger deaf warm-up state resets.
+#[test]
+fn cw_decodes_all_dit_sequences() {
+    let sig = gen_cw("555 5NN H H S S E E 73", 20.0, 0.02);
+    let mut d = cw::CwDecoder::new(FS);
+    let mut out = String::new();
+    for chunk in sig.chunks(4096) {
+        out.push_str(&d.process(chunk));
+    }
+    assert!(
+        out.contains("555") || out.contains("5NN") || out.contains("73"),
+        "all-dit sequence caused decoder failure: {out:?} ({})",
+        d.status()
+    );
+}
+
 /// QSB dropouts and static crashes: brief envelope glitches must be
 /// debounced, not decoded as extra elements or split gaps.
 #[test]
@@ -1297,6 +1366,23 @@ fn cw_copies_a_long_over_at_low_snr() {
             acc * 100.0
         );
     }
+}
+
+/// Multi-minute continuous stream: decoding accuracy must remain rock-solid
+/// over extended text without threshold collapse or drifting deaf.
+#[test]
+fn cw_decodes_continuous_long_stream_without_degrading() {
+    let passage = "CQ CQ DE W1AW W1AW K UR RST 599 599 QTH NEWINGTON CT \
+                   NAME JOE JOE HW CPY? BK TNX FER THE QSO 73 ES GL DE W1AW K ";
+    let full_text = passage.repeat(4);
+    let sig = gen_cw(&full_text, 22.0, scale_for_snr(12.0));
+    let got = decode_cw(&sig, 0.0);
+    let acc = accuracy(&full_text, &got);
+    assert!(
+        acc > 0.92,
+        "Continuous long stream accuracy degraded to {:.1}%: {got:?}",
+        acc * 100.0
+    );
 }
 
 /// The classifier places an auto slot from a spectrum peak, so the carrier

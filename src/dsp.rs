@@ -53,6 +53,7 @@ pub struct Spectrum {
     window: Vec<f32>,
     size: usize,
     buf: Vec<Complex32>,
+    acc: Vec<f32>,
     pending: Vec<Complex32>,
 }
 
@@ -71,6 +72,7 @@ impl Spectrum {
             window,
             size,
             buf: vec![Complex32::new(0.0, 0.0); size],
+            acc: vec![0.0f32; size],
             pending: Vec::with_capacity(size * 2),
         }
     }
@@ -103,7 +105,7 @@ impl Spectrum {
         }
         out.clear();
         out.resize(self.size, 0.0);
-        let mut acc = vec![0.0f32; self.size];
+        self.acc.fill(0.0);
         for s in 0..nseg {
             let start = s * hop;
             let seg = &self.pending[start..start + self.size];
@@ -112,7 +114,7 @@ impl Spectrum {
             }
             self.fft.process(&mut self.buf);
             for i in 0..self.size {
-                acc[i] += self.buf[i].norm_sqr();
+                self.acc[i] += self.buf[i].norm_sqr();
             }
         }
         let consumed = nseg * hop;
@@ -124,7 +126,7 @@ impl Spectrum {
         // fftshift while converting to dB
         for i in 0..self.size {
             let src = (i + half) % self.size;
-            out[i] = 10.0 * (acc[src] * scale + 1e-20).log10();
+            out[i] = 10.0 * (self.acc[src] * scale + 1e-20).log10();
         }
     }
 }
@@ -158,32 +160,32 @@ impl NoiseFloor {
 pub fn smooth_bins(src: &[f32], taps: usize, out: &mut Vec<f32>) {
     out.clear();
     out.resize(src.len(), -140.0);
-    if src.is_empty() {
+    let len = src.len();
+    if len == 0 {
         return;
     }
-    if taps <= 1 || src.len() < 3 {
+    if taps <= 1 || len < 3 {
         out.copy_from_slice(src);
         return;
     }
-    let w: &[f32] = if taps >= 5 {
-        &[1.0, 4.0, 6.0, 4.0, 1.0]
-    } else {
-        &[1.0, 2.0, 1.0]
-    };
-    let r = w.len() / 2;
-    for i in 0..src.len() {
-        let mut acc = 0.0;
-        let mut ww = 0.0;
-        for (k, &wk) in w.iter().enumerate() {
-            let j = i as isize + k as isize - r as isize;
-            if j >= 0 && (j as usize) < src.len() {
-                acc += src[j as usize] * wk;
-                ww += wk;
-            }
+    if taps >= 5 && len >= 5 {
+        out[0] = (6.0 * src[0] + 4.0 * src[1] + src[2]) / 11.0;
+        out[1] = (4.0 * src[0] + 6.0 * src[1] + 4.0 * src[2] + src[3]) / 15.0;
+        out[len - 2] = (src[len - 4] + 4.0 * src[len - 3] + 6.0 * src[len - 2] + 4.0 * src[len - 1]) / 15.0;
+        out[len - 1] = (src[len - 3] + 4.0 * src[len - 2] + 6.0 * src[len - 1]) / 11.0;
+        const NORM5: f32 = 1.0 / 16.0;
+        for i in 2..len - 2 {
+            out[i] = (src[i - 2] + 4.0 * src[i - 1] + 6.0 * src[i] + 4.0 * src[i + 1] + src[i + 2]) * NORM5;
         }
-        out[i] = acc / ww.max(1e-6);
+    } else {
+        out[0] = (2.0 * src[0] + src[1]) / 3.0;
+        out[len - 1] = (src[len - 2] + 2.0 * src[len - 1]) / 3.0;
+        const NORM3: f32 = 0.25;
+        for i in 1..len - 1 {
+            out[i] = (src[i - 1] + 2.0 * src[i] + src[i + 1]) * NORM3;
+        }
     }
-    for i in 1..src.len().saturating_sub(1) {
+    for i in 1..len - 1 {
         if src[i] >= src[i - 1] && src[i] >= src[i + 1] {
             out[i] = src[i];
         }
@@ -269,33 +271,37 @@ pub fn mix_decim(iq: &[Complex32], fs: f32, hz: f32, decim: usize) -> Vec<Comple
 
 /// Numerically controlled oscillator used to shift a signal of interest to 0 Hz.
 pub struct Nco {
-    phase: f64,
-    step: f64,
+    cur: Complex32,
+    step: Complex32,
+    n: u32,
 }
 
 impl Nco {
     pub fn new() -> Self {
         Self {
-            phase: 0.0,
-            step: 0.0,
+            cur: Complex32::new(1.0, 0.0),
+            step: Complex32::new(1.0, 0.0),
+            n: 0,
         }
     }
 
     pub fn set_freq(&mut self, hz: f64, fs: f64) {
-        self.step = -2.0 * std::f64::consts::PI * hz / fs;
+        let step_rad = -2.0 * std::f64::consts::PI * hz / fs;
+        let (sin, cos) = (step_rad as f32).sin_cos();
+        self.step = Complex32::new(cos, sin);
     }
 
     pub fn mix(&mut self, input: &[Complex32], out: &mut Vec<Complex32>) {
         out.clear();
         out.reserve(input.len());
         for &s in input {
-            let (sin, cos) = self.phase.sin_cos();
-            out.push(s * Complex32::new(cos as f32, sin as f32));
-            self.phase += self.step;
-            if self.phase > std::f64::consts::PI {
-                self.phase -= 2.0 * std::f64::consts::PI;
-            } else if self.phase < -std::f64::consts::PI {
-                self.phase += 2.0 * std::f64::consts::PI;
+            out.push(s * self.cur);
+            self.cur *= self.step;
+            self.n += 1;
+            if self.n >= 1024 {
+                self.n = 0;
+                let k = 1.5 - 0.5 * self.cur.norm_sqr();
+                self.cur *= k;
             }
         }
     }
@@ -632,6 +638,129 @@ impl SoftAgc {
     }
 }
 
+/// Audio-domain spectral subtraction and Wiener filtering (Ephraim-Malah /
+/// decision-directed a priori SNR estimation) to reduce background hiss.
+#[allow(dead_code)]
+pub struct AudioNr {
+    fft: Arc<dyn Fft<f32>>,
+    ifft: Arc<dyn Fft<f32>>,
+    window: Vec<f32>,
+    noise_psd: Vec<f32>,
+    prev_mag: Vec<f32>,
+    in_buf: Vec<Complex32>,
+    out_buf: Vec<Complex32>,
+    fft_buf: Vec<Complex32>,
+    overlap: Vec<Complex32>,
+    size: usize,
+    hop: usize,
+    enabled: bool,
+    trained: usize,
+}
+
+#[allow(dead_code)]
+impl AudioNr {
+    pub fn new(size: usize) -> Self {
+        let size = size.next_power_of_two().max(128);
+        let hop = size / 2;
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(size);
+        let ifft = planner.plan_fft_inverse(size);
+        let window: Vec<f32> = (0..size)
+            .map(|i| (PI * (i as f32 + 0.5) / size as f32).sin())
+            .collect();
+        Self {
+            fft,
+            ifft,
+            window,
+            noise_psd: vec![1e-6; size],
+            prev_mag: vec![0.0; size],
+            in_buf: Vec::with_capacity(size * 4),
+            out_buf: Vec::with_capacity(size * 4),
+            fft_buf: vec![Complex32::new(0.0, 0.0); size],
+            overlap: vec![Complex32::new(0.0, 0.0); hop],
+            size,
+            hop,
+            enabled: true,
+            trained: 0,
+        }
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn reset(&mut self) {
+        self.noise_psd.fill(1e-6);
+        self.prev_mag.fill(0.0);
+        self.in_buf.clear();
+        self.out_buf.clear();
+        self.overlap.fill(Complex32::new(0.0, 0.0));
+        self.trained = 0;
+    }
+
+    pub fn process(&mut self, input: &mut [Complex32]) {
+        if !self.enabled || input.is_empty() {
+            return;
+        }
+        self.in_buf.extend_from_slice(input);
+
+        while self.in_buf.len() >= self.size {
+            for i in 0..self.size {
+                self.fft_buf[i] = self.in_buf[i] * self.window[i];
+            }
+            self.fft.process(&mut self.fft_buf);
+
+            let powers: Vec<f32> = self.fft_buf.iter().map(|c| c.norm_sqr()).collect();
+            let mut sorted = powers.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let med_pwr = sorted[sorted.len() / 2].max(1e-12);
+
+            // Estimate a posteriori & decision-directed a priori SNR
+            const ALPHA: f32 = 0.94;
+            const FLOOR_GAIN: f32 = 0.15; // Max 16 dB suppression
+            for i in 0..self.size {
+                let p = powers[i];
+                let noise_ref = p.min(med_pwr * 2.0);
+                if self.trained < 16 {
+                    self.noise_psd[i] =
+                        (self.noise_psd[i] * self.trained as f32 + noise_ref) / (self.trained + 1) as f32;
+                } else {
+                    self.noise_psd[i] += (noise_ref - self.noise_psd[i]) * 0.05;
+                }
+                let gamma = p / self.noise_psd[i].max(1e-12);
+                let xi = (ALPHA * self.prev_mag[i] / self.noise_psd[i].max(1e-12)
+                    + (1.0 - ALPHA) * (gamma - 1.0).max(0.0))
+                .max(1e-4);
+                let gain = (xi / (1.0 + xi)).clamp(FLOOR_GAIN, 1.0);
+                self.fft_buf[i] *= gain;
+                self.prev_mag[i] = self.fft_buf[i].norm_sqr();
+            }
+            self.trained = self.trained.saturating_add(1);
+
+            self.ifft.process(&mut self.fft_buf);
+            let norm = 1.0 / (self.size as f32);
+            for i in 0..self.hop {
+                let s = self.overlap[i] + self.fft_buf[i] * self.window[i] * norm;
+                self.out_buf.push(s);
+            }
+            for i in 0..self.hop {
+                self.overlap[i] = self.fft_buf[self.hop + i] * self.window[self.hop + i] * norm;
+            }
+            self.in_buf.drain(..self.hop);
+        }
+
+        let n = self.out_buf.len().min(input.len());
+        if n > 0 {
+            input[..n].copy_from_slice(&self.out_buf[..n]);
+            self.out_buf.drain(..n);
+        }
+    }
+}
+
 /// One-pole smoother, used for envelopes and AGC-ish level tracking.
 #[derive(Clone, Copy)]
 pub struct OnePole {
@@ -720,6 +849,39 @@ mod tests {
         assert!(
             total > expect - 1200 && total <= expect,
             "emitted {total} of an expected ~{expect} samples"
+        );
+    }
+
+    #[test]
+    fn audio_nr_reduces_noise_floor_and_preserves_tone() {
+        let mut nr = AudioNr::new(256);
+        let fs = 8000.0f32;
+        let mut rng = 0x1234_5678u32;
+        let mut nz = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            (rng as f32 / u32::MAX as f32) - 0.5
+        };
+        // 1 second of noise + tone at 700 Hz
+        let n = 8000;
+        let tone_hz = 700.0f32;
+        let raw: Vec<Complex32> = (0..n)
+            .map(|i| {
+                let s = Complex32::from_polar(0.5, 2.0 * PI * tone_hz * i as f32 / fs);
+                let n = Complex32::new(nz(), nz()) * 0.1;
+                s + n
+            })
+            .collect();
+        let mut proc = raw.clone();
+        for chunk in proc.chunks_mut(512) {
+            nr.process(chunk);
+        }
+        let tone_pwr_in = frontend_tests::power_at(&raw[4000..], fs, tone_hz);
+        let tone_pwr_out = frontend_tests::power_at(&proc[4000..], fs, tone_hz);
+        assert!(
+            (tone_pwr_out / tone_pwr_in - 1.0).abs() < 0.20,
+            "tone altered significantly: {tone_pwr_in} -> {tone_pwr_out}"
         );
     }
 
@@ -871,6 +1033,7 @@ pub struct NoiseBlanker {
     tail: usize,
     window_seen: usize,
     window_blanked: usize,
+    window_triggers: usize,
     last_rate: usize,
     inhibited: bool,
     trained: usize,
@@ -885,6 +1048,7 @@ impl NoiseBlanker {
             tail: 0,
             window_seen: 0,
             window_blanked: 0,
+            window_triggers: 0,
             last_rate: 0,
             inhibited: false,
             trained: 0,
@@ -921,10 +1085,13 @@ impl NoiseBlanker {
                 mag.min((self.background * 2.5).max(1e-6))
             };
             self.background += (observed - self.background) * a;
-            let hot = self.level != 0
-                && !self.inhibited
+            let trigger = self.level != 0
                 && self.trained >= (self.fs as usize / 4).max(32)
                 && mag > threshold * self.background.max(1e-6);
+            if trigger {
+                self.window_triggers += 1;
+            }
+            let hot = trigger && !self.inhibited;
             if hot {
                 for back in 0..=2 {
                     if let Some(s) = i.checked_sub(back).and_then(|j| iq.get_mut(j)) {
@@ -947,9 +1114,10 @@ impl NoiseBlanker {
             self.trained = self.trained.saturating_add(1);
             if self.window_seen >= self.fs as usize {
                 self.last_rate = self.window_blanked;
-                self.inhibited = self.window_blanked * 50 > self.window_seen;
+                self.inhibited = self.window_triggers * 50 > self.window_seen;
                 self.window_seen = 0;
                 self.window_blanked = 0;
+                self.window_triggers = 0;
             }
         }
     }
@@ -1033,57 +1201,64 @@ impl FrontEnd {
         self.blanker.process(iq);
     }
 
-    fn correct_images(&mut self, iq: &mut [Complex32]) {
+    fn correct_block(&mut self, block: &mut [Complex32]) {
         const N: usize = 4096;
         const K: usize = 12;
-        for block in iq.chunks_exact_mut(N) {
-            self.iq_buf.copy_from_slice(block);
-            self.iq_fft.process(&mut self.iq_buf);
-            self.iq_orig.copy_from_slice(&self.iq_buf);
-            let mut cross = [Complex32::new(0.0, 0.0); K];
-            let mut paired = [0.0f32; K];
+        self.iq_buf.copy_from_slice(block);
+        self.iq_fft.process(&mut self.iq_buf);
+        self.iq_orig.copy_from_slice(&self.iq_buf);
+        let mut cross = [Complex32::new(0.0, 0.0); K];
+        let mut paired = [0.0f32; K];
+        for k in 1..N {
+            let shifted = (k + N / 2) % N;
+            let band = (shifted * K / N).min(K - 1);
+            let mirror = (N - k) % N;
+            cross[band] += self.iq_orig[k] * self.iq_orig[mirror];
+            paired[band] += self.iq_orig[k].norm_sqr() + self.iq_orig[mirror].norm_sqr();
+        }
+        let alpha = (N as f32 / (self.fs as f32 * 2.0)).clamp(0.002, 0.2);
+        let mut estimate = [None; K];
+        let max_power = paired.iter().copied().fold(0.0f32, f32::max);
+        for b in 0..K {
+            if paired[b] > (max_power * 1e-3).max(1e-12) {
+                let v = cross[b] / paired[b];
+                if v.norm() < 0.25 {
+                    estimate[b] = Some(v);
+                }
+            }
+        }
+        for b in 0..K {
+            if let Some(mut target) = estimate[b] {
+                let mut weight = 1.0;
+                for neighbour in [b.checked_sub(1), (b + 1 < K).then_some(b + 1)].into_iter().flatten() {
+                    if let Some(v) = estimate[neighbour] {
+                        target += v * 0.25;
+                        weight += 0.25;
+                    }
+                }
+                target /= weight;
+                self.image[b] += (target - self.image[b]) * alpha;
+            }
+        }
+        if self.warm >= self.settle {
             for k in 1..N {
                 let shifted = (k + N / 2) % N;
                 let band = (shifted * K / N).min(K - 1);
+                let a = self.image[band];
                 let mirror = (N - k) % N;
-                cross[band] += self.iq_orig[k] * self.iq_orig[mirror];
-                paired[band] += self.iq_orig[k].norm_sqr() + self.iq_orig[mirror].norm_sqr();
+                self.iq_buf[k] = self.iq_orig[k] - a * self.iq_orig[mirror].conj();
             }
-            let alpha = (N as f32 / (self.fs as f32 * 2.0)).clamp(0.002, 0.2);
-            let mut estimate = [None; K];
-            let max_power = paired.iter().copied().fold(0.0f32, f32::max);
-            for b in 0..K {
-                if paired[b] > (max_power * 1e-3).max(1e-12) {
-                    let v = cross[b] / paired[b];
-                    if v.norm() < 0.25 {
-                        estimate[b] = Some(v);
-                    }
-                }
+            self.iq_ifft.process(&mut self.iq_buf);
+            for (dst, src) in block.iter_mut().zip(&self.iq_buf) {
+                *dst = *src / N as f32;
             }
-            for b in 0..K {
-                if let Some(mut target) = estimate[b] {
-                    let mut weight = 1.0;
-                    for neighbour in [b.checked_sub(1), (b + 1 < K).then_some(b + 1)].into_iter().flatten() {
-                        if let Some(v) = estimate[neighbour] {
-                            target += v * 0.25;
-                            weight += 0.25;
-                        }
-                    }
-                    target /= weight;
-                    self.image[b] += (target - self.image[b]) * alpha;
-                }
-            }
-            if self.warm >= self.settle {
-                for k in 1..N {
-                    let shifted = (k + N / 2) % N;
-                    let band = (shifted * K / N).min(K - 1);
-                    let a = self.image[band];
-                    let mirror = (N - k) % N;
-                    self.iq_buf[k] = self.iq_orig[k] - a * self.iq_orig[mirror].conj();
-                }
-                self.iq_ifft.process(&mut self.iq_buf);
-                for (dst, src) in block.iter_mut().zip(&self.iq_buf) { *dst = *src / N as f32; }
-            }
+        }
+    }
+
+    fn correct_images(&mut self, iq: &mut [Complex32]) {
+        const N: usize = 4096;
+        for block in iq.chunks_exact_mut(N) {
+            self.correct_block(block);
         }
     }
 }

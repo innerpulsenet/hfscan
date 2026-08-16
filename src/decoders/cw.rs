@@ -95,13 +95,20 @@ fn morse_clock(marks: &[f32]) -> Option<(f32, f32)> {
     }
     let mut v: Vec<f32> = marks.to_vec();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    // Two-mean cluster, seeded at the extremes.
-    let (mut c1, mut c2) = (v[0], v[v.len() - 1]);
-    if c2 <= c1 * 1.05 {
-        // All one length: dits alone (or dahs alone) is legitimate Morse but
-        // gives no ratio to work from, so take it as dits.
-        return Some((c1.max(1e-6), 3.0 * c1.max(1e-6)));
+    let (c1_init, c2_init) = (v[0], v[v.len() - 1]);
+    if c2_init <= c1_init * 1.55 {
+        // Homogeneous mark sequence (all dits or all dahs with human jitter).
+        let med = v[v.len() / 2];
+        if med < 1e-6 {
+            return None;
+        }
+        let near = v.iter().filter(|&&x| (x - med).abs() <= 0.35 * med).count();
+        if near * 10 >= v.len() * 7 {
+            return Some((med, 3.0 * med));
+        }
     }
+    // Two-mean cluster, seeded at the extremes.
+    let (mut c1, mut c2) = (c1_init, c2_init);
     for _ in 0..12 {
         let (mut s1, mut n1, mut s2, mut n2) = (0.0, 0.0, 0.0, 0.0);
         for &x in &v {
@@ -124,35 +131,26 @@ fn morse_clock(marks: &[f32]) -> Option<(f32, f32)> {
     if short < 1e-6 {
         return None;
     }
-    // A dah is 3 dits; allow a heavy or light fist, but not anything.
+    // A dah is ~3 dits; allow heavy straight key (1.75) up to fast bug (5.0).
     let r = long / short;
-    if !(1.9..=4.4).contains(&r) {
+    if !(1.75..=5.0).contains(&r) {
         return None;
     }
-    // Every mark must sit close to one of the two lengths. This is the test
-    // that actually separates Morse from noise: a keyer (or a hand) quantises
-    // its marks, and sliced noise does not, however conveniently eight of its
-    // marks may happen to fall into two groups.
+    // Every mark must sit close to one of the two lengths.
     let near = v
         .iter()
         .filter(|&&x| {
             let d = (x - short).abs().min((x - long).abs());
-            d <= 0.30 * if (x - short).abs() < (x - long).abs() { short } else { long }
+            d <= 0.36 * if (x - short).abs() < (x - long).abs() { short } else { long }
         })
         .count();
-    if near * 10 < v.len() * 8 {
+    if near * 10 < v.len() * 7 {
         return None;
     }
     Some((short, long))
 }
 
 /// Whether the gaps between marks are keyed by the same clock as the marks.
-///
-/// Morse spaces come in three lengths — one dit between elements, three
-/// between characters, seven between words — so the short gaps land on the
-/// same dit the marks did. Noise has no reason to oblige, which makes this
-/// the cheapest strong check available: it tests a relationship between two
-/// independent measurements rather than the shape of either one.
 fn gaps_match_clock(gaps: &[f32], dit: f32) -> bool {
     if gaps.len() < 3 || dit <= 0.0 {
         return true;
@@ -162,7 +160,7 @@ fn gaps_match_clock(gaps: &[f32], dit: f32) -> bool {
     // The inter-element gap is the commonest, so the lower half of the
     // distribution is the one to compare against a dit.
     let short = v[v.len() / 4];
-    (0.45..=2.2).contains(&(short / dit))
+    (0.40..=2.6).contains(&(short / dit))
 }
 
 /// A CW tone found by the span scout or the in-passband searcher.
@@ -267,9 +265,9 @@ impl CwDecoder {
             post: NarrowLpf::new(fs),
             peak: 0.0,
             floor: 0.0,
-            peak_decay: 1.0 - (-1.0f32 / (0.6 * env_rate)).exp(),
-            floor_attack: 1.0 - (-1.0f32 / (0.35 * env_rate)).exp(),
-            floor_decay: 1.0 - (-1.0f32 / (0.05 * env_rate)).exp(),
+            peak_decay: 1.0 - (-1.0f32 / (2.5 * env_rate)).exp(),
+            floor_attack: 1.0 - (-1.0f32 / (2.0 * env_rate)).exp(),
+            floor_decay: 1.0 - (-1.0f32 / (0.10 * env_rate)).exp(),
             decim_ctr: 0,
             key_down: false,
             run: 0.0,
@@ -390,10 +388,13 @@ impl CwDecoder {
         if self.marks.len() >= WARMUP_MARKS {
             let recent: Vec<f32> = self.marks.iter().copied().collect();
             if morse_clock(&recent).is_none() {
-                self.symbol.clear();
-                self.warmup.clear();
-                self.warming = true;
-                self.marks.clear();
+                // Only drop back to warm-up if the signal has truly collapsed into noise.
+                if self.peak < 2.3 * self.floor.max(1e-9) || self.quality < 0.15 {
+                    self.push_symbol();
+                    self.warmup.clear();
+                    self.warming = true;
+                    self.marks.clear();
+                }
             }
         }
     }
@@ -464,12 +465,29 @@ impl CwDecoder {
 
     /// Classify one mark against the current clock and add it to the symbol.
     fn classify_mark(&mut self, len: f32) {
-        let dit = self.dit.max(1e-6);
-        let ratio = len / dit;
+        let mut dit = self.dit.max(1e-6);
+        let mut ratio = len / dit;
+
+        // Fast tracking on sudden speed change (e.g. mid-stream speedup or slowdown)
+        if ratio < 0.65 && len >= DIT_MIN_S * self.env_rate {
+            self.dit = 0.25 * self.dit + 0.75 * len;
+            self.dah = 0.25 * self.dah + 0.75 * (3.0 * len);
+            self.acquire = 12;
+            dit = self.dit.max(1e-6);
+            ratio = len / dit;
+        } else if ratio > 4.5 && len <= DIT_MAX_S * self.env_rate {
+            let new_dit = (len / 3.0).clamp(DIT_MIN_S * self.env_rate, DIT_MAX_S * self.env_rate);
+            self.dit = 0.30 * self.dit + 0.70 * new_dit;
+            self.dah = 0.30 * self.dah + 0.70 * len;
+            self.acquire = 12;
+            dit = self.dit.max(1e-6);
+            ratio = len / dit;
+        }
+
         // Classify against the midpoint of the *tracked* dit and dah, not a
         // fixed 2.0: a fist with light dahs (or stretched dits) moves the
         // boundary with it instead of straddling it.
-        let boundary = ((self.dit + self.dah) / (2.0 * dit)).clamp(1.55, 2.6);
+        let boundary = ((self.dit + self.dah) / (2.0 * dit)).clamp(1.50, 2.75);
         let is_dah = ratio >= boundary;
         self.symbol.push(if is_dah { '-' } else { '.' });
 
@@ -481,14 +499,14 @@ impl CwDecoder {
         // Fast while acquiring (after idle or a speed snap), then only
         // trust unambiguous dits and dahs so Farnsworth gaps and a
         // mid-element speed change cannot drag the estimate.
-        let alpha = if self.acquire > 0 { 0.42 } else { 0.20 };
+        let alpha = if self.acquire > 0 { 0.45 } else { 0.20 };
         if self.acquire > 0 {
             self.acquire -= 1;
         }
-        let dah_r = (self.dah / dit).clamp(2.0, 4.0);
+        let dah_r = (self.dah / dit).clamp(1.8, 4.8);
         if !is_dah && ratio < 1.65 {
             self.dit = (1.0 - alpha) * self.dit + alpha * len;
-        } else if is_dah && ratio < 5.0 {
+        } else if is_dah && ratio < 5.2 {
             let a = alpha * 0.55;
             self.dah = (1.0 - a) * self.dah + a * len;
             if ratio > boundary * 1.15 {
@@ -518,11 +536,26 @@ impl CwDecoder {
     fn recluster(&mut self) {
         let mut v: Vec<f32> = self.marks.iter().copied().collect();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let mut c1 = v[0];
-        let mut c2 = *v.last().unwrap();
-        if (c2 - c1).abs() < 1e-6 {
+        let c1_init = v[0];
+        let c2_init = *v.last().unwrap();
+        if (c2_init - c1_init).abs() < 1e-6 {
             return;
         }
+        if c2_init <= c1_init * 1.55 {
+            let med = v[v.len() / 2];
+            if med < 1e-6 {
+                return;
+            }
+            let rel = (med - self.dit).abs() / self.dit.max(1e-6);
+            if rel > 0.28 && (med / self.dit < 0.65 || (med / self.dah - 1.0).abs() > 0.3) {
+                self.dit = 0.50 * self.dit + 0.50 * med;
+                self.dah = 3.0 * self.dit;
+                self.acquire = 8;
+            }
+            self.clamp_dit();
+            return;
+        }
+        let (mut c1, mut c2) = (c1_init, c2_init);
         for _ in 0..8 {
             let mut s1 = 0.0;
             let mut n1 = 0.0;
@@ -551,12 +584,11 @@ impl CwDecoder {
             let n = v.iter().filter(|&&x| (x - c2).abs() <= (x - c1).abs()).count();
             (c2, c1, n)
         };
-        if n_short < 3 || short < 1e-6 {
+        if n_short < 2 || short < 1e-6 {
             return;
         }
         let r = long / short;
-        // Down to 1.9: a light fist's dahs can sit near 2× the dit.
-        if !(1.9..=4.4).contains(&r) {
+        if !(1.75..=5.0).contains(&r) {
             return;
         }
         let rel = (short - self.dit).abs() / self.dit.max(1e-6);
@@ -566,8 +598,8 @@ impl CwDecoder {
             self.dah = 0.40 * self.dah + 0.60 * long;
             self.acquire = 10;
         } else {
-            self.dit = 0.82 * self.dit + 0.18 * short;
-            self.dah = 0.82 * self.dah + 0.18 * long;
+            self.dit = 0.80 * self.dit + 0.20 * short;
+            self.dah = 0.80 * self.dah + 0.20 * long;
         }
         self.clamp_dit();
     }
@@ -581,16 +613,11 @@ impl CwDecoder {
             }
             return;
         }
-        // Spaces never update dit — Farnsworth sending would otherwise
-        // drag the estimate out to the character gap.
-        if len >= 2.0 * self.dit {
+        // Adaptive character boundary: 2.05 dits prevents splitting on element jitter
+        // while cleanly separating characters (>=2.05 dits) and words (>=4.8 dits).
+        if len >= 2.05 * self.dit {
             self.push_symbol();
-            if len >= 5.0 * self.dit {
-                // The scanner is told about the gap unconditionally. `text` is
-                // drained every block, so the guards below suppress a space
-                // that happens to land at the start of a fresh buffer — which
-                // is right for the display and wrong for word framing, where
-                // it would run "DE" and the callsign into one token.
+            if len >= 4.8 * self.dit {
                 self.scan.push(' ');
                 if !self.text.ends_with(' ') && !self.text.is_empty() {
                     self.text.push(' ');
@@ -692,14 +719,14 @@ impl CwDecoder {
                 .find(|h| (h.offset_hz - self.mix_hz).abs() < 35.0)
                 .cloned()
             {
-                self.mix_hz = h.offset_hz;
+                self.mix_hz = 0.85 * self.mix_hz + 0.15 * h.offset_hz;
                 self.lock_score = h.score;
                 self.locked = true;
                 return;
             }
         }
         if let Some(h) = self.hits.first().cloned() {
-            if (h.offset_hz - self.mix_hz).abs() > 8.0 {
+            if (h.offset_hz - self.mix_hz).abs() > 12.0 {
                 self.mix_phase = 0.0;
                 self.post.reset();
             }
@@ -920,6 +947,9 @@ impl Decoder for CwDecoder {
             while self.matched.len() > matched_n {
                 self.matched_sum -= self.matched.pop_front().unwrap_or(0.0);
             }
+            if self.matched_sum < 0.0 {
+                self.matched_sum = self.matched.iter().sum();
+            }
             let env = self.matched_sum / self.matched.len().max(1) as f32;
 
             // The envelope smoother, the channel filter and the tuning
@@ -949,17 +979,15 @@ impl Decoder for CwDecoder {
                 self.peak += (env - self.peak) * self.peak_decay;
             }
             // The floor is the band, so it is measured from the band: only
-            // while the key is up, and as an average rather than a chase of
-            // the minima. Tracking minima put it well below the noise, which
-            // left the thresholds — struck as fractions of peak-minus-floor
-            // — sitting inside the noise, so an empty frequency keyed the
-            // slicer and spelled letters. A fast path down remains, or a
-            // signal fading out would strand the floor at its level.
+            // while the key is up, and only when the element has settled past
+            // the ring-down tail of the mark.
             if !self.key_down {
                 let a = if env < self.floor {
                     self.floor_decay
-                } else {
+                } else if self.pending == 0.0 && self.run > 0.3 * self.dit {
                     self.floor_attack
+                } else {
+                    0.0
                 };
                 self.floor += (env - self.floor) * a;
             }

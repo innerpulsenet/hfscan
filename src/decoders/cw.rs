@@ -21,6 +21,17 @@ const BANDWIDTH: f32 = 400.0;
 const FFT_SIZE: usize = 4096;
 const SCAN_AUDIO: f32 = 8000.0;
 const MARK_HIST: usize = 24;
+/// Marks the speed tracker clusters over.
+///
+/// `MARK_HIST` is sized for the structure check in `morse_clock`, which wants
+/// as long a run as it can get before deciding a fist is not Morse. The speed
+/// tracker wants the opposite: when an operator changes speed, every mark
+/// still in the window from the old fist drags the clusters toward the old
+/// clock, and with 24 marks a 15→32 WPM change takes longer to flush than a
+/// short over lasts — the tracker settles halfway, at 18 WPM, where the new
+/// dahs look like slow dits and hold it there. Clustering over the most
+/// recent marks only shortens that to about a word.
+const RECLUSTER_MARKS: usize = 10;
 /// Envelope history for the scope pane (~0.7 s at 1 kHz).
 const ENV_HIST: usize = 700;
 /// 5–50 WPM. Below that is not Morse; above it noise ripples chop.
@@ -75,13 +86,49 @@ const POST_MIX_K: f32 = 2.5;
 /// filter still. A station going from 15 to 32 WPM drove exactly that spiral
 /// down to a 7.9 WPM estimate with no way back out.
 ///
-/// 70 Hz is wide enough for any fist up to about 34 WPM, so the loop can only
-/// ever run in the safe direction — widening. It also happens to bank almost
-/// all of the available gain: measured against the adaptive corner, a fixed
-/// 70 Hz gives 60%/65% copy at 0 dB for 18/25 WPM against the adaptive
-/// version's 55%/70%. Above 34 WPM the corner opens beyond this and the
-/// clock match earns its keep, in the direction that cannot trap.
-const POST_MIX_MIN_HZ: f32 = 70.0;
+/// The floor is wide enough that the loop can only ever run in the safe
+/// direction — widening — for any fist the tracker will follow.
+///
+/// 70 Hz was the original guess. It can come down, but only as far as the
+/// speed tracker's own reach allows, and the two have to be moved together:
+/// every fixed-speed cell in `bench_cw_score` wants the narrowest filter its
+/// keying will fit through, so the score rises steadily as the floor drops,
+/// while `cw_follows_a_speed_change` fails abruptly once the filter can no
+/// longer pass a fist the tracker is still trying to follow. Sweeping the two
+/// against each other, with `RECLUSTER_MARKS` shortened so the tracker keeps
+/// up: 55 and 60 Hz both pass and score 90.0, 50 Hz fails, 70 Hz passes and
+/// scores 89.6.
+///
+/// 60 Hz is the best of those and leaves a margin over the 50 Hz failure.
+/// That margin is the point: the spiral has no way out once it starts, so
+/// being slightly too wide costs a fraction of a dB and being slightly too
+/// narrow costs the station.
+const POST_MIX_MIN_HZ: f32 = 60.0;
+
+/// Where the slicer arms and releases, as a fraction of the span between the
+/// tracked floor and peak.
+///
+/// These were 0.52 and 0.32, which are the right numbers if `peak` is the
+/// level of a mark. It is not: `peak` attacks instantly and decays over 2.5 s,
+/// so it is a max-hold, and a max-hold over a noisy envelope sits well above
+/// the marks it is supposed to be measuring. The bias grows as the signal
+/// weakens, which is precisely when it hurts — the span inflates, the arming
+/// threshold rides up with it, and real marks stop reaching it. Copy did not
+/// degrade gracefully at 0 dB so much as fall through the floor.
+///
+/// Compensating in the coefficients is not elegant, but it is what measures
+/// best. Slicing against `mark_env`/`space_env` instead — the levels that are
+/// honestly a mark and a space — was tried and is worse (87.4 % against
+/// 89.2 %): those settle slowly and only under conditions the slicer itself
+/// has to establish first, so they lag exactly when the signal is moving.
+///
+/// Swept jointly over a four-seed grid, the surface is a broad plateau across
+/// roughly 0.38–0.46 arming and 0.28–0.32 releasing, all of it 1.5 to 2.4
+/// points above the old pair; these sit in the middle of it. The release
+/// threshold must not go much below 0.28 — at 0.24 the score collapses,
+/// because a mark that never releases runs into the next one.
+const ON_SPAN_K: f32 = 0.40;
+const OFF_SPAN_K: f32 = 0.30;
 
 /// Cascaded complex one-poles: the post-mix channel filter.
 struct NarrowLpf {
@@ -545,7 +592,19 @@ impl CwDecoder {
             self.acquire -= 1;
         }
         let dah_r = (self.dah / dit).clamp(2.0, 4.2);
-        if !is_dah && ratio < boundary && ratio > 0.50 {
+        // The lower gate matches the one that rejected the mark outright a few
+        // lines up. With the two set differently there was a band of lengths —
+        // 0.40 to 0.50 dits — good enough to be decoded as a dit but not good
+        // enough to say anything about the clock, and that band is exactly
+        // where a real dit lands when the operator has just doubled their
+        // speed: against the old clock a 32 WPM dit reads 0.47. The shorter
+        // dits were being decoded and then ignored while the same fist's dahs
+        // read 1.4 and were taken for slow dits, which pushes the estimate the
+        // wrong way. Letting them speak is worth a fifth of a point of score.
+        //
+        // It is not what rescues a doubled speed on its own — `RECLUSTER_MARKS`
+        // is — but it stops this loop pulling against that one.
+        if !is_dah && ratio < boundary && ratio > 0.40 {
             self.dit = (1.0 - alpha) * self.dit + alpha * len;
         } else if is_dah && ratio >= boundary && ratio < 5.0 {
             let a = alpha * 0.5;
@@ -585,7 +644,7 @@ impl CwDecoder {
     /// coherent dit and the long one is ~3×, snap toward it when the
     /// operator has changed speed.
     fn recluster(&mut self) {
-        let mut v: Vec<f32> = self.marks.iter().copied().collect();
+        let mut v: Vec<f32> = self.marks.iter().rev().take(RECLUSTER_MARKS).copied().collect();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let c1_init = v[0];
         let c2_init = *v.last().unwrap();
@@ -670,7 +729,15 @@ impl CwDecoder {
         // Adaptive character boundary: 2.1 dits cleanly separates elements (1 dit) and characters (3 dits)
         if len >= 2.1 * self.dit {
             self.push_symbol();
-            if len >= 5.5 * self.dit {
+            // A character gap is 3 dits and a word gap 7, so the honest place
+            // to split them is 5. It sat at 5.5, which leant toward calling a
+            // word gap a character gap — and the slicer leans the same way:
+            // it arms below the middle of the span and releases below that
+            // again, so every mark reads a little long and every gap a little
+            // short. Two biases in the same direction ran words together on
+            // the live capture (`CVA PT6T` came out `CVAPT6T`). Five is the
+            // midpoint and measures a shade better than 5.5 as well.
+            if len >= 5.0 * self.dit {
                 self.scan.push(' ');
                 if !self.text.ends_with(' ') && !self.text.is_empty() {
                     self.text.push(' ');
@@ -872,8 +939,8 @@ impl CwDecoder {
         }
 
         let span = (self.peak - self.floor).max(1e-9);
-        let on_thr = self.floor + 0.52 * span;
-        let off_thr = self.floor + 0.32 * span;
+        let on_thr = self.floor + ON_SPAN_K * span;
+        let off_thr = self.floor + OFF_SPAN_K * span;
         let snr_ok = self.peak > 2.8 * self.floor.max(1e-9);
 
         let next = if self.key_down {

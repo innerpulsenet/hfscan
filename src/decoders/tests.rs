@@ -105,12 +105,31 @@ fn gen_cw_key(text: &str, wpm: f32, dah_units: f32, jitter: &[f32]) -> Vec<f32> 
         }
         key.extend(std::iter::repeat(0.0).take(dit * 2)); // char gap (total 3)
     }
-    key.extend(std::iter::repeat(0.0).take(dit * 8));
+    // Trailing silence. The decoder flushes the last character once six dits
+    // of idle have passed, so the tail has to outlast that — and the tuning
+    // chain in front of it is overlap-save, which holds back a block of about
+    // 1.2 k samples that never reach the decoder at all. Eight dits alone is
+    // enough at 12 WPM and not at 18, which capped every accuracy figure in
+    // this file at 90 % for the missing final character regardless of what
+    // the decoder did. The fixed pad covers the chain's held block at any
+    // speed; a real receiver keeps running after the station stops, so this
+    // is the honest case rather than a favour to the decoder.
+    key.extend(std::iter::repeat(0.0).take(dit * 8 + 2048));
     key
 }
 
 /// AM the key line onto `tone` with noise, as `gen_cw_at` always did.
 fn key_to_iq(key: &[f32], snr_scale: f32, tone: f32) -> Vec<Complex32> {
+    key_to_iq_seed(key, snr_scale, tone, 0x1234_5678)
+}
+
+/// As `key_to_iq`, with the noise realisation chosen by the caller.
+///
+/// One seed per cell makes a grid of single trials, and near the copy
+/// threshold a single trial is close to a coin flip: whether one particular
+/// noise burst lands inside one particular dah decides the character, and the
+/// cell reads 100 % or 0 % on that. Tuning against that measures the seed.
+fn key_to_iq_seed(key: &[f32], snr_scale: f32, tone: f32, seed: u32) -> Vec<Complex32> {
     // Shape the key envelope so it has realistic rise/fall instead of clicks.
     let rise = (0.005 * FS as f32) as usize;
     let mut env = key.to_vec();
@@ -121,7 +140,7 @@ fn key_to_iq(key: &[f32], snr_scale: f32, tone: f32) -> Vec<Complex32> {
         *v = acc;
     }
 
-    let mut rng = 0x1234_5678u32;
+    let mut rng = seed;
     env.iter()
         .enumerate()
         .map(|(i, &e)| {
@@ -130,6 +149,11 @@ fn key_to_iq(key: &[f32], snr_scale: f32, tone: f32) -> Vec<Complex32> {
             s + Complex32::new(noise(&mut rng), noise(&mut rng)) * snr_scale
         })
         .collect()
+}
+
+/// `gen_cw_at` with the noise realisation chosen by the caller.
+fn gen_cw_seed(text: &str, wpm: f32, snr_scale: f32, tone: f32, seed: u32) -> Vec<Complex32> {
+    key_to_iq_seed(&gen_cw_key(text, wpm, 3.0, &[1.0]), snr_scale, tone, seed)
 }
 
 #[test]
@@ -1254,6 +1278,229 @@ fn ft8_survives_the_tuning_chain() {
     );
 }
 
+
+// -------------------------------------------- simulated band (Stage 0)
+
+use super::channel::{self, Condition};
+
+/// One station on the simulated band.
+#[derive(Clone, Copy)]
+struct BandStation {
+    text: &'static str,
+    wpm: f32,
+    /// Offset from the decoder's centre, Hz.
+    offset_hz: f32,
+    /// Level relative to the wanted station, dB.
+    level_db: f32,
+}
+
+/// Build a stretch of band: a wanted station, its neighbours, an ionosphere,
+/// a noise floor and some weather.
+///
+/// Each station gets its own channel realisation, because each is a different
+/// path from a different place — they do not fade together, and a decoder
+/// choosing between them meets that every time.
+///
+/// `snr_db` is the wanted station's *mean* SNR in the decoder's 400 Hz
+/// bandwidth. Mean is the operative word once the channel is in circuit.
+fn gen_band(
+    wanted: &BandStation,
+    others: &[BandStation],
+    cond: Condition,
+    snr_db: f32,
+    crashes_per_sec: f32,
+    seed: u32,
+) -> Vec<Complex32> {
+    let mut sig = channel::watterson(
+        &gen_cw_at(wanted.text, wanted.wpm, 0.0, CW_TONE + wanted.offset_hz),
+        FS as f32,
+        cond,
+        seed,
+    );
+    for (k, o) in others.iter().enumerate() {
+        let other = channel::watterson(
+            &gen_cw_at(o.text, o.wpm, 0.0, CW_TONE + o.offset_hz),
+            FS as f32,
+            cond,
+            seed ^ (0x9e37_79b9u32.wrapping_mul(k as u32 + 1)),
+        );
+        let g = 10f32.powf(o.level_db / 20.0);
+        for (i, s) in sig.iter_mut().enumerate() {
+            if let Some(v) = other.get(i) {
+                *s += v * g;
+            }
+        }
+    }
+    let mut rng = seed ^ 0xa5a5_a5a5;
+    let n_scale = scale_for_snr(snr_db);
+    for s in sig.iter_mut() {
+        *s += Complex32::new(noise(&mut rng), noise(&mut rng)) * n_scale;
+    }
+    channel::static_crashes(
+        &mut sig,
+        FS as f32,
+        crashes_per_sec,
+        12.0,
+        seed ^ 0x5eed_5eed,
+    );
+    sig
+}
+
+/// The band as it actually is, scored the way `cw_score_grid` scores the
+/// laboratory.
+///
+/// This exists because the flat grid cannot see the decoder's largest real
+/// failure. Across the live 20m capture a single station's mark level moves
+/// by 12 to 31 dB inside one over, every passband holds two to four stations
+/// rather than one, and which signals get copied tracks fade depth far more
+/// closely than it tracks SNR. `bench_cw_fading` shows the mechanism on a
+/// bare sinusoidal fade; this grid puts a proper Watterson channel, real
+/// neighbours and static crashes behind it, and is the yardstick any redesign
+/// of the detector should be judged on.
+fn cw_band_score_grid() -> (Vec<(String, f32)>, f32) {
+    const SEEDS: [u32; 4] = [0x1234_5678, 0x9e37_79b9, 0x0bad_f00d, 0x5eed_1234];
+    const MSG: &str = "CQ CQ DE W1AW W1AW K UR RST 599 599 QTH NEWINGTON CT \
+                       NAME JOE JOE HW CPY? BK TNX FER THE QSO 73 ES GL DE W1AW K";
+    let wanted = BandStation {
+        text: MSG,
+        wpm: 20.0,
+        offset_hz: 0.0,
+        level_db: 0.0,
+    };
+    // Neighbours at the separations and speeds a crowded CW segment actually
+    // has: inside the 400 Hz passband, keyed by other operators at other
+    // speeds, one of them stronger than the wanted station.
+    let qrm = [
+        BandStation {
+            text: "TEST DE G4XYZ G4XYZ 599 001 001 TU QRZ TEST G4XYZ K",
+            wpm: 27.0,
+            offset_hz: 160.0,
+            level_db: 0.0,
+        },
+        BandStation {
+            text: "CQ CQ DE VK2ABC VK2ABC PSE K",
+            wpm: 16.0,
+            offset_hz: -230.0,
+            level_db: 3.0,
+        },
+        BandStation {
+            text: "DE JA1XYZ UR 599 599 BK",
+            wpm: 32.0,
+            offset_hz: 90.0,
+            level_db: -4.0,
+        },
+    ];
+
+    // name, neighbours, channel, mean SNR, crashes/s
+    let cases: Vec<(String, &[BandStation], Condition, f32, f32)> = vec![
+        // 1. The ionosphere alone, at a level the flat grid copies perfectly.
+        ("chan flat 12dB".into(), &[][..], channel::FLAT, 12.0, 0.0),
+        ("chan good 12dB".into(), &[][..], channel::CCIR_GOOD, 12.0, 0.0),
+        ("chan moderate 12dB".into(), &[][..], channel::CCIR_MODERATE, 12.0, 0.0),
+        ("chan poor 12dB".into(), &[][..], channel::CCIR_POOR, 12.0, 0.0),
+        ("chan flutter 12dB".into(), &[][..], channel::CCIR_FLUTTER, 12.0, 0.0),
+        // 2. Level, through a middling path.
+        ("moderate 20dB".into(), &[][..], channel::CCIR_MODERATE, 20.0, 0.0),
+        ("moderate 6dB".into(), &[][..], channel::CCIR_MODERATE, 6.0, 0.0),
+        // 3. Neighbours, fading independently of the wanted station.
+        ("qrm x1 moderate".into(), &qrm[..1], channel::CCIR_MODERATE, 12.0, 0.0),
+        ("qrm x2 moderate".into(), &qrm[..2], channel::CCIR_MODERATE, 12.0, 0.0),
+        ("qrm x3 moderate".into(), &qrm[..], channel::CCIR_MODERATE, 12.0, 0.0),
+        ("qrm x3 poor".into(), &qrm[..], channel::CCIR_POOR, 12.0, 0.0),
+        // 4. Weather.
+        ("crashes 2/s moderate".into(), &[][..], channel::CCIR_MODERATE, 12.0, 2.0),
+        ("crashes 6/s moderate".into(), &[][..], channel::CCIR_MODERATE, 12.0, 6.0),
+        // 5. Everything at once — a Saturday afternoon on 20m.
+        ("the band, 10dB".into(), &qrm[..], channel::CCIR_POOR, 10.0, 2.0),
+        ("the band, 4dB".into(), &qrm[..], channel::CCIR_POOR, 4.0, 2.0),
+    ];
+
+    let mut cells: Vec<(String, f32)> = Vec::new();
+    for (name, others, cond, snr, crashes) in cases {
+        let acc = SEEDS
+            .iter()
+            .map(|&seed| {
+                let sig = gen_band(&wanted, others, cond, snr, crashes, seed);
+                accuracy(MSG, &decode_cw(&sig, 0.0))
+            })
+            .sum::<f32>()
+            / SEEDS.len() as f32;
+        cells.push((name, acc));
+    }
+
+    // An occupied but wanted-station-free stretch: neighbours fading in and
+    // out, nothing on frequency. Anything decoded here is invented, and a
+    // detector rebuilt for fading has every opportunity to invent more.
+    let empty = SEEDS
+        .iter()
+        .map(|&seed| {
+            let quiet = BandStation {
+                text: "",
+                wpm: 20.0,
+                offset_hz: 0.0,
+                level_db: 0.0,
+            };
+            let sig = gen_band(&quiet, &qrm[..], channel::CCIR_POOR, 12.0, 2.0, seed);
+            let letters = decode_cw(&sig, 0.0)
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .count();
+            1.0 - (letters as f32 / 10.0).min(1.0)
+        })
+        .sum::<f32>()
+        / SEEDS.len() as f32;
+    cells.push(("empty, qrm only".into(), empty));
+
+    let mean = cells.iter().map(|(_, a)| *a).sum::<f32>() / cells.len() as f32;
+    (cells, mean)
+}
+
+/// The band grid as a gate, like `cw_score_does_not_regress` but for the
+/// conditions that actually break this decoder.
+///
+/// The bar is low because the decoder is currently bad at this — 43 % against
+/// the flat grid's 90 — and that gap is the point of Stage 0 rather than
+/// something to hide. The gate exists so the number cannot quietly get worse
+/// while the flat grid is being tuned, which is exactly what has been
+/// happening: the flat grid moved three points this session for changes that
+/// this grid barely notices.
+///
+/// Raise it as the detector is rebuilt. The interesting milestones are
+/// `chan moderate 12dB` reaching the high nineties, and `moderate 20dB`
+/// pulling clear of `moderate 6dB` — today they are 49 % and 40 %, which says
+/// fourteen decibels of extra signal buys almost nothing and the decoder is
+/// limited by fading rather than by noise.
+#[test]
+fn cw_band_score_does_not_regress() {
+    let (cells, mean) = cw_band_score_grid();
+    const FLOOR: f32 = 0.38;
+    if mean < FLOOR {
+        let mut worst: Vec<&(String, f32)> = cells.iter().collect();
+        worst.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let detail: Vec<String> = worst
+            .iter()
+            .take(6)
+            .map(|(n, a)| format!("{n} {:.0}%", a * 100.0))
+            .collect();
+        panic!(
+            "CW band score {:.2}% is below the {:.0}% gate; worst cells: {}",
+            mean * 100.0,
+            FLOOR * 100.0,
+            detail.join(", ")
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_cw_band() {
+    let (cells, mean) = cw_band_score_grid();
+    for (name, acc) in &cells {
+        println!("  {name:<24} {:>5.1}%", acc * 100.0);
+    }
+    println!("\n  CW BAND SCORE {:.2}%  ({} cells)", mean * 100.0, cells.len());
+}
+
 // ------------------------------------------------- CW accuracy bench
 
 /// Levenshtein distance, for scoring decoded text against what was sent.
@@ -1460,8 +1707,9 @@ fn cw_copies_at_zero_db() {
         let sig = gen_cw(msg, wpm, scale_for_snr(0.0));
         let acc = accuracy(msg, &decode_cw(&sig, 0.0));
         assert!(
-            acc >= 0.40,
-            "{wpm:.0} WPM at 0 dB copied {:.0}%, was 15-20% before the filter matched the clock",
+            acc >= 0.60,
+            "{wpm:.0} WPM at 0 dB copied {:.0}%, was 15-20% before the filter matched the clock \
+             and 65-80% before the slicer thresholds were corrected for the max-hold peak",
             acc * 100.0
         );
     }
@@ -1476,6 +1724,164 @@ fn cw_copies_at_zero_db() {
                 acc * 100.0
             );
         }
+    }
+}
+
+/// One number for the whole CW decoder, so a change can be called an
+/// improvement or a regression rather than argued about cell by cell.
+///
+/// The grid is deliberately weighted toward where the decoder actually
+/// lives: a long over rather than a five-word call, several speeds, and
+/// SNRs from comfortable down past the copy threshold. Insertions count
+/// against it as heavily as misses, because the failure that makes a pane
+/// of copy worthless on a real band is noise spelling extra letters between
+/// the real ones — see `cw_stays_quiet_on_noise`.
+///
+/// Prints per-cell accuracy and a mean. Compare the mean across a change;
+/// the cells say where it came from.
+fn cw_score_grid() -> (Vec<(String, f32)>, f32) {
+    let short = "CQ CQ DE W1AW W1AW K";
+    let long = "CQ CQ DE W1AW W1AW K UR RST 599 599 QTH NEWINGTON CT \
+                NAME JOE JOE HW CPY? BK TNX FER THE QSO 73 ES GL DE W1AW K";
+    let qrm = "TEST DE G4XYZ G4XYZ 599 001 001 TU QRZ TEST G4XYZ K";
+    // Every cell is the mean over these noise realisations. Near the copy
+    // threshold one realisation decides a whole character, so a single-trial
+    // grid moves by tens of points between neighbouring settings and rewards
+    // whichever constant happened to suit one burst of noise.
+    const SEEDS: [u32; 4] = [0x1234_5678, 0x9e37_79b9, 0x0bad_f00d, 0x5eed_1234];
+    let mut cells: Vec<(String, f32)> = Vec::new();
+    fn over_seeds(f: impl Fn(u32) -> f32) -> f32 {
+        SEEDS.iter().map(|&s| f(s)).sum::<f32>() / SEEDS.len() as f32
+    }
+
+    for &wpm in &[12.0f32, 18.0, 25.0, 35.0] {
+        for &db in &[15.0f32, 6.0, 3.0, 0.0, -3.0] {
+            let acc = over_seeds(|seed| {
+                let sig = gen_cw_seed(short, wpm, scale_for_snr(db), CW_TONE, seed);
+                accuracy(short, &decode_cw(&sig, 0.0))
+            });
+            cells.push((format!("short {wpm:.0}wpm {db:+.0}dB"), acc));
+        }
+    }
+    for &wpm in &[15.0f32, 22.0, 28.0] {
+        for &db in &[12.0f32, 6.0, 3.0] {
+            let acc = over_seeds(|seed| {
+                let sig = gen_cw_seed(long, wpm, scale_for_snr(db), CW_TONE, seed);
+                accuracy(long, &decode_cw(&sig, 0.0))
+            });
+            cells.push((format!("long {wpm:.0}wpm {db:+.0}dB"), acc));
+        }
+    }
+    // Residual tuning error the classifier leaves behind.
+    for &err in &[-150.0f32, -50.0, 50.0, 150.0] {
+        let acc = over_seeds(|seed| {
+            let sig = gen_cw_seed(long, 20.0, scale_for_snr(10.0), 700.0 + err, seed);
+            accuracy(long, &decode_cw(&sig, 700.0))
+        });
+        cells.push((format!("tune {err:+.0}Hz"), acc));
+    }
+    // A second station inside the 400 Hz passband, keyed at another speed.
+    for &sep in &[300.0f32, 200.0, -200.0] {
+        let acc = over_seeds(|seed| {
+            let mut sig = gen_cw_seed(long, 20.0, scale_for_snr(10.0), CW_TONE, seed);
+            let other = gen_cw_at(qrm, 27.0, 0.0, CW_TONE + sep);
+            for (i, s) in sig.iter_mut().enumerate() {
+                if let Some(o) = other.get(i) {
+                    *s += o;
+                }
+            }
+            accuracy(long, &decode_cw(&sig, 0.0))
+        });
+        cells.push((format!("qrm {sep:+.0}Hz"), acc));
+    }
+    // A station that changes speed mid-over, which is where the post-mix
+    // filter can trap itself: too narrow for the fist actually being sent
+    // smears the keying, which reads as a *slower* clock, which asks for a
+    // narrower filter still. Nothing else in this grid can see that — every
+    // other cell is a single speed held throughout — so without this cell the
+    // filter's safety floor looks like free score.
+    for &(from, to) in &[(15.0f32, 32.0f32), (30.0, 14.0)] {
+        const FIRST: &str = "CQ CQ DE W1AW K ";
+        const SECOND: &str = "UR RST 599 QTH NEWINGTON DE W1AW K";
+        let acc = over_seeds(|seed| {
+            let mut sig = gen_cw_seed(FIRST, from, scale_for_snr(12.0), CW_TONE, seed);
+            sig.extend(gen_cw_seed(
+                SECOND,
+                to,
+                scale_for_snr(12.0),
+                CW_TONE,
+                seed ^ 0xffff,
+            ));
+            // Scored over the whole over: if the clock traps itself on the
+            // change, everything after it is wreckage and the score says so.
+            accuracy(&format!("{FIRST}{SECOND}"), &decode_cw(&sig, 0.0))
+        });
+        cells.push((format!("speed {from:.0}->{to:.0}wpm"), acc));
+    }
+    // Empty frequency: every character emitted is an error, and the score has
+    // to feel that or a change can buy copy with insertions and look good.
+    for &seed in &[0x1234_5678u32, 0xdead_beef, 0x0bad_f00d] {
+        let mut rng = seed;
+        let n = (12.0 * FS) as usize;
+        let sig: Vec<Complex32> = (0..n)
+            .map(|_| Complex32::new(noise(&mut rng), noise(&mut rng)) * 0.3)
+            .collect();
+        let letters = decode_cw(&sig, 0.0)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .count();
+        // Ten spurious characters in twelve seconds scores zero.
+        cells.push((
+            format!("noise {seed:08x}"),
+            1.0 - (letters as f32 / 10.0).min(1.0),
+        ));
+    }
+
+
+    let mean = cells.iter().map(|(_, a)| *a).sum::<f32>() / cells.len() as f32;
+    (cells, mean)
+}
+
+#[test]
+#[ignore]
+fn bench_cw_score() {
+    let (cells, mean) = cw_score_grid();
+    for (name, acc) in &cells {
+        println!("  {name:<22} {:>5.1}%", acc * 100.0);
+    }
+    println!("\n  CW SCORE {:.2}%  ({} cells)", mean * 100.0, cells.len());
+}
+
+/// The score is a regression gate, not just something to read.
+///
+/// Every other CW test here asserts on one scenario, so a change that trades
+/// weak-signal copy for clean-signal copy — or buys either by emitting more
+/// characters — passes all of them while making the decoder worse. This is
+/// the one that notices, because it is the only test that weighs the whole
+/// grid, insertions on an empty frequency included.
+///
+/// The bar sits below the measured figure by about the amount the grid moves
+/// between neighbouring settings of a single constant. It is meant to catch a
+/// change that costs a point or more, not to pin the exact number: raise it
+/// when the score improves, and treat needing to lower it as the finding.
+#[test]
+fn cw_score_does_not_regress() {
+    let (cells, mean) = cw_score_grid();
+    const FLOOR: f32 = 0.88;
+    if mean < FLOOR {
+        let mut worst: Vec<&(String, f32)> = cells.iter().collect();
+        worst.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let detail: Vec<String> = worst
+            .iter()
+            .take(6)
+            .map(|(n, a)| format!("{n} {:.0}%", a * 100.0))
+            .collect();
+        panic!(
+            "CW score {:.2}% is below the {:.0}% gate; worst cells: {}",
+            mean * 100.0,
+            FLOOR * 100.0,
+            detail.join(", ")
+        );
     }
 }
 
@@ -2680,5 +3086,53 @@ fn spot_snr_follows_the_band() {
             (-24.0..=20.0).contains(&weak_db) && (-24.0..=20.0).contains(&strong_db),
             "{label}: SNR outside the reportable range: {weak_db} / {strong_db}"
         );
+    }
+}
+
+
+/// Fading, at signal levels where the flat benchmark reads 100 %.
+///
+/// Every other CW figure in this file is measured on a constant-amplitude
+/// carrier. Nothing on HF is constant-amplitude. Measured across the live 20m
+/// capture, the mark level of a single station moves by 12 to 31 dB inside one
+/// 60-second over, and which stations the decoder copies tracks that number
+/// far more closely than it tracks their SNR: the one it copies cleanly fades
+/// by 15 dB, the two it turns into nonsense fade by 30.
+///
+/// This is why: at 15 dB SNR — comfortable, 100 % copy when flat — 20 dB of
+/// QSB takes it to about 40 %. The threshold tracker is the reason. `peak`
+/// decays over 2.5 s and `floor` attacks over 2, deliberately slow so keying
+/// cannot drag them, but QSB moves on the same timescale as the keying they
+/// are trying to ignore. Through a fade-down the arming threshold is stranded
+/// above the signal and whole characters vanish; on the way back up it sits far
+/// below and noise walks in.
+///
+/// Fixing that needs a detector whose decision does not depend on an absolute
+/// level — the numbers here are the yardstick for whether one works.
+#[test]
+#[ignore]
+fn bench_cw_fading() {
+    let msg = "CQ CQ DE W1AW W1AW K UR RST 599 QTH NEWINGTON DE W1AW K";
+    println!("\n  copy vs fade depth, 20 WPM (0 dB row is the flat case)\n");
+    println!("{:>8} {:>8} {:>8} {:>8}", "QSB dB", "15dB", "10dB", "6dB");
+    for depth_db in [0.0f32, 6.0, 12.0, 20.0, 30.0] {
+        print!("{depth_db:>8.0}");
+        for snr in [15.0f32, 10.0, 6.0] {
+            let key = gen_cw_key(msg, 20.0, 3.0, &[1.0]);
+            // A slow fade, 0.15 Hz, applied in dB so the depth means what it says.
+            let faded: Vec<f32> = key
+                .iter()
+                .enumerate()
+                .map(|(i, &k)| {
+                    let t = i as f32 / FS as f32;
+                    let db = -0.5 * depth_db * (1.0 + (2.0 * PI * 0.15 * t).sin());
+                    k * 10f32.powf(db / 20.0)
+                })
+                .collect();
+            let sig = key_to_iq(&faded, scale_for_snr(snr), CW_TONE);
+            let acc = accuracy(msg, &decode_cw(&sig, 0.0));
+            print!("{:>8}", format!("{:.0}%", acc * 100.0));
+        }
+        println!();
     }
 }

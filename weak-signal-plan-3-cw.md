@@ -1,9 +1,8 @@
 # CW plan, round 3 — the band, not the bench
 
-**Status:** Stage 0 complete and committed on `main`. Stage 1 attempted five
-ways and rejected; none of it is in the tree. Stage 2 (the HSMM in §5) is
-**implemented on `weak-signal-stage2-hsmm` and has not met §6.** Do not merge
-it as-is. Section 7 is the handback from that attempt.
+**Status:** Stage 0 complete. Stage 1 attempted five ways and rejected; none
+of it is in the tree. Stage 2 (the HSMM in §5) is **on `main` and has not
+met §6.** Section 7 is the handback from that attempt.
 
 **This document is a handoff.** Sections 1–4 are context; section 5 is the
 specification Stage 2 followed; section 6 is still how to know you are done;
@@ -29,7 +28,7 @@ IQ in → mix wanted tone to DC → 4-pole narrow LPF → magnitude → smooth
 fit. The tone search and lock (`search`, `score_cw`) sit alongside and were
 not in scope for Stage 2.
 
-Stage 0, still the committed decoder on `main`, was the hard-decision chain:
+Stage 0, replaced on `main` by the HSMM, was the hard-decision chain:
 
 ```
 … → matched boxcar (0.35 dit) → hysteresis slicer (step_envelope)
@@ -62,7 +61,7 @@ machine that recorded it before trusting any real-band number.
 
 ### The three instruments
 
-| Instrument | What it measures | Stage 0 (`main`) | Stage 2 (`weak-signal-stage2-hsmm`) |
+| Instrument | What it measures | Stage 0 | Stage 2 (now on `main`) |
 |---|---|---|---|
 | `bench_cw_score` (41 cells) | flat carrier, AWGN — the laboratory | **90.22 %** | **84.05 %** |
 | `bench_cw_band` (16 cells) | Watterson channel, QRM, static — the band | **43.54 %** | **41.84 %** |
@@ -445,7 +444,7 @@ lower one is the finding, not the fix.
 
 ## 7. Handback
 
-Stage 2 as specified in §5 is on `weak-signal-stage2-hsmm`. Isolated Viterbi
+Stage 2 as specified in §5 is on `main`. Isolated Viterbi
 on a clean
 0/1 envelope recovers `PARIS` / `CQ` at the right `T`. The loss is in the
 real envelope, windowing, and fade-following, not the grammar.

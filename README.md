@@ -358,10 +358,8 @@ the other. The comparison survives that difference; the level does not.
   offset, a ±20 Hz centre-frequency meter, WPM, and the tones in the
   passband. Threshold lines on the envelope are the normalised mark and
   space level estimates, not a hysteresis slicer. `u` / `i` trim the
-  lock 2 Hz; `g` centres the cursor on it. The HSMM lives on
-  `weak-signal-stage2-hsmm` and has not met the Stage 2 band/flat bars
-  in `weak-signal-plan-3-cw.md` — `main` still ships the older
-  hysteresis slicer.
+  lock 2 Hz; `g` centres the cursor on it. The HSMM is on `main` and
+  has not met the Stage 2 band/flat bars in `weak-signal-plan-3-cw.md`.
 - **RTTY** — a matched filter per tone, each integrating across exactly one
   bit and dumped on the framer's own bit boundary, with per-tone envelope
   normalisation so a selective fade that takes one tone 20 dB down still

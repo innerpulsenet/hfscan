@@ -62,8 +62,8 @@
 Successor to `weak-signal-plan.md` (items 1–8 finished 2026-08-14, plus the
 receiver-control follow-up). This one starts from what that plan actually
 left on the table, measured on the current tree rather than assumed.
-Round 3 is `weak-signal-plan-3-cw.md`: Stage 2's HSMM is on
-`weak-signal-stage2-hsmm` and has not met that plan's acceptance bar.
+Round 3 is `weak-signal-plan-3-cw.md`: Stage 2's HSMM is on `main`
+and has not met that plan's acceptance bar.
 
 ## Measured baseline (2026-08-16, this tree, release build)
 

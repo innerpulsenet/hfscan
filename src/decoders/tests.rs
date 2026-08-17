@@ -1634,6 +1634,36 @@ fn cw_band_score_grid() -> (Vec<(String, f32)>, f32, Vec<(String, f32)>, f32) {
     (cells, mean, any_cells, any_mean)
 }
 
+/// Copying every tone has to be worth more than copying one.
+///
+/// `bench_cw_band` prints the throughput column but printing is not a gate,
+/// and that gap bit: deleting `take_background` during a cleanup silently
+/// took throughput back down to the lock-only figure with the whole suite
+/// still green, because every other Stage 4 test goes through the spot path
+/// instead. This asserts the capability itself.
+#[test]
+fn cw_throughput_beats_the_lock_alone() {
+    let (_, mean, any_cells, any_mean) = cw_band_score_grid();
+    assert!(
+        any_mean > mean + 0.02,
+        "throughput {:.2}% is not clear of lock-only {:.2}% — background          tones are not reaching the caller",
+        any_mean * 100.0,
+        mean * 100.0
+    );
+    // The gain has to be in the cells it is supposed to be in: several
+    // stations in one passband, where the lock can only have picked one.
+    let qrm = any_cells
+        .iter()
+        .find(|(n, _)| n == "qrm x3 moderate")
+        .map(|(_, a)| *a)
+        .unwrap_or(0.0);
+    assert!(
+        qrm >= 0.38,
+        "qrm x3 moderate copies {:.0}% across all streams; it was 45.5% when          Stage 4 landed and 26.1% on the lock alone",
+        qrm * 100.0
+    );
+}
+
 /// The band grid as a gate, like `cw_score_does_not_regress` but for the
 /// conditions that actually break this decoder.
 ///
@@ -1761,7 +1791,7 @@ fn decode_cw_all(sig: &[Complex32], tone: f32) -> Vec<(f32, String)> {
     for chunk in sig.chunks(4096) {
         chain.process(chunk, &mut audio);
         primary.push_str(&d.process(&audio));
-        for b in d.take_background() {
+        for b in Decoder::take_background(&mut d) {
             // Tones drift by a few Hz as the search re-centres them, so bin
             // by proximity rather than by exact offset.
             match bg.iter_mut().find(|(h, _)| (*h - b.hz).abs() < 40.0) {

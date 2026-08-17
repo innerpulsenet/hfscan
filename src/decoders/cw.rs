@@ -977,35 +977,6 @@ impl CwDecoder {
         self.tones.len()
     }
 
-    /// Copy from every tone except the one being listened to, drained.
-    ///
-    /// These are the stations Stage 4 exists to recover: they sit in the same
-    /// 400 Hz passband as the primary and used to be discarded unheard.
-    /// Returned as `(offset_hz, text)` so a caller can tell them apart.
-    pub fn take_background(&mut self) -> Vec<BgCopy> {
-        let (i, floor) = (self.primary(), self.copy_floor);
-        self.tones
-            .iter_mut()
-            .enumerate()
-            .filter(|(k, t)| *k != i && !t.text.is_empty())
-            .map(|(_, t)| BgCopy {
-                hz: t.mix_hz,
-                quality: t.quality.clamp(0.0, 1.0),
-                // Drained whether or not it clears the bar: a tone held back
-                // must not accumulate until it happens to pass and then emit
-                // a minute of stale copy in one go.
-                text: match t.quality >= floor {
-                    true => std::mem::take(&mut t.text),
-                    false => {
-                        t.text.clear();
-                        String::new()
-                    }
-                },
-            })
-            .filter(|b| !b.text.is_empty())
-            .collect()
-    }
-
     /// Start a tone on `hz` if the budget allows and nothing is there yet.
     fn spawn(&mut self, hz: f32) {
         if self.tones.len() >= MAX_TONES
@@ -1522,8 +1493,32 @@ impl Decoder for CwDecoder {
         self.copy_floor = floor;
     }
 
+    /// Copy from every tone except the one being listened to, drained.
+    ///
+    /// These are the stations Stage 4 exists to recover: they sit in the same
+    /// 400 Hz passband as the primary and used to be discarded unheard.
     fn take_background(&mut self) -> Vec<BgCopy> {
-        CwDecoder::take_background(self)
+        let (i, floor) = (self.primary(), self.copy_floor);
+        self.tones
+            .iter_mut()
+            .enumerate()
+            .filter(|(k, t)| *k != i && !t.text.is_empty())
+            .map(|(_, t)| BgCopy {
+                hz: t.mix_hz,
+                quality: t.quality.clamp(0.0, 1.0),
+                // Drained whether or not it clears the bar: a tone held back
+                // must not accumulate until it happens to pass and then emit
+                // a minute of stale copy in one go.
+                text: match t.quality >= floor {
+                    true => std::mem::take(&mut t.text),
+                    false => {
+                        t.text.clear();
+                        String::new()
+                    }
+                },
+            })
+            .filter(|b| !b.text.is_empty())
+            .collect()
     }
 
     fn cw_view(&self) -> Option<CwView> {

@@ -812,6 +812,39 @@ moderate` cell (46.2 %) is the result worth reading: three neighbours cost
 fading-limited rather than selection-limited — §7.8's arithmetic still holds
 and Stage 4 is not what gets the band mean to 60.
 
+**Against the live capture, in auto mode**, which is how the app is actually
+used. `bench_auto_decode_over_the_capture` drives the real path — classifier,
+slot placement, channelizer, one decoder per slot — over the 60 s of 20m and
+prints the roster and the spots. The classifier places 34 slots, 25 of them
+CW, saturating the 32-slot budget.
+
+Stage 4 recovers **NK9G** there, and single-tone does not: six unique spots
+against five. That is the QRP station the capture is named for, found as a
+background tone of a slot locked to something else. It is one station out of
+six, which is the honest size of the win on this band — but it is exactly the
+kind of station the whole round is about.
+
+Two things had to be fixed to get there, both found by running it rather than
+by reasoning about it:
+
+- **Background copy does not belong in the auto roster.** Wired in, it added
+  five junk rows and no callsigns: the fleet already has a decoder on every
+  signal the classifier can see, so the leftover tones inside each passband
+  are the ones it looked at and rejected. Reverted. The roster stays primary-
+  only; the cursor pane, where the operator has chosen one frequency and
+  everything else is by definition uncovered, keeps its `also copying` pane.
+- **One operator is one spot.** CW slots dedup at 120 Hz but copy across 400,
+  so their passbands overlap and Stage 4 gives each of them every station in
+  its own. G4MLW went to pskreporter twice, once from the slot locked to it
+  and once as its neighbour's background tone. `App::spot_is_new` holds a
+  two-minute window keyed on call and frequency.
+
+Cost on the capture: CW demod throughput 20.28 → 18.12 MS/s, about −10 %,
+which is the only red line in `bench_replay`. End-to-end is unchanged at
+72x realtime and 1.39 % of a core, because the CW demod is not where the time
+goes. (PSK31 also flags there intermittently, swinging 53 → 45 MS/s across
+runs on code this work never touched; that one is the machine, not a change.)
+
 **CPU, the budget §6 never set.** 1.0 ms per second of audio for four tones
 against 0.4 ms for one — 0.1 % of a core. `bench_cw_cpu` prints it and
 `cw_cost_does_not_grow_on_a_busy_band` measures *growth* rather than absolute

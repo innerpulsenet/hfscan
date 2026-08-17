@@ -849,6 +849,10 @@ struct App {
     /// Copy from the other stations in the CW passband, newest last, one
     /// entry per tone. Stage 4 decodes them; this is where they are read.
     cw_bg: Vec<BgStation>,
+    /// Callsigns already reported, with where and when. One operator can be
+    /// a slot's lock and another slot's background tone — overlapping
+    /// passbands make that routine — and pskreporter should hear it once.
+    spotted: VecDeque<(String, f64, Instant)>,
     /// Occupied slices labelled CW / PSK / SSB / … from the last classify.
     idents: Vec<identify::Ident>,
     /// Held, fading spectrum labels. `idents` is the visible snapshot of these.
@@ -1070,6 +1074,7 @@ impl App {
             psk_hits: Vec::new(),
             cw_hits: Vec::new(),
             cw_bg: Vec::new(),
+            spotted: VecDeque::new(),
             idents: Vec::new(),
             tracks: Vec::new(),
             heard: Vec::new(),
@@ -1111,6 +1116,7 @@ impl App {
         self.psk_hits.clear();
         self.cw_hits.clear();
         self.cw_bg.clear();
+        self.spotted.clear();
         self.idents.clear();
         self.tracks.clear();
         self.scout_iq.clear();
@@ -1457,6 +1463,7 @@ impl App {
             if soft && slot.decoder.wants_agc() {
                 slot.agc.process(&mut slot.audio);
             }
+            slot.decoder.set_copy_floor(floor);
             let t = Instant::now();
             let text = slot.decoder.process(&slot.audio);
             if let Some(i) = cpu_kind_index(slot.kind) {
@@ -1585,6 +1592,7 @@ impl App {
         if self.msg_scroll > 0 && added > 0 {
             self.scroll_transcript(added as isize);
         }
+        spots.retain(|(m, dial, _)| self.spot_is_new(m, *dial));
         if let Some(r) = &self.reporter {
             for (m, dial, mode) in &spots {
                 r.spot(m, *dial, mode);
@@ -1600,6 +1608,34 @@ impl App {
         while self.ft_msgs.len() > 600 {
             self.ft_msgs.pop_front();
         }
+    }
+
+    /// Whether this spot is new, remembering it if so.
+    ///
+    /// Two decoders hearing the same operator is not two reports. CW slots
+    /// dedup at 120 Hz but copy across 400, so their passbands overlap, and
+    /// Stage 4 gives each of them every station in its own — measured on the
+    /// 20m capture, G4MLW went to the reporter once from the slot locked to
+    /// it and once as a neighbouring slot's background tone.
+    fn spot_is_new(&mut self, m: &FtMessage, dial_hz: f64) -> bool {
+        const HOLD: Duration = Duration::from_secs(120);
+        const SAME_HZ: f64 = 200.0;
+        let hz = dial_hz + m.freq_hz as f64;
+        while self.spotted.front().is_some_and(|(_, _, t)| t.elapsed() > HOLD) {
+            self.spotted.pop_front();
+        }
+        if self
+            .spotted
+            .iter()
+            .any(|(text, f, _)| text == &m.text && (f - hz).abs() < SAME_HZ)
+        {
+            return false;
+        }
+        self.spotted.push_back((m.text.clone(), hz, Instant::now()));
+        while self.spotted.len() > 256 {
+            self.spotted.pop_front();
+        }
+        true
     }
 
     /// Point the automatic decoders at what is actually on the band.
@@ -2009,8 +2045,12 @@ impl App {
                     }
                     _ => d.take_messages(),
                 };
+                let dial = self.tuned_freq();
+                let msgs: Vec<FtMessage> = msgs
+                    .into_iter()
+                    .filter(|m| self.spot_is_new(m, dial))
+                    .collect();
                 if let Some(r) = &self.reporter {
-                    let dial = self.tuned_freq();
                     for m in &msgs {
                         r.spot(m, dial, self.mode.label());
                     }
@@ -7807,6 +7847,117 @@ mod tests {
         assert!(text.contains("tuner"), "tuner pane missing:\n{text}");
         assert!(text.contains("copy"), "copy pane missing:\n{text}");
         assert!(text.contains("activity"), "activity strip missing:\n{text}");
+    }
+
+    /// Auto decode over the real 20m capture, which is how this app is used.
+    ///
+    /// Everything else about Stage 4 is measured on synthesised bands. This
+    /// runs the actual auto path — classifier, slot placement, channelizer,
+    /// one CW decoder per slot — over sixty seconds of real 20m and prints
+    /// the roster it builds, so the stations recovered behind each slot's
+    /// lock can be read rather than inferred.
+    #[test]
+    #[ignore]
+    fn bench_auto_decode_over_the_capture() {
+        use crate::bench::IqRecording;
+        use std::path::Path;
+
+        const CAP: &str = "captures/20m_14060khz_192ksps_60s.iq";
+        if !Path::new(CAP).exists() {
+            eprintln!("skipping: {CAP} not found");
+            return;
+        }
+        let rec = IqRecording::load_file(CAP).expect("loading capture");
+        let mut app = App::new(rec.center_freq, rec.sample_rate, Mode::Auto);
+        let mut spec = crate::Spectrum::new(8192);
+        let mut out = Vec::new();
+        for (n, block) in rec.samples.chunks(16384).enumerate() {
+            app.feed(block, &mut spec, &mut out);
+            // The event loop reclassifies on a timer; here it is every
+            // ~0.85 s of capture, which is the same order. Slot retention is
+            // wall-clock based, so the roster row count moves by one or two
+            // between runs; the spot list is stable.
+            if n % 10 == 9 {
+                super::refresh_idents(&mut app);
+            }
+        }
+        app.sort_rows();
+        println!(
+            "\n  auto decode, 60 s of 20m, {} slots, {} roster rows\n",
+            app.auto.len(),
+            app.rows.len()
+        );
+        println!("          kHz     mode    sig   speed  copy");
+        for r in &app.rows {
+            let copy: String = r.copy.chars().take(52).collect();
+            // A row on no slot's dial is one Stage 4 recovered behind a lock.
+            let bg = !app
+                .auto
+                .iter()
+                .any(|s| (s.dial_hz - r.dial_hz).abs() < 120.0);
+            println!(
+                "  {:>11.3} {} {:<5} {:>5} {:>7}  {:?}",
+                r.dial_hz / 1000.0,
+                if bg { "bg" } else { "  " },
+                r.mode,
+                r.signal,
+                r.speed,
+                copy.trim()
+            );
+        }
+        let cw = app.auto.iter().filter(|s| s.kind == identify::Kind::Cw).count();
+        println!("\n  CW slots: {cw}");
+        // Spots are the filtered channel: a call has to match CQ/DE plus a
+        // structurally valid callsign, which raw roster text does not.
+        let mut calls: Vec<String> = app
+            .ft_msgs
+            .iter()
+            .filter(|m| m.text.starts_with("CQ "))
+            .map(|m| format!("{:.3} {}", m.freq_hz / 1000.0, m.text))
+            .collect();
+        calls.sort();
+        calls.dedup();
+        println!("\n  CW/PSK spots: {}", calls.len());
+        for c in &calls {
+            println!("    {c}");
+        }
+    }
+
+    /// One operator is one spot, however many decoders heard them.
+    ///
+    /// CW auto slots dedup at 120 Hz but copy across 400, so their passbands
+    /// overlap; Stage 4 then gives each slot every station in its own, and a
+    /// station sitting between two slots is heard twice. Measured on the 20m
+    /// capture before this: G4MLW went to the reporter from the slot locked
+    /// to it and again as its neighbour's background tone.
+    #[test]
+    fn a_station_heard_by_two_slots_is_spotted_once() {
+        let mut app = App::new(14_060_000.0, 192_000.0, Mode::Auto);
+        let msg = |hz: f32| FtMessage {
+            stamp: "120000".into(),
+            snr_db: 5.0,
+            dt_sec: 0.0,
+            freq_hz: hz,
+            text: "CQ G4MLW".into(),
+        };
+        // Same operator, reached from two slots 140 Hz apart: 14023.994 both
+        // times, once as +16 Hz of one dial and once as +156 Hz of another.
+        assert!(app.spot_is_new(&msg(16.0), 14_023_978.0), "first sighting");
+        assert!(
+            !app.spot_is_new(&msg(156.0), 14_023_838.0),
+            "the same station on the same frequency was spotted twice"
+        );
+        // A different operator on that frequency is still news...
+        let other = FtMessage {
+            text: "CQ W1AW".into(),
+            ..msg(16.0)
+        };
+        assert!(app.spot_is_new(&other, 14_023_978.0), "a different call");
+        // ...and so is the same operator somewhere else entirely.
+        assert!(
+            app.spot_is_new(&msg(16.0), 14_055_000.0),
+            "the same call 31 kHz away is a different spot"
+        );
     }
 
     #[test]

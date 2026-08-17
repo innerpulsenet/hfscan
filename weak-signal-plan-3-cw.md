@@ -1,12 +1,15 @@
 # CW plan, round 3 — the band, not the bench
 
 **Status:** Stage 0 complete. Stage 1 attempted five ways and rejected; none
-of it is in the tree. Stage 2 (the HSMM in §5) is **on `main` and has not
-met §6.** Section 7 is the handback from that attempt.
+of it is in the tree. Stage 2 (the HSMM in §5) is in the tree and **has not met
+§6**: the band grid is at 49.25 % against a 60 % bar and the flat grid at
+84.52 % against 88 %. It is closer than it was, and the remaining gap is
+characterised in §7.8.
 
 **This document is a handoff.** Sections 1–4 are context; section 5 is the
 specification Stage 2 followed; section 6 is still how to know you are done;
-section 7 is what the first implementation measured.
+section 7 is what has actually been measured, including two rounds of work that
+were reverted.
 
 ---
 
@@ -61,11 +64,15 @@ machine that recorded it before trusting any real-band number.
 
 ### The three instruments
 
-| Instrument | What it measures | Stage 0 | Stage 2 (now on `main`) |
-|---|---|---|---|
-| `bench_cw_score` (41 cells) | flat carrier, AWGN — the laboratory | **90.22 %** | **84.05 %** |
-| `bench_cw_band` (16 cells) | Watterson channel, QRM, static — the band | **43.54 %** | **41.84 %** |
-| `tests/cw_capture.rs` | token recall on the real 20m recording | **81.9 %** | not re-run |
+| Instrument | What it measures | Stage 0 | Stage 2 | Stage 2 + EM |
+|---|---|---|---|---|
+| `bench_cw_score` (41 cells) | flat carrier, AWGN — the laboratory | **90.22 %** | **84.58 %** | **84.52 %** |
+| `bench_cw_band` (16 cells) | Watterson channel, QRM, static — the band | **43.54 %** | **41.84 %** | **49.25 %** |
+| `tests/cw_capture.rs` | token recall on the real 20m recording | **81.9 %** | **77.5 %** | **90.0 %** |
+
+Every figure in that table is a re-measurement, taken in one sitting on one
+machine with the capture present. Where it disagrees with a number quoted
+elsewhere in this document, the table is right.
 
 Both grids average every cell over four noise seeds. Single-trial cells near
 the copy threshold swing by tens of points on which noise burst lands in which
@@ -444,72 +451,97 @@ lower one is the finding, not the fix.
 
 ## 7. Handback
 
-Stage 2 as specified in §5 is on `main`. Isolated Viterbi
-on a clean
-0/1 envelope recovers `PARIS` / `CQ` at the right `T`. The loss is in the
-real envelope, windowing, and fade-following, not the grammar.
+Stage 2 as specified in §5 is in the tree, plus one EM refinement (§7.7).
+Isolated Viterbi on a clean 0/1 envelope recovers `PARIS` / `CQ` at the right
+`T`. The residual loss is in the real envelope, windowing, and fade-following,
+not the grammar.
 
-`captures/20m_baseline_metrics.json` was not touched.
+`captures/20m_baseline_metrics.json` was not touched, so the replay baseline is
+still genuine Stage 0.
 
-### 7.1 `bench_cw_band` — before (Stage 0) and after (Stage 2)
+Two rounds of work are recorded here. The first built the HSMM and handed back
+honestly, though it left several criteria unmeasured. The second declared the
+work complete without running the instruments; it was measured and reverted
+(§7.9). Everything below is re-measured, not carried over.
 
-| Cell | Stage 0 | Stage 2 |
-|---|---:|---:|
-| chan flat 12dB | 100.0% | 97.3% |
-| chan good 12dB | 87.2% | 84.9% |
-| chan moderate 12dB | 45.7% | 45.3% |
-| chan poor 12dB | 26.6% | 21.4% |
-| chan flutter 12dB | 1.4% | 0.0% |
-| moderate 20dB | 48.6% | 49.3% |
-| moderate 6dB | 40.1% | 41.2% |
-| qrm x1 moderate | — | 45.3% |
-| qrm x2 moderate | — | 34.0% |
-| qrm x3 moderate | 25.2% | 25.9% |
-| qrm x3 poor | — | 13.7% |
-| crashes 2/s moderate | — | 43.9% |
-| crashes 6/s moderate | — | 43.9% |
-| the band, 10dB | 15.3% | 9.0% |
-| the band, 4dB | — | 14.2% |
-| empty, qrm only | 100.0% | 100.0% |
-| **mean** | **43.54%** | **41.84%** |
+### 7.1 `bench_cw_band`
 
-Dashes are cells the Stage 0 write-up did not quote. The mean is over all
-16 cells. Fourteen extra dB on the moderate path still buy almost nothing
-(49.3 vs 41.2). Stage 2 has not earned its complexity.
+| Cell | Stage 0 | Stage 2 | Stage 2 + EM |
+|---|---:|---:|---:|
+| chan flat 12dB | 100.0% | 97.3% | 97.3% |
+| chan good 12dB | 87.2% | 84.9% | 87.4% |
+| chan moderate 12dB | 45.7% | 45.3% | 56.1% |
+| chan poor 12dB | 26.6% | 21.4% | 39.4% |
+| chan flutter 12dB | 1.4% | 0.0% | 6.3% |
+| moderate 20dB | 48.6% | 49.3% | 59.7% |
+| moderate 6dB | 40.1% | 41.2% | 46.2% |
+| qrm x1 moderate | — | 45.3% | 56.1% |
+| qrm x2 moderate | — | 34.0% | 42.6% |
+| qrm x3 moderate | 25.2% | 25.9% | 30.4% |
+| qrm x3 poor | — | 13.7% | 27.9% |
+| crashes 2/s moderate | — | 43.9% | 55.0% |
+| crashes 6/s moderate | — | 43.9% | 54.3% |
+| the band, 10dB | 15.3% | 9.0% | 15.1% |
+| the band, 4dB | — | 14.2% | 14.4% |
+| empty, qrm only | 100.0% | 100.0% | 100.0% |
+| **mean** | **43.54%** | **41.84%** | **49.25%** |
+
+Dashes are cells the Stage 0 write-up did not quote. Every cell improved or
+held. `chan flutter` is off the floor but still a collapse. The 20 dB / 6 dB
+spread widened from 8.1 points to 13.5, which is the §6 target signature —
+extra signal is starting to buy copy again — but the decoder is still much
+closer to fade-limited than to noise-limited.
 
 ### 7.2 `bench_cw_score`
 
-Stage 0 mean **90.22%**. Stage 2 mean **84.05%** (gate 88%). Full 41-cell
-listing was not printed; worst cells:
+Stage 0 **90.22%**, Stage 2 **84.58%**, Stage 2 + EM **84.52%** (gate 88%).
+The EM pass is neutral here by design; the give-back is Stage 2's and it is
+concentrated at the noise wall:
 
-| Cell | Stage 2 |
-|---|---:|
-| short 12wpm −3dB | 0% |
-| short 18wpm −3dB | 0% |
-| short 25wpm −3dB | 4% |
-| short 35wpm −3dB | 8% |
-| short 35wpm +0dB | 48% |
-| short 12wpm +0dB | 50% |
+| Cell | Stage 0 | Stage 2 + EM |
+|---|---:|---:|
+| short 12wpm −3dB | — | 0% |
+| short 18wpm −3dB | — | 0% |
+| short 25wpm −3dB | — | 0% |
+| short 35wpm −3dB | — | 6% |
+| short 12wpm +0dB | — | 58% |
+| short 35wpm +0dB | — | 59% |
 
-The give-back is at the noise wall, not a small robustness tax.
+All three `noise *` cells are at 100%. Do not merge anything that moves them.
 
 ### 7.3 `cw_capture`
 
-Not re-run. Stage 0 token recall remains the last measured figure (81.9%).
+Token recall **90.0%**, against 81.9% at Stage 0 and 77.5% at Stage 2, with
+per-station density up on all four frequencies (18.9 / 5.3 / 2.4 / 4.9 against
+Stage 2's 18.3 / 5.2 / 0.8 / 4.9). Recall and density rising together is the
+one combination that is not an artefact of emitting more letters.
+
+`the_clean_station_is_copied_nearly_verbatim` still fails, and has failed since
+the HSMM landed. `NK9G` now recurs often enough to clear the first assertion;
+what fails is `text.contains("CQ CQ QRP TEST DE NK9G")` — the decoder emits
+`DENK9G`, dropping the word gap before the callsign. That is a gap-classifica-
+tion bug, not a detection one, and it is the most concrete lead in this file.
 
 ### 7.4 Acceptance
 
-| Criterion | Need | Stage 2 | Met |
+| Criterion | Need | Stage 2 + EM | Met |
 |---|---|---|---|
 | Speed / adjacent / clean-start canaries | green | pass | yes |
-| `cw_copies_at_zero_db` | ≥ 60% at 0 dB | ~25% | **no** |
-| `cargo test --release` | green | 0 dB + 88% flat gate fail | **no** |
-| `bench_cw_band` | ≥ 60% | 41.84% | **no** |
-| `bench_cw_score` | ≥ 88% | 84.05% | **no** |
-| `cw_capture` recall / density | ≥ 82%, density not down | not run | unknown |
 | `empty, qrm only` | 100% | 100% | yes |
-| Flat `noise *` cells | 100% | not re-listed | unverified |
-| Raise `cw_*_does_not_regress` gates | just under new scores | not done | n/a — scores did not earn it |
+| Flat `noise *` cells | 100% | 100% | yes |
+| `cw_capture` recall / density | ≥ 82%, density not down | 90.0%, density up | yes |
+| `bench_cw_band` | ≥ 60% | 49.25% | **no** |
+| `bench_cw_score` | ≥ 88% | 84.52% | **no** |
+| `cw_copies_at_zero_db` | ≥ 60% at 0 dB | 35% | **no** |
+| `the_clean_station_is_copied_nearly_verbatim` | pass | fails on the `DE` word gap | **no** |
+| `spot_snr_follows_the_band` | pass | −2.2 dB weak vs 4.6 dB strong | **no** |
+| `cargo test --release` | green | 132 pass, 3 fail | **no** |
+| Raise `cw_*_does_not_regress` gates | just under new scores | not done | n/a — flat did not earn it |
+
+The three `cargo test` failures are `cw_copies_at_zero_db`,
+`cw_score_does_not_regress` and `spot_snr_follows_the_band`. All three predate
+the EM pass and fail identically without it. `spot_snr_follows_the_band` went
+unmentioned in the first handback; it is a real, open failure.
 
 ### 7.5 Tried on the Stage 2 branch (do not repeat)
 
@@ -522,23 +554,84 @@ Not re-run. Stage 0 token recall remains the last measured figure (81.9%).
 | Word-gap threshold 3.9 T | Extra spaces (`W1 A W`) | 4.6 T |
 | Full-buffer idle-only emit | Clean copy; 0 dB never flushed | back to incremental flush |
 | Require tone lock to emit | Noise quiet; 0 dB → 0% | lock **or** mark/space contrast ≥ 2.4 |
-| Skip EM for speed | Band 40.84% | one same-`T` EM pass when contrast < 6 → 41.84% |
+| Skip EM for speed | Band 40.84% | one same-`T` EM pass when contrast < 6 |
 
 ### 7.6 Throughput
 
-Not re-measured. Stage 0 CW row of `bench_replay` was ~2500×. The Stage 2
-trellis is 500 Hz with a ~2.5 s window; expect to give some of that back.
-Do not quote 2500× as a Stage 2 number.
+**This is now the largest unaddressed problem.** Measured with `bench_replay`
+against the Stage 0 baseline in `20m_baseline_metrics.json`:
 
-### 7.7 What to do next
+| | CW demod | End-to-end | CPU |
+|---|---:|---:|---:|
+| Stage 0 baseline | 20.28 MS/s | 71.67× | 1.4% |
+| Stage 2 | 0.11 MS/s | 2.56× | 39.1% |
+| Stage 2 + EM | 0.08 MS/s | 1.94× | 58.6% |
 
-1. Make `mu_mark(t)` follow QSB on a ~50–80 ms time constant *inside* the
-   window — the causal mean is still too sticky on the way down.
-2. Two full EM decode passes on fading cells, not a single same-`T` retry.
-3. Drive `POST_MIX_*` from grid `T` earlier so 0 dB sees the narrow filter.
-4. Re-run `cw_capture` and `bench_replay` before any merge.
+The HSMM costs ~184× on CW demod and the EM pass another ~1.4× on top. §5.4
+budgeted "a few hundred times real time" and that is roughly where the decoder
+landed in isolation, but end-to-end the scanner is at 1.94× realtime with 16
+channels and 58% CPU. That is not enough headroom for the live TUI, and none of
+§5.6's levers (coarse-to-fine period search, less frequent `T` re-estimation,
+duration pruning, beam pruning) have been applied yet. Do this before any
+further accuracy work; it is also the cheapest remaining win, because the
+period grid is currently re-searched far more often than §5.5 asks for.
 
----
+### 7.7 The EM pass that was kept
+
+One change on top of Stage 2, worth +7.4 band and +12.5 capture recall for
+−0.06 flat:
+
+`decode_window` now runs an unconditional EM pass before the existing
+conditional one. It re-estimates levels from the first decode's segmentation,
+refills the likelihoods, and lets the period re-settle one grid step either way
+against the improved levels (`refine_steps(t_ds, rate, 1)`), keeping the result
+when it scores within 5 of the incumbent. The second pass, previously gated at
+contrast < 6, is now gated at < 8.
+
+Why it works where the Stage 1 attempts did not: the levels are re-estimated
+from a globally optimal segmentation rather than from an instantaneous
+threshold, which is exactly the distinction §5.3 drew. Why the narrow refine:
+five candidates cost 1.71× end-to-end against 1.94× for three, and scored
+slightly worse on the band.
+
+### 7.8 Where the remaining gap is
+
+- **Band 49.25 → 60.** `chan flutter` (6.3%) and `the band` (15.1 / 14.4) are
+  the three cells holding the mean down. Flutter is a fast-fading collapse; the
+  band cells are the multi-station case Stage 4 is meant to address, and no
+  amount of single-tone work will fix them.
+- **Flat 84.52 → 88.** Entirely the −3 dB row and the slower +0 dB cells. This
+  is the noise wall, and §7.2 shows Stage 2 gave it back relative to Stage 0's
+  hard-decision chain. Worth understanding before adding anything.
+- **The `DE` word gap** (§7.3). Small, concrete, and it is the one test whose
+  failure says something is structurally wrong rather than merely weak.
+
+### 7.9 Rejected: the second Stage 2 round
+
+A round of work that reported itself complete was measured and reverted whole.
+It is recorded because the ideas look plausible and should not be retried.
+
+| Attempt | Effect | Verdict |
+|---|---|---|
+| `mu_mark` from a ±50 ms **running maximum**, bidirectionally smoothed, sold as fade tracking | Flat 84.58 → 48.34 in isolation | rejected. This is a max-hold peak, the structure §3 and §5.3 exist to eliminate. Refer levels to a **mean**. |
+| `mu_space` pinned to a constant 12.5th percentile of the window | part of the above | rejected — throws away adaptive space tracking |
+| `reest_levels` rebuilt on interpolated per-segment mark averages | Band 48.97 → 44.99, flat 84.77 → 83.78 | rejected; the simple mean-of-mark-samples estimator it replaced is better |
+| SNR-adaptive emission variance `sigma = clamp(0.40·mu_s/span, 0.22, 0.65)`, to "remove the 0 dB cliff" | 0 dB cells 42.5/52.5/66.2/45.0 → 31.2/45.0/48.8/36.2 | rejected — it makes the exact cells it targets worse |
+| Loosening ~13 detector thresholds at once (contrast, `inst_q`, `mark_frac`, `t_jump`, clock-fit tolerances, gap boundaries) | Band 45.41 → measured worse at every setting tried | rejected |
+| Emission gates in `cw.rs` cut to `mark_env < 1.08·space_env && quality < 0.12`, replacing the `2.4×` contrast guard | **All three flat `noise *` cells 100% → 0%** | rejected outright. The decoder invented Morse from pure noise, which §6 forbids. |
+| `update_post_mix` with the `have_period()` guard removed | reintroduces the §5.7 feedback loop; orphans `have_period` | rejected |
+
+Combined, that round measured flat **39.97%**, band **32.93%** (below the 38%
+gate), `noise *` at **0%**, capture recall **55.8%** with density collapsing
+from 18.3 to 3.9 tok/100c, and 14 failing tests including two of the three
+§6 canaries. The §7 it left behind reported none of this.
+
+**The lesson worth keeping:** every one of those changes is a threshold or an
+estimator tuned by inspection rather than measured. The one change that
+survived (§7.7) is structural — it adds an inference pass, not a constant. On
+this decoder, tuning constants by hand has now failed across three rounds and
+roughly twenty attempts. Measure first, and run `bench_cw_score`'s `noise *`
+cells and `cw_capture`'s density column before believing any improvement.
 
 ## 8. Later stages
 

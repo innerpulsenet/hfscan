@@ -36,8 +36,8 @@ const LAG_S: f32 = 0.30;
 /// Wait for this much envelope before the first decode, so the period grid
 /// sees a whole character rather than three dits that look like a dah.
 const MIN_DECODE_S: f32 = 1.15;
-/// Trellis rate as a fraction of the 1 kHz envelope. A 50 WPM dit is still
-/// 6 samples at 250 Hz.
+/// Trellis rate as a fraction of the 1 kHz envelope. A 50 WPM dit is
+/// 12 samples at 500 Hz.
 const DECIM: usize = 2;
 
 /// Geometric Idle: leave-rate of about one per second.
@@ -387,9 +387,37 @@ impl HsmmDecoder {
             }
         }
 
-        let (t_ds, mut score, mut path) = self.best_period(&candidates, n, hint);
+        let (mut t_ds, mut score, mut path) = self.best_period(&candidates, n, hint);
 
-        if contrast < 6.0 {
+        // EM pass 1: re-estimate levels from the decoded path, then let the
+        // period re-settle locally against the improved levels.
+        if !path.is_empty() {
+            reest_levels(
+                &env_ds,
+                &path,
+                n,
+                &mut self.scratch.mu_m,
+                &mut self.scratch.mu_s,
+            );
+            fill_likelihoods(
+                &env_ds,
+                &self.scratch.mu_m,
+                &self.scratch.mu_s,
+                &mut self.scratch.l_mark,
+                &mut self.scratch.l_space,
+            );
+            let em_cands = refine_steps(t_ds, trellis_rate, 1);
+            let (t_em, s_em, p_em) = self.best_period(&em_cands, n, hint);
+            if s_em > score - 5.0 {
+                t_ds = t_em;
+                score = s_em;
+                path = p_em;
+            }
+        }
+
+        // EM pass 2: a second level re-estimation, for deep fades where one
+        // pass has not yet pulled mu_mark down onto the faded signal.
+        if contrast < 8.0 && !path.is_empty() {
             reest_levels(
                 &env_ds,
                 &path,
@@ -856,7 +884,6 @@ fn seed_window_levels(env: &[f32], mu_m: &mut [f32], mu_s: &mut [f32]) {
     }
 }
 
-#[allow(dead_code)]
 fn reest_levels(env: &[f32], path: &[Seg], n: usize, mu_m: &mut [f32], mu_s: &mut [f32]) {
     let mut mark_on = vec![false; n];
     for seg in path {
@@ -990,10 +1017,16 @@ fn hint_dit(env: &[f32], mu_m: f32, mu_s: f32) -> Option<f32> {
 }
 
 fn refine_around(t: f32, env_rate: f32) -> Vec<f32> {
+    refine_steps(t, env_rate, 2)
+}
+
+/// `steps` grid points either side of `t`. The EM pass only needs the period
+/// to re-settle against the new levels, so it asks for one.
+fn refine_steps(t: f32, env_rate: f32, steps: i32) -> Vec<f32> {
     let lo = DIT_MIN_S * env_rate;
     let hi = DIT_MAX_S * env_rate;
     let mut out = Vec::new();
-    for k in -2i32..=2 {
+    for k in -steps..=steps {
         let v = (t * 1.12f32.powi(k)).clamp(lo, hi).round();
         if v >= 1.0 && !out.iter().any(|x: &f32| (*x - v).abs() < 0.1) {
             out.push(v);

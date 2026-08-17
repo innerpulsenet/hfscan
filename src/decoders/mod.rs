@@ -4,6 +4,7 @@
 pub mod callscan;
 pub mod channel;
 pub mod cw;
+pub mod cwlex;
 pub mod ft8;
 pub mod psk31;
 pub mod rtty;

@@ -7,6 +7,7 @@
 //! near the cursor and mixes the best one to DC; `n` hops to the next.
 
 use super::callscan::{CallScanner, utc_hhmmss};
+use super::cwlex::{self, Sym};
 use super::{CwView, Decoder, FtMessage};
 use crate::dsp::{OnePole, Rotator, mix_decim_into};
 use num_complex::Complex32;
@@ -302,6 +303,9 @@ pub struct CwDecoder {
     /// Whether `warmup` is collecting rather than the clock being trusted.
     warming: bool,
     symbol: String,
+    /// The word being assembled, held until a gap so `cwlex` can rescore it
+    /// whole. Each character keeps the elements it came from.
+    word_buf: Vec<Sym>,
     text: String,
     /// Word scanner for pskreporter spots (`CQ ... CALL`, `DE CALL CALL`).
     scan: CallScanner,
@@ -378,6 +382,7 @@ impl CwDecoder {
             warmup: Vec::new(),
             warming: true,
             symbol: String::new(),
+            word_buf: Vec::new(),
             text: String::new(),
             scan: CallScanner::new(),
             idle: 0.0,
@@ -466,12 +471,37 @@ impl CwDecoder {
             if is_dit && self.quality < 0.40 {
                 return;
             }
+            self.word_buf.push(Sym { ch: c, elems: sym });
+        } else {
+            // An unmatched pattern still carries evidence: keep the elements
+            // so the rescorer can measure against them even though no letter
+            // can be named.
+            self.word_buf.push(Sym { ch: '*', elems: sym });
+            self.quality *= 0.85;
+        }
+    }
+
+    /// Emit the buffered word, rescored against ham CW's vocabulary.
+    ///
+    /// Called wherever a word boundary is recognised, before the space is
+    /// written, so the transcript stays in order.
+    fn flush_word(&mut self) {
+        if self.word_buf.is_empty() {
+            return;
+        }
+        let w = std::mem::take(&mut self.word_buf);
+        let decoded: String = w.iter().map(|s| s.ch).collect();
+        let word = match cwlex::rescore_word(&w) {
+            Some(fixed) => fixed.to_string(),
+            None => decoded,
+        };
+        let word = match cwlex::split_prefix(&word) {
+            Some((head, rest)) => format!("{head} {rest}"),
+            None => word,
+        };
+        for c in word.chars() {
             self.text.push(c);
             self.scan.push(c);
-        } else {
-            self.text.push('*');
-            self.scan.push('*');
-            self.quality *= 0.85;
         }
     }
 
@@ -738,6 +768,7 @@ impl CwDecoder {
             // the live capture (`CVA PT6T` came out `CVAPT6T`). Five is the
             // midpoint and measures a shade better than 5.5 as well.
             if len >= 5.0 * self.dit {
+                self.flush_word();
                 self.scan.push(' ');
                 if !self.text.ends_with(' ') && !self.text.is_empty() {
                     self.text.push(' ');
@@ -1012,6 +1043,7 @@ impl CwDecoder {
                     self.push_symbol();
                 }
                 if (self.idle - 6.0 * self.dit) <= 1.0 {
+                    self.flush_word();
                     self.scan.push(' ');
                     if !self.text.ends_with(' ') && !self.text.is_empty() {
                         self.text.push(' ');
@@ -1367,8 +1399,12 @@ fn score_cw(buf: &[Complex32], fs: f32, hz: f32) -> Option<(f32, f32)> {
     Some((quality, snr))
 }
 
-fn morse_lookup(sym: &str) -> Option<char> {
-    const TABLE: &[(&str, char)] = &[
+/// The Morse alphabet, read in both directions.
+///
+/// `morse_lookup` decodes; `morse_elements` re-encodes, which is what lets
+/// `cwlex` measure how far a mis-copied word is from a real one in the space
+/// the errors actually happen in — elements — rather than in characters.
+pub(crate) const MORSE: &[(&str, char)] = &[
         (".-", 'A'),
         ("-...", 'B'),
         ("-.-.", 'C'),
@@ -1423,6 +1459,14 @@ fn morse_lookup(sym: &str) -> Option<char> {
         (".-..-.", '"'),
         ("...-..-", '$'),
         (".--.-.", '@'),
-    ];
-    TABLE.iter().find(|(s, _)| *s == sym).map(|(_, c)| *c)
+];
+
+fn morse_lookup(sym: &str) -> Option<char> {
+    MORSE.iter().find(|(s, _)| *s == sym).map(|(_, c)| *c)
+}
+
+/// The element pattern for a character, or `None` if it has no Morse form.
+pub(crate) fn morse_elements(c: char) -> Option<&'static str> {
+    let c = c.to_ascii_uppercase();
+    MORSE.iter().find(|(_, t)| *t == c).map(|(s, _)| *s)
 }

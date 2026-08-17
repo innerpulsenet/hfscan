@@ -3136,3 +3136,4 @@ fn bench_cw_fading() {
         println!();
     }
 }
+

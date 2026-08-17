@@ -1,6 +1,7 @@
 # CW plan, round 3 — the band, not the bench
 
-**Status:** Stage 0 is on `main` and is the shipping decoder. Stage 1 was
+**Status:** Stage 0 plus Stage 3 lexicon rescoring (§9) is on `main` and is the
+shipping decoder. Stage 1 was
 attempted five ways and rejected. **Stage 2 (the HSMM in §5) was built, measured
 against every instrument, and reverted on 2026-08-16.** It never met §6, and the
 throughput cost was not survivable: 73.5× realtime and 1.36 % CPU became 3.0×
@@ -71,16 +72,16 @@ machine that recorded it before trusting any real-band number.
 
 ### The three instruments
 
-Stage 0 is what is in the tree. The Stage 2 columns are historical, kept so a
-future attempt can tell immediately whether it is beating the HSMM or repeating
-it.
+Stage 0 plus Stage 3 is what is in the tree. The Stage 2 columns are
+historical, kept so a future attempt can tell immediately whether it is beating
+the HSMM or repeating it.
 
-| Instrument | What it measures | **Stage 0 (in tree)** | Stage 2 | Stage 2 + EM |
-|---|---|---|---|---|
-| `bench_cw_score` (41 cells) | flat carrier, AWGN — the laboratory | **90.22 %** | **84.58 %** | **84.72 %** |
-| `bench_cw_band` (16 cells) | Watterson channel, QRM, static — the band | **43.54 %** | **41.84 %** | **49.27 %** |
-| `tests/cw_capture.rs` | token recall on the real 20m recording | **81.9 %** | **77.5 %** | **91.2 %** |
-| `bench_replay` end-to-end | realtime multiple, 16 channels | **71.67×** | **2.56×** | **3.04×** |
+| Instrument | What it measures | Stage 0 | Stage 2 | Stage 2 + EM | **In tree (0+3)** |
+|---|---|---|---|---|---|
+| `bench_cw_score` (41 cells) | flat carrier, AWGN — the laboratory | 90.22 % | 84.58 % | 84.72 % | **90.57 %** |
+| `bench_cw_band` (16 cells) | Watterson channel, QRM, static — the band | 43.54 % | 41.84 % | 49.27 % | **44.03 %** |
+| `tests/cw_capture.rs` | token recall on the real 20m recording | 81.9 % | 77.5 % | 91.2 % | **88.1 %** |
+| `bench_replay` end-to-end | realtime multiple, 16 channels | 71.67× | 2.56× | 3.04× | **73.8×** |
 
 Every figure in that table is a re-measurement, taken in one sitting on one
 machine with the capture present. Where it disagrees with a number quoted
@@ -777,14 +778,7 @@ one above from the first commit.
 
 ## 8. Later stages
 
-**Stage 3 — lexicon rescoring.** Once the HSMM emits soft character hypotheses,
-rescore against ham CW's very small language: CQ, DE, TEST, 599/5NN, TU, 73,
-QTH, and callsigns with real prefix-digit-suffix structure. `"CE TEST T EWH I
-ZW B"` becomes `"CQ TEST DE ZW5B"` because the alternative is not a word. This
-is the largest remaining real-world gain after Stage 2 and it is also where
-fldigi's SOM matcher becomes worth revisiting — neutral on its own because it
-turns `*` into a confident wrong guess, useful once a lexicon can adjudicate
-between candidates instead of the matcher having to commit.
+**Stage 3 — lexicon rescoring. Done — see §9.**
 
 **Stage 4 — decode every tone.** Two to four stations sit in every 400 Hz
 passband and the decoder picks one and discards the rest.
@@ -793,3 +787,77 @@ passband and the decoder picks one and discards the rest.
 amplitudes and PSK31 has none at all. Both should move onto
 `decoders::channel`, and both are probably hiding the same class of problem
 this round found in CW.
+
+---
+
+## 9. Stage 3 — lexicon rescoring (done)
+
+`src/decoders/cwlex.rs`, on top of the Stage 0 slicer. The plan assumed this
+would sit on the HSMM's soft character hypotheses; the HSMM is gone, and it
+turns out not to matter — the elements each character was decoded from are
+enough, and Stage 0 has them.
+
+| Instrument | Stage 0 | Stage 3 |
+|---|---:|---:|
+| `bench_cw_score` | 90.22% | **90.57%** |
+| `bench_cw_band` | 43.54% | **44.03%** |
+| `cw_capture` recall | 81.9% | **88.1%** |
+| `cargo test --release` | 134 / 0 | **143 / 0** |
+| `bench_replay` end-to-end | 73.5× | 73.8×, every row PASS |
+
+Everything up, nothing down, and free: it is string work on already-decoded
+characters, so the replay figures are unchanged inside noise.
+
+**Be honest about the capture number.** The +6.2 is one token. Only 14028.01
+moved, 2/4 → 3/4, when `CG CVA PT6T` became `CQ CVA PT6T`. With four stations
+and 39 tokens the metric is coarse, and a single recovery is worth six points.
+The flat and band gains are small but broad, and those are the trustworthy
+half of the result.
+
+### 9.1 Distance is measured in elements, not characters
+
+`C` and `G` are unrelated letters and neighbouring Morse patterns — `-.-.`
+against `--.` — so a character-level edit distance cannot see that `CG` is a
+near miss for `CQ` while `CX` is not. Everything works on the element string
+with `/` between characters, and `/` is edited like any other symbol, so two
+letters run together by a mis-heard gap cost exactly one deletion, which is
+what they physically are.
+
+### 9.2 Two lists, and why
+
+The design mistake worth not repeating: a single lexicon, used both to
+recognise real words and as the set of corrections to make. Measured, that
+rewrote `NEWINGTON CT` into `NEWINGTON BT` — `CT` is one element from the
+procedural `BT` — and `THE QSO` into `TEST QSO`. Seven cells of
+`bench_cw_score` fell from a clean 100 % to 96.4 %, on *correctly decoded*
+copy. The whole flat and band gain above is the difference between one list
+and two.
+
+So `LEXICON` is broad and only answers "already a real word, leave it alone",
+while `CORRECT_TO` is small and is the only thing a decode may be rewritten
+into. A token earns a place in the second list by carrying meaning — `CQ` and
+`DE` gate `CallScanner` and therefore the spots — and by not sitting one
+element from an ordinary word. The filler signals (`BT`, `AS`, `NW`) fail the
+second test and are recognised but never corrected toward.
+
+Three further rules keep it from inventing: a word already shaped like a
+callsign is never rewritten, since spots are the product; the runner-up
+candidate must be strictly worse, so `CX` at distance 1 from both `CQ` and
+`TNX` is left alone; and the element budget is one for anything short, because
+two is enough to turn `THE` into `TEST`.
+
+### 9.3 What it does not do
+
+No context. `CQ` is corrected the same way wherever it appears, and the plan's
+worked example — `"CE TEST T EWH I ZW B"` → `"CQ TEST DE ZW5B"` — is only
+half reachable, because repairing `ZW B` into `ZW5B` means inventing a
+character inside a callsign. That is the line this module does not cross.
+
+The obvious next increment is positional: `DE` and `CQ` are followed by a
+callsign within a word or two, which is exactly the state machine
+`callscan.rs` already runs. Corrections supported by that context could afford
+a looser distance budget than the blind ones can, and it would let the
+`CORRECT_TO` list grow back without the false positives §9.2 describes. The
+`*`-into-a-guess idea from fldigi's SOM matcher becomes safe at the same
+point, and for the same reason.
+

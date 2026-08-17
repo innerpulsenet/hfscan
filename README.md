@@ -343,7 +343,10 @@ the other. The comparison survives that difference; the level does not.
 
 ### The decoders
 
-- **CW** — envelope detection with hysteresis and a peak/noise-floor tracker.
+- **CW** — envelope detection with hysteresis and a peak/noise-floor tracker,
+  then a lexicon pass that measures a mis-copied word against ham CW's own
+  vocabulary in Morse-element space, so `CG` becomes `CQ` where the evidence
+  is unambiguous and copy that was already right is left alone.
   Dit length is estimated from a short/long cluster of recent marks, so a
   station that speeds up or slows down is followed instead of being decoded
   as garbage — and the post-mix filter is then sized from that clock rather

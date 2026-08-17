@@ -381,6 +381,15 @@ struct Tone {
     /// heavy or light fist is classified by the operator's own weighting.
     dah: f32,
     marks: VecDeque<f32>,
+    /// Recent inter-element gaps, the other half of Morse's structure.
+    ///
+    /// Marks alone can look like Morse when they are not. A clock that has
+    /// collapsed onto noise produces marks that all sit near the collapsed
+    /// dit, and `morse_clock`'s consistency test reads that as a fist sending
+    /// one element length — which is a real thing an operator does, so it
+    /// passes. The gaps do not follow: Morse spaces its elements 1, 3 and 7
+    /// dits apart and noise does not, whatever the marks are doing.
+    gaps: VecDeque<f32>,
     /// Fast-adapt elements remaining after idle or a speed-change snap.
     acquire: u32,
     /// Elements held while the clock is still unknown, oldest first.
@@ -472,6 +481,7 @@ impl Tone {
             dit: 0.06 * env_rate, // start at 20 WPM
             dah: 0.18 * env_rate,
             marks: VecDeque::with_capacity(MARK_HIST + 1),
+            gaps: VecDeque::with_capacity(MARK_HIST + 1),
             acquire: 16,
             warmup: Vec::new(),
             warming: true,
@@ -613,13 +623,17 @@ impl Tone {
 
         if self.marks.len() >= 12 {
             let recent: Vec<f32> = self.marks.iter().copied().collect();
-            let gaps: Vec<f32> = Vec::new();
+            // The gaps were being passed empty, so this check has only ever
+            // asked whether the *marks* look like Morse. That is the half a
+            // collapsed clock can satisfy by accident.
+            let gaps: Vec<f32> = self.gaps.iter().copied().collect();
             if morse_clock(&recent, &gaps).is_none() {
                 if self.peak < SNR_DROP * self.floor.max(1e-9) || self.quality < 0.05 {
                     self.symbol.clear();
                     self.warmup.clear();
                     self.warming = true;
                     self.marks.clear();
+                    self.gaps.clear();
                 }
             }
         }
@@ -841,6 +855,14 @@ impl Tone {
                 self.warmup.push((len, false));
             }
             return;
+        }
+        // Word gaps and the silence between overs say nothing about keying
+        // structure, so only element and character gaps are kept.
+        if len < 5.0 * self.dit {
+            self.gaps.push_back(len);
+            if self.gaps.len() > MARK_HIST {
+                self.gaps.pop_front();
+            }
         }
         // Adaptive character boundary: 2.1 dits cleanly separates elements (1 dit) and characters (3 dits)
         if len >= 2.1 * self.dit {

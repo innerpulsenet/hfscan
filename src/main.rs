@@ -238,6 +238,17 @@ struct BgStation {
 }
 
 struct SignalRow {
+    /// The callsign this frequency has identified itself with, if any.
+    ///
+    /// Most of what a CW roster shows on a real band is a real station copied
+    /// badly — `bench_replay`'s strongest signal, 14.4 dB, transcribes as
+    /// `M E E E* E E E TDI*E/E H`. Those rows cannot be filtered out without
+    /// deleting real stations, and they cannot be told apart from noise by
+    /// any statistic of their text. What *can* be said with confidence is the
+    /// opposite: which rows have said something checkable. A callsign that
+    /// passed `CallScanner` and `is_callsign` is that, and it is the same
+    /// evidence the app is willing to send to pskreporter.
+    call: Option<String>,
     dial_hz: f64,
     kind: identify::Kind,
     mode: &'static str,
@@ -1352,6 +1363,7 @@ impl App {
             return i;
         }
         self.rows.push(SignalRow {
+            call: None,
             dial_hz,
             kind,
             mode,
@@ -1373,6 +1385,14 @@ impl App {
             .retain(|r| now.duration_since(r.last_copy) < ROW_RETIRE);
         self.rows.sort_by(|a, b| {
             match b.live(now).cmp(&a.live(now)) {
+                std::cmp::Ordering::Equal => {}
+                other => return other,
+            }
+            // Among live rows, the ones that have identified themselves come
+            // first. Nothing is hidden — most of the rest are real stations
+            // being copied badly rather than noise — but the copy worth
+            // reading should not have to be hunted for.
+            match b.call.is_some().cmp(&a.call.is_some()) {
                 std::cmp::Ordering::Equal => {}
                 other => return other,
             }
@@ -1610,6 +1630,32 @@ impl App {
         // copy arrives underneath them, instead of being dragged along.
         if self.msg_scroll > 0 && added > 0 {
             self.scroll_transcript(added as isize);
+        }
+        // A spot is the one thing a row can say that is checkable, so the
+        // roster remembers it. This is deliberately taken from the spot path
+        // rather than by scanning the copy: `CallScanner` requires a CQ or DE
+        // announcement around the call, which is what keeps a stray four
+        // characters of noise from labelling a row.
+        for (m, dial, _) in &spots {
+            if let Some(call) = m.text.strip_prefix("CQ ").map(str::to_string) {
+                let hz = dial + m.freq_hz as f64;
+                // Nearest, not first within range: two CW rows can sit 120 Hz
+                // apart, and taking the first put G4MLW's call on the row
+                // beside the one transcribing "CQ DE G4MLW G4MLW G4MLW".
+                let best = self
+                    .rows
+                    .iter_mut()
+                    .filter(|r| (r.dial_hz - hz).abs() < 200.0)
+                    .min_by(|a, b| {
+                        (a.dial_hz - hz)
+                            .abs()
+                            .partial_cmp(&(b.dial_hz - hz).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                if let Some(r) = best {
+                    r.call = Some(call);
+                }
+            }
         }
         spots.retain(|(m, dial, _)| self.spot_is_new(m, *dial));
         if let Some(r) = &self.reporter {
@@ -5427,7 +5473,7 @@ fn signal_rows_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     if app.rows.is_empty() {
         return vec![Line::from(Span::styled(
-            "  age    kHz  mode    sig  speed  copy — nothing heard yet",
+            "  age    kHz  mode    sig  speed  call      copy — nothing heard yet",
             dim,
         ))];
     }
@@ -5436,13 +5482,15 @@ fn signal_rows_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
     const HEAD: usize = 5 + 10 + 6;
     // signal (5) + gap, speed (5) + two gaps, dropped first on a narrow pane.
     let show_meta = width >= HEAD + 13 + 24;
-    let head = HEAD + if show_meta { 13 } else { 0 };
+    // callsign (8) + gap, dropped before the meta columns are.
+    let show_call = width >= HEAD + 13 + 9 + 24;
+    let head = HEAD + if show_meta { 13 } else { 0 } + if show_call { 9 } else { 0 };
     let copy_width = width.saturating_sub(head).max(8);
 
     let shown: Vec<&SignalRow> = app.rows.iter().filter(|r| r.worth_showing()).collect();
     if shown.is_empty() {
         return vec![Line::from(Span::styled(
-            "  age    kHz  mode    sig  speed  copy — nothing readable yet",
+            "  age    kHz  mode    sig  speed  call      copy — nothing readable yet",
             dim,
         ))];
     }
@@ -5480,6 +5528,21 @@ fn signal_rows_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
                     signal_style(&r.signal, live),
                 ));
                 spans.push(Span::styled(format!("{}  ", col(&r.speed, 5)), dim));
+            }
+            // The callsign column: filled only where the station announced
+            // itself in a form that passed the spotter. Blank is the common
+            // case and means "not yet identified", not "not a station".
+            if show_call {
+                spans.push(Span::styled(
+                    format!("{} ", col(r.call.as_deref().unwrap_or(""), 8)),
+                    if r.call.is_some() {
+                        Style::default()
+                            .fg(Color::LightGreen)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        dim
+                    },
+                ));
             }
 
             // The tail, so the newest copy is always on screen. A leading
@@ -6942,6 +7005,48 @@ mod tests {
         );
     }
 
+    /// A row that has identified itself is labelled and sorted to the top.
+    ///
+    /// Most of a CW roster on a real band is real stations copied badly — the
+    /// capture's strongest signal, at 14.4 dB, transcribes as
+    /// `M E E E* E E E TDI*E/E H` — so the rows cannot be filtered without
+    /// deleting stations. What can be done is say which ones have produced a
+    /// callsign, and put those where the eye lands.
+    #[test]
+    fn identified_rows_are_labelled_and_come_first() {
+        let mut app = App::new(14_060_000.0, 192_000.0, Mode::Auto);
+        row(&mut app, 14_030_000.0, identify::Kind::Cw, "E E EIE*HSEE ETT", 0);
+        row(&mut app, 14_020_000.0, identify::Kind::Cw, "CQ DE G4MLW G4MLW K", 0);
+        app.rows[1].call = Some("G4MLW".into());
+        app.sort_rows();
+        assert_eq!(
+            app.rows[0].call.as_deref(),
+            Some("G4MLW"),
+            "the identified row did not sort to the top"
+        );
+        let rect = ratatui::layout::Rect::new(0, 0, 110, 6);
+        let lines = super::signal_rows_lines(&app, rect);
+        let first: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            first.contains("G4MLW") && first.contains("14020.0"),
+            "the callsign column is missing from the identified row: {first:?}"
+        );
+        // The unidentified row is still there — it is a station, just not one
+        // that has said who it is yet.
+        let all: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            all.contains("14030.0"),
+            "an unidentified row was dropped from the pane:\n{all}"
+        );
+    }
+
     /// Every automatic slot is tuned relative to the radio centre, so a
     /// retune has to tear the fleet down rather than leave it pointing at
     /// frequencies that no longer exist.
@@ -8023,19 +8128,20 @@ mod tests {
             app.auto.len(),
             app.rows.len()
         );
-        println!("          kHz  mode   sig  speed  chars  copy");
+        println!("          kHz  mode   sig  speed  chars  call      copy");
         let shown = app.rows.iter().filter(|r| r.worth_showing()).count();
         println!("  rows shown: {shown} of {}", app.rows.len());
         for r in app.rows.iter().filter(|r| r.worth_showing()) {
-            let copy: String = r.copy.chars().take(56).collect();
+            let copy: String = r.copy.chars().take(48).collect();
             let n = r.copy.chars().filter(|c| !c.is_whitespace()).count();
             println!(
-                "  {:>11.3} {:<5} {:>4} {:>6} {:>4}  {:?}",
+                "  {:>11.3} {:<5} {:>4} {:>6} {:>4} {:<8}  {:?}",
                 r.dial_hz / 1000.0,
                 r.mode,
                 r.signal,
                 r.speed,
                 n,
+                r.call.clone().unwrap_or_default(),
                 copy.trim()
             );
         }
@@ -8340,6 +8446,7 @@ mod tests {
 
     fn row(app: &mut App, freq: f64, kind: identify::Kind, copy: &str, ago_secs: u64) {
         app.rows.push(super::SignalRow {
+            call: None,
             dial_hz: freq,
             kind,
             mode: kind.label(),

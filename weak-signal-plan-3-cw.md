@@ -873,9 +873,46 @@ and more stations, because the junk was consuming the budget.
 | one-element (E/T) share | 4–41 % | 28–62 % | rejected — no separation |
 | clock railed at the 5/50 WPM stop | — | — | rejected — no measurable effect; railed clocks wander a few WPM off the stop rather than sitting on it, and widening the test until it fires is fitting a constant to one capture |
 
-The medium-length in-band junk that remains does not separate on any content
-measure tried. It is the same frontier §7.10 describes: what is left needs a
-detector that is structurally better, not a threshold.
+**The medium-length in-band rows are not junk.** This was chased properly and
+the answer inverts the question. `bench_replay` tests eight candidate CW
+frequencies from this capture; `14038.09` is one of them at 8.1 dB, and it is
+the same signal as the row transcribing `2 *DREEE E S TM **IDXESD`. The two
+strongest signals in the whole recording, `14000.00` and `14000.09` at 13.5
+and 14.4 dB, come back as `MTE E E EUI E E TDI*E*E` with the clock railed at
+50 WPM. These are **real stations the decoder cannot copy**, not slots
+pointed at nothing, and filtering them would delete stations from the roster.
+
+That is why nothing separates them. Seven discriminators were measured
+against the capture, all defeated by the same fact — a real station fading
+produces the statistics of noise:
+
+| Discriminator | Real rows | Junk-looking rows | Verdict |
+|---|---|---|---|
+| unmatched-pattern (`*`) share | 0–6 % | 16–19 % | NK9G's own row reads 47 % |
+| one-element (E/T) share | 4–41 % | 28–62 % | no separation |
+| clock railed at a 5/50 WPM stop | — | — | no measurable effect; railed clocks wander off the stop |
+| lexicon coverage, per character | 27–60 % | 0–25 % | boundary 25/27, fails on a bad minute |
+| lexicon coverage, per Morse element | 0–75 % | 0–40 % | NK9G scored 0 % on a fading run |
+| distinct lexicon tokens / callsigns, sticky | 0–4 tok, 0–5 call | 2–3 tok, 1–3 call | no separation |
+| `morse_clock` structure-failure rate | 0–29 % | 15–51 % | overlaps |
+
+§1 of this document already said it: fourteen decibels of extra signal buys
+eight points, because the decoder is fade-limited. The roster is an honest
+picture of that. **There is no filtering fix here — the copy quality is the
+ceiling**, and the way past it is the work §7.10 describes, not a threshold.
+
+What could be done instead is to stop making the operator hunt. A row that
+has produced a callsign through `CallScanner` has said something checkable —
+it is the same evidence the app will send to pskreporter — so those rows are
+labelled with the call and sorted to the top of the live group. Nothing is
+hidden. On the capture six of eighteen rows carry a call.
+
+*Also found and left alone:* the ongoing structure check in `on_mark_end`
+passed `morse_clock` an empty gap list, so it has only ever asked whether the
+marks look like Morse — the half a collapsed clock satisfies by accident.
+Supplying the real gaps is correct and moves no measurement, because a
+structure failure is ignored unless the SNR or quality has already collapsed.
+Giving it teeth would need the separation the table above says is not there.
 
 **CPU, the budget §6 never set.** 1.0 ms per second of audio for four tones
 against 0.4 ms for one — 0.1 % of a core. `bench_cw_cpu` prints it and

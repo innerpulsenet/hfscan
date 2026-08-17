@@ -1532,7 +1532,7 @@ fn gen_band(
 /// bare sinusoidal fade; this grid puts a proper Watterson channel, real
 /// neighbours and static crashes behind it, and is the yardstick any redesign
 /// of the detector should be judged on.
-fn cw_band_score_grid() -> (Vec<(String, f32)>, f32) {
+fn cw_band_score_grid() -> (Vec<(String, f32)>, f32, Vec<(String, f32)>, f32) {
     const SEEDS: [u32; 4] = [0x1234_5678, 0x9e37_79b9, 0x0bad_f00d, 0x5eed_1234];
     const MSG: &str = "CQ CQ DE W1AW W1AW K UR RST 599 599 QTH NEWINGTON CT \
                        NAME JOE JOE HW CPY? BK TNX FER THE QSO 73 ES GL DE W1AW K";
@@ -1591,16 +1591,18 @@ fn cw_band_score_grid() -> (Vec<(String, f32)>, f32) {
     ];
 
     let mut cells: Vec<(String, f32)> = Vec::new();
+    let mut any_cells: Vec<(String, f32)> = Vec::new();
     for (name, others, cond, snr, crashes) in cases {
-        let acc = SEEDS
-            .iter()
-            .map(|&seed| {
-                let sig = gen_band(&wanted, others, cond, snr, crashes, seed);
-                accuracy(MSG, &decode_cw(&sig, 0.0))
-            })
-            .sum::<f32>()
-            / SEEDS.len() as f32;
-        cells.push((name, acc));
+        let (mut lock, mut any) = (0.0f32, 0.0f32);
+        for &seed in SEEDS.iter() {
+            let sig = gen_band(&wanted, others, cond, snr, crashes, seed);
+            let streams = decode_cw_all(&sig, 0.0);
+            lock += accuracy(MSG, &streams[0].1);
+            any += accuracy_any(MSG, &streams);
+        }
+        let n = SEEDS.len() as f32;
+        cells.push((name.clone(), lock / n));
+        any_cells.push((name, any / n));
     }
 
     // An occupied but wanted-station-free stretch: neighbours fading in and
@@ -1625,9 +1627,11 @@ fn cw_band_score_grid() -> (Vec<(String, f32)>, f32) {
         .sum::<f32>()
         / SEEDS.len() as f32;
     cells.push(("empty, qrm only".into(), empty));
+    any_cells.push(("empty, qrm only".into(), empty));
 
     let mean = cells.iter().map(|(_, a)| *a).sum::<f32>() / cells.len() as f32;
-    (cells, mean)
+    let any_mean = any_cells.iter().map(|(_, a)| *a).sum::<f32>() / any_cells.len() as f32;
+    (cells, mean, any_cells, any_mean)
 }
 
 /// The band grid as a gate, like `cw_score_does_not_regress` but for the
@@ -1647,7 +1651,7 @@ fn cw_band_score_grid() -> (Vec<(String, f32)>, f32) {
 /// limited by fading rather than by noise.
 #[test]
 fn cw_band_score_does_not_regress() {
-    let (cells, mean) = cw_band_score_grid();
+    let (cells, mean, _, _) = cw_band_score_grid();
     const FLOOR: f32 = 0.38;
     if mean < FLOOR {
         let mut worst: Vec<&(String, f32)> = cells.iter().collect();
@@ -1669,11 +1673,22 @@ fn cw_band_score_does_not_regress() {
 #[test]
 #[ignore]
 fn bench_cw_band() {
-    let (cells, mean) = cw_band_score_grid();
-    for (name, acc) in &cells {
-        println!("  {name:<24} {:>5.1}%", acc * 100.0);
+    let (cells, mean, any_cells, any_mean) = cw_band_score_grid();
+    println!("  {:<24} {:>8} {:>8}", "", "lock", "any");
+    for ((name, acc), (_, any)) in cells.iter().zip(any_cells.iter()) {
+        let flag = if any - acc > 0.02 { " <-" } else { "" };
+        println!(
+            "  {name:<24} {:>7.1}% {:>7.1}%{flag}",
+            acc * 100.0,
+            any * 100.0
+        );
     }
-    println!("\n  CW BAND SCORE {:.2}%  ({} cells)", mean * 100.0, cells.len());
+    println!(
+        "\n  CW BAND SCORE {:.2}%  (lock only)\n  THROUGHPUT    {:.2}%  (any stream, {} cells)",
+        mean * 100.0,
+        any_mean * 100.0,
+        cells.len()
+    );
 }
 
 // ------------------------------------------------- CW accuracy bench
@@ -1729,6 +1744,48 @@ fn decode_cw(sig: &[Complex32], tone: f32) -> String {
         out.push_str(&d.process(&audio));
     }
     out.trim().to_string()
+}
+
+/// Every stream the decoder produced: the primary first, then each
+/// background tone, keyed by its offset.
+///
+/// `decode_cw` returns only what the operator hears. That was the whole
+/// measurement before Stage 4, because it was also all the decoder produced.
+fn decode_cw_all(sig: &[Complex32], tone: f32) -> Vec<(f32, String)> {
+    let mut d = cw::CwDecoder::new(FS);
+    let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+    chain.set_offset(tone as f64 + d.offset_shift());
+    let mut audio = Vec::new();
+    let mut primary = String::new();
+    let mut bg: Vec<(f32, String)> = Vec::new();
+    for chunk in sig.chunks(4096) {
+        chain.process(chunk, &mut audio);
+        primary.push_str(&d.process(&audio));
+        for (hz, text) in d.take_background() {
+            // Tones drift by a few Hz as the search re-centres them, so bin
+            // by proximity rather than by exact offset.
+            match bg.iter_mut().find(|(h, _)| (*h - hz).abs() < 40.0) {
+                Some((_, t)) => t.push_str(&text),
+                None => bg.push((hz, text)),
+            }
+        }
+    }
+    let mut out = vec![(d.lock_hz(), primary.trim().to_string())];
+    out.extend(bg.into_iter().map(|(h, t)| (h, t.trim().to_string())));
+    out
+}
+
+/// Best copy of `sent` across every stream the decoder produced.
+///
+/// This is "throughput of copy": the question is whether the station was
+/// copied *at all*, not whether it happened to be the one the lock landed on.
+/// A decoder that hears four stations and transcribes the wrong one into the
+/// pane has still heard the other three.
+fn accuracy_any(sent: &str, streams: &[(f32, String)]) -> f32 {
+    streams
+        .iter()
+        .map(|(_, got)| accuracy(sent, got))
+        .fold(0.0f32, f32::max)
 }
 
 /// Same as `decode_cw` but reports what the decoder thought it was doing.
@@ -3445,6 +3502,201 @@ fn cw_spot_snr_is_calibrated() {
              ({:+.1} dB). It read +4 dB high when the bandwidth correction was \
              hardcoded against a filter that had since become adaptive.",
             best - want
+        );
+    }
+}
+
+
+// ------------------------------------------------------- Stage 4 CPU budget
+
+/// A busy stretch of band, long enough to see cost drift if there is any.
+fn busy_band(secs: f32, seed: u32) -> Vec<Complex32> {
+    let wanted = BandStation {
+        text: "CQ CQ DE W1AW W1AW K UR RST 599 QTH NEWINGTON CT NAME JOE BK",
+        wpm: 20.0,
+        offset_hz: 0.0,
+        level_db: 0.0,
+    };
+    let qrm = [
+        BandStation { text: "TEST DE G4XYZ 599 001 TU QRZ TEST G4XYZ K", wpm: 27.0, offset_hz: 160.0, level_db: 0.0 },
+        BandStation { text: "CQ CQ DE VK2ABC VK2ABC PSE K", wpm: 16.0, offset_hz: -230.0, level_db: 3.0 },
+        BandStation { text: "DE JA1XYZ UR 599 599 BK", wpm: 32.0, offset_hz: 90.0, level_db: -4.0 },
+    ];
+    let mut sig = gen_band(&wanted, &qrm[..], channel::CCIR_MODERATE, 12.0, 0.0, seed);
+    let want = (secs * FS as f32) as usize;
+    while sig.len() < want {
+        let more = sig.clone();
+        sig.extend_from_slice(&more);
+    }
+    sig.truncate(want);
+    sig
+}
+
+/// Cost per second of audio must not climb as the audio goes on.
+///
+/// This is §7.11 of the plan as a test. The Stage 2 lockup was not a constant
+/// factor — it was unbounded growth, because state was retained until a
+/// decode committed and so grew forever on exactly the signals where no
+/// decode ever did. Stage 4 multiplies the number of decoders, so if anything
+/// in a `Tone` accumulates, this is where it shows.
+///
+/// Growth is what is measured, not absolute speed, so the test says the same
+/// thing on a fast machine and a slow one.
+#[test]
+fn cw_cost_does_not_grow_on_a_busy_band() {
+    use std::time::Instant;
+    let sig = busy_band(24.0, 0x1234_5678);
+    let mut d = cw::CwDecoder::new(FS);
+    let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+    chain.set_offset(d.offset_shift());
+    let mut audio = Vec::new();
+    let per_sec = FS as usize;
+    let mut costs: Vec<f32> = Vec::new();
+    for block in sig.chunks(per_sec) {
+        let t0 = Instant::now();
+        for chunk in block.chunks(4096) {
+            chain.process(chunk, &mut audio);
+            d.process(&audio);
+            d.take_background();
+        }
+        costs.push(t0.elapsed().as_secs_f32() * 1000.0);
+    }
+    let n = costs.len();
+    let early: f32 = costs[1..n / 3].iter().sum::<f32>() / (n / 3 - 1) as f32;
+    let late: f32 = costs[2 * n / 3..].iter().sum::<f32>() / (n - 2 * n / 3) as f32;
+    assert!(
+        late <= early * 2.0 + 1.0,
+        "cost per second of audio grew from {early:.1} ms to {late:.1} ms across \
+         {n} s of a busy band — something in a Tone is accumulating"
+    );
+}
+
+/// What decoding every tone actually costs, against decoding one.
+#[test]
+#[ignore]
+fn bench_cw_cpu() {
+    use std::time::Instant;
+    let sig = busy_band(12.0, 0x1234_5678);
+    for (label, quiet) in [("busy band (4 stations)", false), ("one station", true)] {
+        let src = if quiet {
+            let only = BandStation { text: "CQ CQ DE W1AW W1AW K UR RST 599 QTH NEWINGTON CT NAME JOE BK", wpm: 20.0, offset_hz: 0.0, level_db: 0.0 };
+            let mut s = gen_band(&only, &[][..], channel::CCIR_MODERATE, 12.0, 0.0, 0x1234_5678);
+            s.truncate(sig.len().min(s.len()));
+            s
+        } else {
+            sig.clone()
+        };
+        let mut d = cw::CwDecoder::new(FS);
+        let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+        chain.set_offset(d.offset_shift());
+        let mut audio = Vec::new();
+        let t0 = Instant::now();
+        for chunk in src.chunks(4096) {
+            chain.process(chunk, &mut audio);
+            d.process(&audio);
+            d.take_background();
+        }
+        let el = t0.elapsed().as_secs_f32();
+        let audio_s = src.len() as f32 / FS as f32;
+        println!(
+            "  {label:<24} {:>6.1} ms/s of audio  ({:.2}% of one core)",
+            el / audio_s * 1000.0,
+            el / audio_s * 100.0
+        );
+    }
+}
+
+// ------------------------------------------------ Stage 4: every tone heard
+
+/// Two stations calling in one passband must both reach the map.
+///
+/// This is what Stage 4 is for. Two to four stations sit in every 400 Hz
+/// passband; the decoder used to lock the best-scoring one and discard the
+/// rest, so the second station here was never decoded at all — not copied
+/// badly, not copied late, simply never looked at. The lock still picks one
+/// station for the pane, but the spot path now hears both.
+#[test]
+fn cw_spots_a_second_station_behind_the_lock() {
+    // A CQ call repeats, which is what gives a decoder that has just spawned
+    // a tone on the second station something to lock onto. A single unrepeated
+    // call would test the search's reaction time, not whether the station is
+    // heard at all.
+    const CALL_A: &str = "CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K";
+    const CALL_B: &str = "CQ CQ DE G4XYZ G4XYZ K CQ CQ DE G4XYZ G4XYZ K CQ CQ DE G4XYZ G4XYZ K";
+    let a = gen_cw_at(CALL_A, 20.0, 0.0, CW_TONE);
+    // Both inside the +/-180 Hz search window, and further apart than
+    // TONE_SEP_HZ so they are two stations rather than one seen twice.
+    let b = gen_cw_at(CALL_B, 27.0, 0.0, CW_TONE + 120.0);
+    let mut sig = a.clone();
+    let mut rng = 0x1234_5678u32;
+    let n = scale_for_snr(20.0);
+    for (i, s) in sig.iter_mut().enumerate() {
+        if let Some(v) = b.get(i) {
+            *s += v;
+        }
+        *s += Complex32::new(noise(&mut rng), noise(&mut rng)) * n;
+    }
+
+    let mut d = cw::CwDecoder::new(FS);
+    let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+    chain.set_offset(d.offset_shift());
+    let mut audio = Vec::new();
+    let mut msgs: Vec<FtMessage> = Vec::new();
+    for chunk in sig.chunks(4096) {
+        chain.process(chunk, &mut audio);
+        d.process(&audio);
+        msgs.extend(d.take_messages());
+    }
+    let calls: Vec<&str> = msgs.iter().map(|m| m.text.as_str()).collect();
+    for want in ["CQ W1AW", "CQ G4XYZ"] {
+        assert!(
+            calls.contains(&want),
+            "{want:?} was not spotted from a two-station passband, got {calls:?}"
+        );
+    }
+    // Each spot has to carry its own frequency, or the map puts both stations
+    // on top of each other and the second one is worse than useless.
+    let hz: Vec<f32> = ["CQ W1AW", "CQ G4XYZ"]
+        .iter()
+        .map(|w| msgs.iter().find(|m| m.text == *w).unwrap().freq_hz)
+        .collect();
+    assert!(
+        (hz[0] - hz[1]).abs() > 60.0,
+        "both spots claim the same frequency: {hz:?}"
+    );
+}
+
+/// The budget is a cap, not a suggestion.
+#[test]
+fn cw_tone_count_stays_within_budget() {
+    // Eight stations across the passband; only MAX_TONES may ever run.
+    let mut sig: Vec<Complex32> = Vec::new();
+    for k in 0..8 {
+        let off = -175.0 + 50.0 * k as f32;
+        let s = gen_cw_at("CQ DE W1AW K", 20.0 + k as f32, 0.0, CW_TONE + off);
+        if sig.is_empty() {
+            sig = s;
+        } else {
+            for (i, v) in s.iter().enumerate() {
+                if let Some(d) = sig.get_mut(i) {
+                    *d += v;
+                }
+            }
+        }
+    }
+    let mut d = cw::CwDecoder::new(FS);
+    let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+    chain.set_offset(d.offset_shift());
+    let mut audio = Vec::new();
+    for chunk in sig.chunks(4096) {
+        chain.process(chunk, &mut audio);
+        d.process(&audio);
+        d.take_background();
+        assert!(
+            d.tone_count() <= cw::MAX_TONES,
+            "{} tones running against a cap of {}",
+            d.tone_count(),
+            cw::MAX_TONES
         );
     }
 }

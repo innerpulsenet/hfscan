@@ -162,6 +162,38 @@ const OFF_SPAN_K: f32 = 0.30;
 /// None of the three has been swept. They are a plausible ladder that
 /// measures no worse than the alternatives tried, not a measured optimum —
 /// if they are ever tuned, tune them against `bench_cw_band`, together.
+/// How many stations in the passband are decoded at once.
+///
+/// The passband holds two to four, and the decoder used to take one. Each
+/// extra tone costs a full mixer, a four-pole filter, an envelope detector
+/// and a slicer over every audio sample — the per-sample chain is the whole
+/// cost, since the FFT search is shared and runs once for all of them.
+///
+/// This is the CPU budget §6 of the plan never set, and the omission it calls
+/// "the one that allowed all of this". It is a hard cap rather than a target:
+/// `cw_cost_scales_with_tones` measures the real ratio.
+pub const MAX_TONES: usize = 4;
+/// Characters of background copy held per tone before the oldest are
+/// dropped. Roughly two overs' worth; the primary's copy is never capped
+/// because it is drained on every `process` call.
+const BG_TEXT_MAX: usize = 4096;
+/// Closest two tones may sit and still be worth running separately.
+///
+/// Not a resolution limit — the search resolves better than this — but a
+/// usefulness one. The post-mix filter is 60 to 150 Hz wide, so two tones
+/// closer than its narrowest setting are listening to the same keying and
+/// would produce the same copy twice, once well and once badly. Measured
+/// directly: at 40 Hz a station at +50 Hz got both the primary and a
+/// background tone, and both transcribed it.
+const TONE_SEP_HZ: f32 = 60.0;
+/// Searches a tone may go unfound before it is retired.
+///
+/// The search runs every `FFT_SIZE * 4` samples once locked, so at 8 kHz this
+/// is about eight seconds of grace — long enough to ride out a QSB null on a
+/// station that is still there, short enough that a station which has stopped
+/// sending frees its slot within an over.
+const TONE_MISSES: u32 = 4;
+
 const SNR_ARM: f32 = 2.8;
 const SNR_HOLD: f32 = 1.8;
 const SNR_DROP: f32 = 1.5;
@@ -315,7 +347,18 @@ pub struct CwHit {
     pub quality: f32,
 }
 
-pub struct CwDecoder {
+/// One station's worth of decode: a mixer onto its tone, the filter and
+/// envelope behind it, the slicer, the clock and the text it has produced.
+///
+/// This is everything that used to be `CwDecoder`'s body. It is a separate
+/// struct because a 400 Hz passband holds two to four stations and the
+/// decoder used to pick one and discard the rest — `CwDecoder` now runs one
+/// of these per tone the search finds.
+struct Tone {
+    /// Stable identity. The primary is tracked by this rather than by its
+    /// offset, because offsets move every search and float equality on a
+    /// tracked frequency is not an identity.
+    id: u32,
     fs: f32,
     env_rate: f32,
     smooth: OnePole,
@@ -368,8 +411,6 @@ pub struct CwDecoder {
     have_env: bool,
     /// Envelope samples still to discard while the filters fill.
     settle: u32,
-    /// Searches to skip after a manual nudge so AFC does not fight the user.
-    hold_tune: u32,
 
     mix_hz: f32,
     /// Mixer that brings the locked tone to DC. A rotator rather than a
@@ -381,8 +422,22 @@ pub struct CwDecoder {
     post: NarrowLpf,
     /// Corner currently programmed into `post`.
     post_hz: f32,
+    /// Searches since this tone was last seen by the search. A tone that
+    /// stops being found is retired, which is what bounds the work.
+    missed: u32,
+}
+
+pub struct CwDecoder {
+    fs: f32,
+    /// One decoder per tone the search is currently holding, newest last.
+    /// `primary` indexes the one the user is listening to.
+    tones: Vec<Tone>,
+    primary_id: u32,
+    next_id: u32,
     locked: bool,
     lock_score: f32,
+    /// Searches to skip after a manual nudge so AFC does not fight the user.
+    hold_tune: u32,
     hits: Vec<CwHit>,
     search_buf: Vec<Complex32>,
     since_search: usize,
@@ -391,16 +446,11 @@ pub struct CwDecoder {
     window: Vec<f32>,
 }
 
-impl CwDecoder {
-    pub fn new(fs: f64) -> Self {
-        let fs = fs as f32;
+impl Tone {
+    fn new(id: u32, fs: f32, offset_hz: f32) -> Self {
         let env_rate = fs / ENV_DECIM as f32;
-        let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(FFT_SIZE);
-        let window: Vec<f32> = (0..FFT_SIZE)
-            .map(|i| 0.5 - 0.5 * (2.0 * PI * i as f32 / FFT_SIZE as f32).cos())
-            .collect();
         Self {
+            id,
             fs,
             env_rate,
             smooth: OnePole::new(0.003 * fs),
@@ -441,22 +491,14 @@ impl CwDecoder {
             have_mixed: false,
             have_env: false,
             settle: SETTLE_MS,
-            hold_tune: 0,
-            mix_hz: 0.0,
+            mix_hz: offset_hz,
             mix_rot: Rotator::new(0.0),
             mix_rate_hz: 0.0,
-            locked: false,
-            lock_score: 0.0,
-            hits: Vec::new(),
-            search_buf: Vec::with_capacity(FFT_SIZE * 2),
-            since_search: 0,
-            fft,
-            fft_buf: vec![Complex32::new(0.0, 0.0); FFT_SIZE],
-            window,
+            missed: 0,
         }
     }
 
-    pub fn wpm(&self) -> f32 {
+    fn wpm(&self) -> f32 {
         let dit_ms = self.dit / self.env_rate * 1000.0;
         if dit_ms > 1.0 { 1200.0 / dit_ms } else { 0.0 }
     }
@@ -819,6 +861,151 @@ impl CwDecoder {
         }
     }
 
+    /// Mix, filter, detect and slice one audio sample for this tone.
+    fn feed(&mut self, raw: Complex32) {
+        let mixed = self.mix(raw);
+        let s = self.post.process(mixed);
+        if self.have_mixed && s.norm() > 1e-9 && self.prev_mixed.norm() > 1e-9 {
+            let d = s * self.prev_mixed.conj();
+            let inst = d.arg() * self.fs / (2.0 * PI);
+            if self.key_down {
+                self.tune_err = 0.92 * self.tune_err + 0.08 * inst.clamp(-80.0, 80.0);
+            }
+        }
+        self.prev_mixed = s;
+        self.have_mixed = true;
+
+        let raw_env = self.smooth.process(s.norm());
+        self.decim_ctr += 1;
+        if self.decim_ctr < ENV_DECIM {
+            return;
+        }
+        self.decim_ctr = 0;
+
+        if self.settle > 0 {
+            self.settle -= 1;
+            return;
+        }
+
+        let matched_n = (0.35 * self.dit)
+            .round()
+            .clamp(4.0, self.env_rate * DIT_MAX_S) as usize;
+        self.matched.push_back(raw_env);
+        self.matched_sum += raw_env;
+        while self.matched.len() > matched_n {
+            self.matched_sum -= self.matched.pop_front().unwrap_or(0.0);
+        }
+        if self.matched_sum < 0.0 {
+            self.matched_sum = self.matched.iter().sum();
+        }
+        let env = self.matched_sum / self.matched.len().max(1) as f32;
+        self.step_envelope(env);
+    }
+
+    /// Move this tone onto a new offset, resetting only what the move
+    /// invalidates. The clock is kept — it is the same operator.
+    fn retune(&mut self, hz: f32) {
+        if (hz - self.mix_hz).abs() > 12.0 {
+            self.mix_rot.reset_phase();
+            self.post.reset();
+        }
+        self.mix_hz = hz;
+    }
+}
+
+impl CwDecoder {
+    pub fn new(fs: f64) -> Self {
+        let fs = fs as f32;
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(FFT_SIZE);
+        let window: Vec<f32> = (0..FFT_SIZE)
+            .map(|i| 0.5 - 0.5 * (2.0 * PI * i as f32 / FFT_SIZE as f32).cos())
+            .collect();
+        Self {
+            fs,
+            // One tone at DC until the search says otherwise, so a decoder
+            // handed audio it never searches behaves as it always did.
+            tones: vec![Tone::new(0, fs, 0.0)],
+            primary_id: 0,
+            next_id: 1,
+            locked: false,
+            lock_score: 0.0,
+            hold_tune: 0,
+            hits: Vec::new(),
+            search_buf: Vec::with_capacity(FFT_SIZE * 2),
+            since_search: 0,
+            fft,
+            fft_buf: vec![Complex32::new(0.0, 0.0); FFT_SIZE],
+            window,
+        }
+    }
+
+    pub fn wpm(&self) -> f32 {
+        self.cur().wpm()
+    }
+
+    /// Index of the tone the user is listening to. `sync_tones` guarantees
+    /// the primary is never retired, so the fallback is unreachable in
+    /// practice and exists only so this cannot panic.
+    fn primary(&self) -> usize {
+        self.tones
+            .iter()
+            .position(|t| t.id == self.primary_id)
+            .unwrap_or(0)
+    }
+
+    /// The tone the user is listening to. Always present.
+    fn cur(&self) -> &Tone {
+        &self.tones[self.primary()]
+    }
+
+    fn cur_mut(&mut self) -> &mut Tone {
+        let i = self.primary();
+        &mut self.tones[i]
+    }
+
+    /// How many tones are currently running. Never exceeds `MAX_TONES`.
+    // Background copy reaches the app through `take_messages` as spots, which
+    // is where the value is; these two expose the raw streams for anything
+    // that wants them. The TUI does not show background text yet — that is a
+    // question about panes and screen room, not about the decoder.
+    #[allow(dead_code)]
+    pub fn tone_count(&self) -> usize {
+        self.tones.len()
+    }
+
+    /// Copy from every tone except the one being listened to, drained.
+    ///
+    /// These are the stations Stage 4 exists to recover: they sit in the same
+    /// 400 Hz passband as the primary and used to be discarded unheard.
+    /// Returned as `(offset_hz, text)` so a caller can tell them apart.
+    #[allow(dead_code)]
+    pub fn take_background(&mut self) -> Vec<(f32, String)> {
+        let i = self.primary();
+        self.tones
+            .iter_mut()
+            .enumerate()
+            .filter(|(k, t)| *k != i && !t.text.is_empty())
+            .map(|(_, t)| (t.mix_hz, std::mem::take(&mut t.text)))
+            .collect()
+    }
+
+    /// Start a tone on `hz` if the budget allows and nothing is there yet.
+    fn spawn(&mut self, hz: f32) {
+        if self.tones.len() >= MAX_TONES
+            || self.tones.iter().any(|t| (t.mix_hz - hz).abs() < TONE_SEP_HZ)
+        {
+            return;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.tones.push(Tone::new(id, self.fs, hz));
+    }
+
+    fn mix_hz(&self) -> f32 {
+        self.cur().mix_hz
+    }
+
     fn search(&mut self) {
         if self.search_buf.len() < FFT_SIZE {
             return;
@@ -901,9 +1088,10 @@ impl CwDecoder {
                 None => self.hits.push(n),
             }
         }
+        let cur_hz = self.mix_hz();
         self.hits.sort_by(|a, b| {
-            let dist_a = (a.offset_hz - self.mix_hz).abs();
-            let dist_b = (b.offset_hz - self.mix_hz).abs();
+            let dist_a = (a.offset_hz - cur_hz).abs();
+            let dist_b = (b.offset_hz - cur_hz).abs();
             let rank_a = a.quality - (dist_a / 400.0).min(0.20);
             let rank_b = b.quality - (dist_b / 400.0).min(0.20);
             rank_b
@@ -916,30 +1104,126 @@ impl CwDecoder {
             self.hold_tune -= 1;
             return;
         }
-        if self.locked {
-            if let Some(h) = self
+
+        // The primary is decided first and alone, and only then are the
+        // other stations reconciled. Doing it the other way round lets a tone
+        // spawned this same search be adopted as the primary, handing the user
+        // a cold slicer that has missed the start of the transmission —
+        // measured as "NQ CQ DE ..." where the station sent "CQ CQ DE ...".
+        if self.locked
+            && let Some(h) = self
                 .hits
                 .iter()
-                .find(|h| (h.offset_hz - self.mix_hz).abs() < 35.0)
+                .find(|h| (h.offset_hz - cur_hz).abs() < 35.0)
                 .cloned()
-            {
-                self.mix_hz = 0.85 * self.mix_hz + 0.15 * h.offset_hz;
-                self.lock_score = h.score;
-                self.locked = true;
-                return;
-            }
+        {
+            let hz = 0.85 * cur_hz + 0.15 * h.offset_hz;
+            self.cur_mut().mix_hz = hz;
+            self.lock_score = h.score;
+            self.sync_tones();
+            return;
         }
         if let Some(h) = self.hits.first().cloned() {
-            if (h.offset_hz - self.mix_hz).abs() > 12.0 {
-                self.mix_rot.reset_phase();
-                self.post.reset();
+            // Once locked, prefer a tone already running on that station: it
+            // has a clock and a warm slicer, which is the point of keeping
+            // them alive. Before the first lock there is nothing to inherit
+            // and the primary simply takes the frequency, as it always did.
+            let adopt = self
+                .locked
+                .then(|| {
+                    self.tones
+                        .iter()
+                        .find(|t| (t.mix_hz - h.offset_hz).abs() < TONE_SEP_HZ)
+                        .map(|t| t.id)
+                })
+                .flatten();
+            match adopt {
+                Some(id) => self.primary_id = id,
+                None => self.cur_mut().retune(h.offset_hz),
             }
-            self.mix_hz = h.offset_hz;
             self.lock_score = h.score;
             self.locked = true;
         }
+        self.sync_tones();
     }
 
+    /// Match the running tones to what the search just found: retune the ones
+    /// that moved, start one for a hit nobody is on, retire the ones whose
+    /// station has gone.
+    ///
+    /// Retirement is what bounds the work, and it is deliberately not
+    /// conditional on the tone decoding anything — §7.11 of the plan is a
+    /// lockup caused by exactly that coupling, where state was retained until
+    /// a decode succeeded and so grew without bound on the signals where it
+    /// never did. A tone is retired when the *search* stops seeing it, which
+    /// is a judgement made outside the decoder it is judging.
+    fn sync_tones(&mut self) {
+        // A background tone the primary has since tuned onto is a duplicate:
+        // both would transcribe the same station.
+        let (primary_id, primary_hz) = (self.primary_id, self.mix_hz());
+        self.tones
+            .retain(|t| t.id == primary_id || (t.mix_hz - primary_hz).abs() >= TONE_SEP_HZ);
+        for t in self.tones.iter_mut() {
+            t.missed += 1;
+        }
+        let hits: Vec<(f32, usize)> = self
+            .hits
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (h.offset_hz, i))
+            .collect();
+        for (hz, rank) in hits {
+            match self
+                .tones
+                .iter()
+                .position(|t| (t.mix_hz - hz).abs() < TONE_SEP_HZ)
+            {
+                Some(i) => {
+                    self.tones[i].missed = 0;
+                    // The primary's offset is steered by `search` itself, so
+                    // leave it alone here — smoothing it in both places pulls
+                    // it twice per search and measurably degrades its copy.
+                    if self.tones[i].id != self.primary_id
+                        && (self.tones[i].mix_hz - hz).abs() > 3.0
+                    {
+                        self.tones[i].mix_hz = 0.85 * self.tones[i].mix_hz + 0.15 * hz;
+                    }
+                }
+                // Only the strongest `MAX_TONES` hits are ever worth a slot,
+                // so a weak hit cannot displace the budget on a busy band.
+                None if rank < MAX_TONES && self.tones.len() < MAX_TONES => {
+                    self.spawn(hz);
+                }
+                None => {}
+            }
+        }
+        // The primary is exempt from retirement: the user chose it, and a
+        // fade must not silently move them to another station.
+        self.tones
+            .retain(|t| t.missed <= TONE_MISSES || t.id == primary_id);
+        if self.tones.is_empty() {
+            self.tones.push(Tone::new(primary_id, self.fs, 0.0));
+        }
+    }
+
+    fn clear_lock_state(&mut self) {
+        self.locked = false;
+        self.lock_score = 0.0;
+        self.hits.clear();
+        self.search_buf.clear();
+        self.since_search = 0;
+        self.hold_tune = 0;
+        // Every tone goes, including the primary: `hop` means the operator has
+        // given up on this stretch of band, not that one station faded.
+        self.tones.clear();
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.tones.push(Tone::new(id, self.fs, 0.0));
+        self.primary_id = id;
+    }
+}
+
+impl Tone {
     /// SNR in a 2500 Hz reference bandwidth, for the spot report.
     ///
     /// `mark_env/space_env` is measured through the post-mix filter, so it is
@@ -972,19 +1256,19 @@ impl CwDecoder {
         (20.0 * ratio.log10() - 1.05 - to_2500 - 3.2).clamp(-24.0, 20.0)
     }
 
-    fn clear_lock_state(&mut self) {
+    /// Return this tone to the state a fresh one starts in, keeping only its
+    /// offset and its clock — the next station on the same frequency is
+    /// usually the same operator, or at least a similar speed.
+    fn reset_decode(&mut self) {
         self.scan.reset();
-        self.mix_hz = 0.0;
         self.mix_rot.reset_phase();
         self.post.reset();
-        self.locked = false;
-        self.lock_score = 0.0;
         self.post_hz = POST_MIX_HZ;
         self.post.set_corner(POST_MIX_HZ, self.fs);
-        self.hits.clear();
-        self.search_buf.clear();
-        self.since_search = 0;
         self.symbol.clear();
+        self.word_buf.clear();
+        self.marks.clear();
+        self.missed = 0;
         self.warmup.clear();
         self.warming = true;
         self.key_down = false;
@@ -1006,7 +1290,6 @@ impl CwDecoder {
         self.key_hist.clear();
         self.tune_err = 0.0;
         self.have_mixed = false;
-        self.hold_tune = 0;
         // Keep dit — the next station may be a similar speed.
     }
 
@@ -1146,7 +1429,7 @@ impl Decoder for CwDecoder {
     }
 
     fn lock_hz(&self) -> f32 {
-        self.mix_hz
+        self.mix_hz()
     }
 
     fn locked(&self) -> bool {
@@ -1175,7 +1458,7 @@ impl Decoder for CwDecoder {
                 .partial_cmp(&b.offset_hz)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let cur = self.mix_hz;
+        let cur = self.mix_hz();
         let pick = if forward {
             hs.iter()
                 .find(|h| h.offset_hz > cur + 35.0)
@@ -1187,13 +1470,20 @@ impl Decoder for CwDecoder {
                 .or_else(|| hs.last())
         };
         pick.cloned().map(|h| {
-            self.mix_hz = h.offset_hz;
+            // The station may already be running as a background tone, in
+            // which case hopping to it inherits a clock and a warm slicer
+            // rather than starting from nothing — the point of Stage 4.
+            match self.tones.iter().find(|t| (t.mix_hz - h.offset_hz).abs() < 40.0) {
+                Some(t) => self.primary_id = t.id,
+                None => {
+                    let t = self.cur_mut();
+                    t.retune(h.offset_hz);
+                    t.symbol.clear();
+                    t.acquire = 12;
+                }
+            }
             self.lock_score = h.score;
             self.locked = true;
-            self.mix_rot.reset_phase();
-            self.post.reset();
-            self.symbol.clear();
-            self.acquire = 12;
             h.offset_hz
         })
     }
@@ -1203,27 +1493,30 @@ impl Decoder for CwDecoder {
     }
 
     fn nudge_lock(&mut self, delta_hz: f32) -> Option<f32> {
-        self.mix_hz = (self.mix_hz + delta_hz).clamp(-SEARCH_HZ, SEARCH_HZ);
+        let hz = (self.mix_hz() + delta_hz).clamp(-SEARCH_HZ, SEARCH_HZ);
+        let t = self.cur_mut();
+        t.mix_hz = hz;
+        t.tune_err = 0.0;
         self.locked = true;
         self.hold_tune = 6;
-        self.tune_err = 0.0;
-        Some(self.mix_hz)
+        Some(hz)
     }
 
     fn cw_view(&self) -> Option<CwView> {
-        let span = (self.peak - self.floor).max(1e-9);
+        let t = self.cur();
+        let span = (t.peak - t.floor).max(1e-9);
         Some(CwView {
-            env: self.env_hist.iter().copied().collect(),
-            keyed: self.key_hist.iter().copied().collect(),
-            on_thr: ((self.on_thr - self.floor) / span).clamp(0.0, 1.0),
-            off_thr: ((self.off_thr - self.floor) / span).clamp(0.0, 1.0),
-            lock_hz: self.mix_hz,
-            tune_err_hz: self.tune_err,
-            wpm: self.wpm(),
-            quality: self.quality,
-            key_down: self.key_down,
-            symbol: self.symbol.clone(),
-            dit_ms: self.dit / self.env_rate * 1000.0,
+            env: t.env_hist.iter().copied().collect(),
+            keyed: t.key_hist.iter().copied().collect(),
+            on_thr: ((t.on_thr - t.floor) / span).clamp(0.0, 1.0),
+            off_thr: ((t.off_thr - t.floor) / span).clamp(0.0, 1.0),
+            lock_hz: t.mix_hz,
+            tune_err_hz: t.tune_err,
+            wpm: t.wpm(),
+            quality: t.quality,
+            key_down: t.key_down,
+            symbol: t.symbol.clone(),
+            dit_ms: t.dit / t.env_rate * 1000.0,
             locked: self.locked,
             hits: self.hits.clone(),
         })
@@ -1242,46 +1535,30 @@ impl Decoder for CwDecoder {
             self.search();
         }
 
+        // Every tone sees every sample. This is the whole cost of Stage 4:
+        // the search above is shared, but each station needs its own mixer,
+        // filter, envelope and slicer because each is keyed by a different
+        // operator at a different speed.
         for &raw in samples {
-            let mixed = self.mix(raw);
-            let s = self.post.process(mixed);
-            if self.have_mixed && s.norm() > 1e-9 && self.prev_mixed.norm() > 1e-9 {
-                let d = s * self.prev_mixed.conj();
-                let inst = d.arg() * self.fs / (2.0 * PI);
-                if self.key_down {
-                    self.tune_err = 0.92 * self.tune_err + 0.08 * inst.clamp(-80.0, 80.0);
-                }
+            for t in self.tones.iter_mut() {
+                t.feed(raw);
             }
-            self.prev_mixed = s;
-            self.have_mixed = true;
-
-            let raw_env = self.smooth.process(s.norm());
-            self.decim_ctr += 1;
-            if self.decim_ctr < ENV_DECIM {
-                continue;
-            }
-            self.decim_ctr = 0;
-
-            if self.settle > 0 {
-                self.settle -= 1;
-                continue;
-            }
-
-            let matched_n = (0.35 * self.dit)
-                .round()
-                .clamp(4.0, self.env_rate * DIT_MAX_S) as usize;
-            self.matched.push_back(raw_env);
-            self.matched_sum += raw_env;
-            while self.matched.len() > matched_n {
-                self.matched_sum -= self.matched.pop_front().unwrap_or(0.0);
-            }
-            if self.matched_sum < 0.0 {
-                self.matched_sum = self.matched.iter().sum();
-            }
-            let env = self.matched_sum / self.matched.len().max(1) as f32;
-            self.step_envelope(env);
         }
-        std::mem::take(&mut self.text)
+        // Only the primary's copy goes to the pane. The rest is not thrown
+        // away — `take_messages` spots it and `take_background` returns it —
+        // but interleaving four stations into one transcript is unreadable.
+        let i = self.primary();
+        for (k, t) in self.tones.iter_mut().enumerate() {
+            // Bounded whether or not anyone ever reads it. §7.11 of the plan
+            // is a lockup caused by state that grew until a decode succeeded;
+            // this buffer is capped on length alone, so a caller that never
+            // drains it costs a fixed amount rather than an increasing one.
+            if k != i && t.text.len() > BG_TEXT_MAX {
+                let cut = t.text.len() - BG_TEXT_MAX / 2;
+                t.text.drain(..cut);
+            }
+        }
+        std::mem::take(&mut self.tones[i].text)
     }
 
     fn status(&self) -> String {
@@ -1291,8 +1568,8 @@ impl Decoder for CwDecoder {
         } else {
             String::new()
         };
-        if self.locked && self.mix_hz.abs() > 1.0 {
-            format!("{wpm:.0} WPM lock {:+.0}Hz{extra}", self.mix_hz)
+        if self.locked && self.mix_hz().abs() > 1.0 {
+            format!("{wpm:.0} WPM lock {:+.0}Hz{extra}", self.mix_hz())
         } else {
             format!("{wpm:.0} WPM{extra}")
         }
@@ -1302,7 +1579,7 @@ impl Decoder for CwDecoder {
     /// is really noise through the slicer has random mark lengths, so they
     /// straddle the boundary and this collapses; well-sent CW sits near 1.
     fn confidence(&self) -> Option<f32> {
-        Some(self.quality.clamp(0.0, 1.0))
+        Some(self.cur().quality.clamp(0.0, 1.0))
     }
 
     fn speed(&self) -> Option<String> {
@@ -1313,26 +1590,34 @@ impl Decoder for CwDecoder {
     /// Stations that identified themselves since the last call. The scanner
     /// only recognises `CQ` and `DE` announcements, so an exchange in progress
     /// produces nothing — see `callscan` for why that is the right answer.
+    ///
+    /// Every tone is asked, not just the one being listened to. This is where
+    /// Stage 4 actually pays: a station calling CQ behind a louder neighbour
+    /// used to be discarded unheard, and now it reaches pskreporter with its
+    /// own offset and its own SNR.
     fn take_messages(&mut self) -> Vec<FtMessage> {
-        let (stamp, snr, hz) = (utc_hhmmss(), self.spot_snr(), self.mix_hz);
-        self.scan
-            .take_calls()
-            .into_iter()
-            .map(|call| FtMessage {
+        let stamp = utc_hhmmss();
+        let mut out = Vec::new();
+        for t in self.tones.iter_mut() {
+            let (snr, hz) = (t.spot_snr(), t.mix_hz);
+            out.extend(t.scan.take_calls().into_iter().map(|call| FtMessage {
                 stamp: stamp.clone(),
                 snr_db: snr,
                 dt_sec: 0.0,
                 freq_hz: hz,
                 text: format!("CQ {call}"),
-            })
-            .collect()
+            }));
+        }
+        out
     }
 
     fn reset(&mut self) {
-        self.text.clear();
-        self.marks.clear();
-        self.dit = 0.06 * self.env_rate;
-        self.dah = 0.18 * self.env_rate;
+        for t in self.tones.iter_mut() {
+            t.text.clear();
+            t.dit = 0.06 * t.env_rate;
+            t.dah = 0.18 * t.env_rate;
+            t.reset_decode();
+        }
         self.clear_lock_state();
     }
 }

@@ -621,7 +621,9 @@ slightly worse on the band.
 - **Band 49.27 → 60.** `chan flutter` (6.3%) and `the band` (15.1 / 14.4) are
   the three cells holding the mean down. Flutter is a fast-fading collapse; the
   band cells are the multi-station case Stage 4 is meant to address, and no
-  amount of single-tone work will fix them. Note the arithmetic: lifting all
+  amount of single-tone work will fix them. *(Stage 4 shipped — see §8. It
+  recovers the QRM cells on the throughput metric but leaves the lock-only
+  mean where it was, so the arithmetic below is unchanged.)* Note the arithmetic: lifting all
   three to 60 % only reaches a mean of 59. **Band ≥ 60 is probably not
   reachable without Stage 4**, and §6 was written before that was known.
 - **Flat 84.72 → 88.** Almost entirely the −3 dB row, which is 61 % of the
@@ -780,8 +782,51 @@ one above from the first commit.
 
 **Stage 3 — lexicon rescoring. Done — see §9.**
 
-**Stage 4 — decode every tone.** Two to four stations sit in every 400 Hz
-passband and the decoder picks one and discards the rest.
+**Stage 4 — decode every tone. Done.** `CwDecoder` now owns a `Vec<Tone>`,
+one per station the search finds, capped at `MAX_TONES = 4`. The search and
+its FFT stay shared; each tone gets its own mixer, post-mix filter, envelope,
+slicer, clock and `CallScanner`.
+
+The lock path is unchanged and measures unchanged — flat 90.57 %, band
+44.03 %, both identical to the commit before. That is the point: the operator
+hears the same station they always did. What is new is everything behind it.
+`bench_cw_band` now reports a second column, **throughput of copy** — was the
+wanted station copied in *any* stream, rather than in the one the lock landed
+on — and that is where the multi-station cells move:
+
+| cell | lock | any |
+|---|---|---|
+| `qrm x2 moderate` | 34.9 % | 45.7 % |
+| `qrm x3 moderate` | 26.1 % | 45.5 % |
+| `the band, 10dB` | 16.0 % | 25.0 % |
+| grid mean | 44.03 % | **46.90 %** |
+
+`qrm x3 moderate` recovering to within a point of the QRM-free `chan
+moderate` cell (46.2 %) is the result worth reading: three neighbours cost
+20 points of copy purely by capturing the lock, not by damaging the signal.
+`qrm x3 poor` and `the band, 4dB` barely move, because those are
+fading-limited rather than selection-limited — §7.8's arithmetic still holds
+and Stage 4 is not what gets the band mean to 60.
+
+**CPU, the budget §6 never set.** 1.0 ms per second of audio for four tones
+against 0.4 ms for one — 0.1 % of a core. `bench_cw_cpu` prints it and
+`cw_cost_does_not_grow_on_a_busy_band` measures *growth* rather than absolute
+speed, which is §7.11 as a regression test: tone retirement is driven by the
+search failing to find a station, never by that station's decode failing to
+progress, so the coupling that caused the lockup cannot form here.
+
+**Two things worth knowing if you touch this.** Acquisition is deliberately
+single-tone: the primary is chosen before `sync_tones` runs, because letting
+a tone spawned in the same search be adopted as the primary hands the user a
+cold slicer that has missed the start of the transmission — measured, it
+turned `CQ CQ DE ...` into `NQ CQ DE ...`. And `TONE_SEP_HZ` is 60, not the
+search's 40: the post-mix filter is 60–150 Hz wide, so two tones closer than
+that transcribe the same station twice, once well and once badly.
+
+**Not done: the TUI shows only the primary.** Background copy reaches
+pskreporter through `take_messages`, which is where the value is, and
+`take_background` exposes the raw streams. Putting a second station's text on
+screen is a question about panes and screen room, not about the decoder.
 
 **Not CW, but owed. Done.** Both are on `decoders::channel` now
 (`bench_rtty_fading`, `bench_psk31_fading`), and the guess above was half

@@ -36,6 +36,20 @@ pub struct CwView {
     pub dit_ms: f32,
     pub locked: bool,
     pub hits: Vec<cw::CwHit>,
+    /// Offsets that currently have a decoder of their own running, the lock
+    /// among them. A hit not in this list was found but is not being copied.
+    pub live: Vec<f32>,
+}
+
+/// Copy from a station other than the one under the lock.
+///
+/// The CW decoder runs one of these per tone in the passband; before Stage 4
+/// they were found and discarded. `quality` is that tone's own confidence,
+/// not the lock's, so a caller can hold each station to the same bar.
+pub struct BgCopy {
+    pub hz: f32,
+    pub quality: f32,
+    pub text: String,
 }
 
 /// Snapshot of the PSK31 decoder for the scope / tuner pane.
@@ -162,6 +176,17 @@ pub trait Decoder: Send {
     fn cw_view(&self) -> Option<CwView> {
         None
     }
+    /// Copy from stations in the passband other than the one under the lock,
+    /// drained. Only CW produces these; every other mode decodes one signal.
+    fn take_background(&mut self) -> Vec<BgCopy> {
+        Vec::new()
+    }
+    /// Confidence below which copy must not be surfaced or spotted.
+    ///
+    /// The trait's own `confidence` describes the locked signal, which is the
+    /// only one most decoders have. A decoder that copies several at once has
+    /// to apply the bar per station, and only it knows their confidences.
+    fn set_copy_floor(&mut self, _floor: f32) {}
     fn psk_view(&self) -> Option<PskView> {
         None
     }

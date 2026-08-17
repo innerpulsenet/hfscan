@@ -1761,12 +1761,12 @@ fn decode_cw_all(sig: &[Complex32], tone: f32) -> Vec<(f32, String)> {
     for chunk in sig.chunks(4096) {
         chain.process(chunk, &mut audio);
         primary.push_str(&d.process(&audio));
-        for (hz, text) in d.take_background() {
+        for b in d.take_background() {
             // Tones drift by a few Hz as the search re-centres them, so bin
             // by proximity rather than by exact offset.
-            match bg.iter_mut().find(|(h, _)| (*h - hz).abs() < 40.0) {
-                Some((_, t)) => t.push_str(&text),
-                None => bg.push((hz, text)),
+            match bg.iter_mut().find(|(h, _)| (*h - b.hz).abs() < 40.0) {
+                Some((_, t)) => t.push_str(&b.text),
+                None => bg.push((b.hz, b.text)),
             }
         }
     }
@@ -3699,4 +3699,74 @@ fn cw_tone_count_stays_within_budget() {
             cw::MAX_TONES
         );
     }
+}
+
+/// The copy floor is a bar each station clears on its own merits.
+///
+/// Before Stage 4 there was one signal, so gating on `confidence()` — the
+/// lock's — was the same thing as gating per station. With several running it
+/// is not: a clean station behind a poor lock would be suppressed, and a poor
+/// one would ride out on a good lock. A spot is a claim about one station.
+#[test]
+fn cw_copy_floor_applies_to_each_station_separately() {
+    let a = gen_cw_at(
+        "CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K",
+        20.0,
+        0.0,
+        CW_TONE,
+    );
+    let mut sig = a;
+    let mut rng = 0x1234_5678u32;
+    let n = scale_for_snr(20.0);
+    for s in sig.iter_mut() {
+        *s += Complex32::new(noise(&mut rng), noise(&mut rng)) * n;
+    }
+
+    // A floor no tone can clear must silence every stream, background too.
+    let mut d = cw::CwDecoder::new(FS);
+    d.set_copy_floor(1.01);
+    let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+    chain.set_offset(d.offset_shift());
+    let mut audio = Vec::new();
+    let mut msgs = 0usize;
+    let mut bg = 0usize;
+    for chunk in sig.chunks(4096) {
+        chain.process(chunk, &mut audio);
+        d.process(&audio);
+        msgs += d.take_messages().len();
+        bg += Decoder::take_background(&mut d).len();
+    }
+    assert_eq!(msgs, 0, "a floor above 1.0 still let spots through");
+    assert_eq!(bg, 0, "a floor above 1.0 still let background copy through");
+
+    // Held-back copy must be discarded as it goes, not queued: dropping the
+    // floor must not release a backlog of stale text in one burst.
+    let mut d = cw::CwDecoder::new(FS);
+    d.set_copy_floor(1.01);
+    let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+    chain.set_offset(d.offset_shift());
+    let mut audio = Vec::new();
+    let chunks: Vec<&[Complex32]> = sig.chunks(4096).collect();
+    for chunk in &chunks[..chunks.len() / 2] {
+        chain.process(chunk, &mut audio);
+        d.process(&audio);
+        Decoder::take_background(&mut d);
+    }
+    d.set_copy_floor(0.0);
+    let mut released = 0usize;
+    for chunk in &chunks[chunks.len() / 2..] {
+        chain.process(chunk, &mut audio);
+        d.process(&audio);
+        released += Decoder::take_background(&mut d)
+            .iter()
+            .map(|b| b.text.len())
+            .sum::<usize>();
+    }
+    // Whatever arrives after the floor drops is live copy, not the first half
+    // of the transmission arriving late.
+    assert!(
+        released < 200,
+        "{released} chars of background copy arrived at once after the floor \
+         dropped — held-back text is being queued rather than discarded"
+    );
 }

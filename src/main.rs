@@ -227,6 +227,14 @@ enum AutoView {
 /// slow CW station shows a few characters at a time and they scroll away.
 /// A held row instead accumulates into a buffer that stays put on screen, so
 /// the copy builds up in place and can be read as it arrives.
+/// One background CW station as the pane shows it: where it is, how well it
+/// is being copied, and a tail of what it has sent.
+struct BgStation {
+    hz: f32,
+    quality: f32,
+    text: String,
+}
+
 struct SignalRow {
     dial_hz: f64,
     kind: identify::Kind,
@@ -838,6 +846,9 @@ struct App {
     psk_hits: Vec<PskHit>,
     /// Confirmed CW tones in the current span (offsets from centre).
     cw_hits: Vec<CwHit>,
+    /// Copy from the other stations in the CW passband, newest last, one
+    /// entry per tone. Stage 4 decodes them; this is where they are read.
+    cw_bg: Vec<BgStation>,
     /// Occupied slices labelled CW / PSK / SSB / … from the last classify.
     idents: Vec<identify::Ident>,
     /// Held, fading spectrum labels. `idents` is the visible snapshot of these.
@@ -1058,6 +1069,7 @@ impl App {
             scout_iq: Vec::new(),
             psk_hits: Vec::new(),
             cw_hits: Vec::new(),
+            cw_bg: Vec::new(),
             idents: Vec::new(),
             tracks: Vec::new(),
             heard: Vec::new(),
@@ -1098,6 +1110,7 @@ impl App {
         self.act_scroll = 0;
         self.psk_hits.clear();
         self.cw_hits.clear();
+        self.cw_bg.clear();
         self.idents.clear();
         self.tracks.clear();
         self.scout_iq.clear();
@@ -1931,6 +1944,7 @@ impl App {
             let open = !self.squelch || !gated || self.cursor_snr >= self.squelch_db;
             let floor = self.copy_floor;
             if let Some(d) = &mut self.decoder {
+                d.set_copy_floor(floor);
                 let t = Instant::now();
                 let new = if open { d.process(out) } else { String::new() };
                 dec_ns = t.elapsed().as_nanos();
@@ -1952,6 +1966,38 @@ impl App {
                             .find(|i| self.text.is_char_boundary(*i))
                             .unwrap_or(self.text.len());
                         self.text = self.text[cut..].to_string();
+                    }
+                }
+                // Everything the other stations in the passband sent. Only CW
+                // produces these, and only when more than one station is up.
+                for b in d.take_background() {
+                    let clean = sanitize_text(&b.text);
+                    match self.cw_bg.iter_mut().find(|s| (s.hz - b.hz).abs() < 40.0) {
+                        Some(st) => {
+                            st.hz = b.hz;
+                            st.quality = b.quality;
+                            st.text.push_str(&clean);
+                        }
+                        None => self.cw_bg.push(BgStation {
+                            hz: b.hz,
+                            quality: b.quality,
+                            text: clean,
+                        }),
+                    }
+                }
+                // Drop stations whose tone the decoder has retired, and keep
+                // each tail short — this is a glance, not a transcript.
+                if let Some(v) = d.cw_view() {
+                    self.cw_bg
+                        .retain(|s| v.live.iter().any(|h| (h - s.hz).abs() < 40.0));
+                }
+                for st in self.cw_bg.iter_mut() {
+                    if st.text.len() > 400 {
+                        let cut = st.text.len() - 300;
+                        let cut = (cut..st.text.len())
+                            .find(|i| st.text.is_char_boundary(*i))
+                            .unwrap_or(st.text.len());
+                        st.text = st.text[cut..].to_string();
                     }
                 }
                 // A spot is someone else's map entry; the floor applies to it
@@ -5581,14 +5627,35 @@ fn draw_cw_envelope(f: &mut Frame, area: Rect, _app: &App, view: Option<&CwView>
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// The lock's copy, and under it whatever else the passband is saying.
+///
+/// The second section only exists when another station is actually being
+/// copied, so the ordinary one-station case looks exactly as it always did.
+/// It is deliberately a few lines rather than a full transcript: its job is
+/// to tell the operator that someone else is there and worth pressing `n`
+/// for, not to be read as prose.
 fn draw_cw_text(f: &mut Frame, area: Rect, app: &App) {
+    let bg: Vec<&BgStation> = app
+        .cw_bg
+        .iter()
+        .filter(|s| !s.text.trim().is_empty())
+        .collect();
+    // At most half the pane, and never so little of it that the lock's own
+    // copy is squeezed off the screen.
+    let bg_h = if bg.is_empty() || area.height < 10 {
+        0
+    } else {
+        ((bg.len() + 2) as u16).min(area.height / 2)
+    };
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(bg_h)]).split(area);
+
     let mut title = " copy ".to_string();
     if app.msg_scroll > 0 {
         title = format!(" copy (scrolled up {}) ", app.msg_scroll);
     }
     let block = Block::default().borders(Borders::ALL).title(title);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = block.inner(rows[0]);
+    f.render_widget(block, rows[0]);
     let body = transcript_lines(
         app,
         inner.width.max(1) as usize,
@@ -5596,6 +5663,54 @@ fn draw_cw_text(f: &mut Frame, area: Rect, app: &App) {
         false,
     );
     f.render_widget(Paragraph::new(body), inner);
+
+    if bg_h == 0 {
+        return;
+    }
+    draw_cw_background(f, rows[1], app, &bg);
+}
+
+/// The stations Stage 4 recovers: in the same passband, not under the lock.
+fn draw_cw_background(f: &mut Frame, area: Rect, app: &App, bg: &[&BgStation]) {
+    let title = format!(" also copying  {} ", bg.len());
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let rf = app.tuned_freq();
+    // Widest label the rows will use, so the copy columns line up.
+    let label_w = 12usize;
+    let mut rows: Vec<&&BgStation> = bg.iter().collect();
+    rows.sort_by(|a, b| a.hz.partial_cmp(&b.hz).unwrap_or(std::cmp::Ordering::Equal));
+    let lines: Vec<Line> = rows
+        .into_iter()
+        .take(inner.height as usize)
+        .map(|s| {
+            let khz = (rf + s.hz as f64) / 1000.0;
+            // Newest text is the interesting text: keep the tail that fits.
+            let room = (inner.width as usize).saturating_sub(label_w + 1);
+            let text = s.text.trim();
+            let tail: String = if text.chars().count() > room {
+                text.chars().skip(text.chars().count() - room).collect()
+            } else {
+                text.to_string()
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!("{khz:8.3}  "),
+                    Style::default().fg(if s.quality >= 0.5 {
+                        Color::LightCyan
+                    } else {
+                        Color::Cyan
+                    }),
+                ),
+                Span::styled(tail, Style::default().fg(Color::Gray)),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_cw_tuner(f: &mut Frame, area: Rect, app: &App, view: Option<&CwView>) {
@@ -5683,7 +5798,11 @@ fn draw_cw_tuner(f: &mut Frame, area: Rect, app: &App, view: Option<&CwView>) {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("tones", dim)));
             let passband = !v.hits.is_empty();
-            let mut listed: Vec<(f32, f32, bool)> = if passband {
+            // A hit is a station the search found; a *live* hit is one with
+            // a decoder of its own on it. Before Stage 4 those were the same
+            // list of one, and the difference is what is worth showing:
+            // everything marked here is being copied, not merely seen.
+            let mut listed: Vec<(f32, f32, bool, bool)> = if passband {
                 v.hits
                     .iter()
                     .map(|h| {
@@ -5691,28 +5810,35 @@ fn draw_cw_tuner(f: &mut Frame, area: Rect, app: &App, view: Option<&CwView>) {
                             h.offset_hz,
                             h.quality,
                             (h.offset_hz - v.lock_hz).abs() < 15.0,
+                            v.live.iter().any(|t| (t - h.offset_hz).abs() < 40.0),
                         )
                     })
                     .collect()
             } else {
                 app.cw_hits
                     .iter()
-                    .map(|h| (h.offset_hz, h.quality, false))
+                    .map(|h| (h.offset_hz, h.quality, false, false))
                     .collect()
             };
             listed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
             let skip = app.st_scroll.min(listed.len().saturating_sub(1));
-            for (off, q, on) in listed.into_iter().skip(skip).take(8) {
+            for (off, q, on, live) in listed.into_iter().skip(skip).take(8) {
                 let abs = if passband {
                     (rf + off as f64) / 1000.0
                 } else {
                     (app.center + off as f64) / 1000.0
                 };
-                let mark = if on { '>' } else { ' ' };
-                let style = if on {
-                    Style::default().fg(Color::LightCyan)
-                } else {
-                    Style::default()
+                // '>' is the lock, '·' is copied in the background, blank is
+                // found but not decoded — the budget is four tones.
+                let mark = match (on, live) {
+                    (true, _) => '>',
+                    (false, true) => '·',
+                    _ => ' ',
+                };
+                let style = match (on, live) {
+                    (true, _) => Style::default().fg(Color::LightCyan),
+                    (false, true) => Style::default().fg(Color::Cyan),
+                    _ => Style::default().fg(Color::DarkGray),
                 };
                 lines.push(Line::from(Span::styled(
                     format!("{mark}{abs:8.3}  q={:.0}%", q * 100.0),
@@ -7707,6 +7833,72 @@ mod tests {
         assert!(text.contains("envelope"), "envelope pane missing:\n{text}");
         assert!(text.contains("tuner"), "tuner pane missing:\n{text}");
         assert!(text.contains("copy"), "copy pane missing:\n{text}");
+        // One station in the passband is the ordinary case, and it must look
+        // exactly as it did before Stage 4 — no empty section, no lost rows.
+        assert!(
+            !text.contains("also copying"),
+            "background pane appeared with nothing behind the lock:\n{text}"
+        );
+    }
+
+    /// The other stations in the passband, on screen.
+    ///
+    /// Stage 4 decodes every tone; this is the half of it the operator sees.
+    /// The section has to appear when there is something behind the lock,
+    /// stay away when there is not, and never squeeze the lock's own copy off
+    /// a small terminal.
+    #[test]
+    fn cw_background_pane_shows_the_other_stations() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let render = |app: &App, w: u16, h: u16| -> String {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| super::draw(f, app)).unwrap();
+            let buf = t.backend().buffer();
+            let mut text = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    text.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+                }
+                text.push('\n');
+            }
+            text
+        };
+
+        let mut app = App::new(14_026_000.0, 192_000.0, Mode::Cw);
+        app.text = "CQ CQ DE W1AW W1AW K\n".into();
+        app.cw_bg = vec![
+            super::BgStation { hz: 120.0, quality: 0.8, text: "CQ DE G4XYZ G4XYZ K".into() },
+            super::BgStation { hz: -230.0, quality: 0.3, text: "TEST DE VK2ABC".into() },
+        ];
+        let text = render(&app, 120, 30);
+        assert!(
+            text.contains("also copying"),
+            "background pane missing with two stations behind the lock:\n{text}"
+        );
+        assert!(text.contains("G4XYZ"), "background copy missing:\n{text}");
+        // Each station is placed on the band, not just listed.
+        assert!(
+            text.contains("14026.120") && text.contains("14025.770"),
+            "background stations are not shown at their own frequencies:\n{text}"
+        );
+        // The lock's own copy survives sharing the column.
+        assert!(text.contains("W1AW"), "primary copy was pushed out:\n{text}");
+
+        // A station whose text is only whitespace is not a station.
+        app.cw_bg = vec![super::BgStation { hz: 90.0, quality: 0.9, text: "   ".into() }];
+        assert!(
+            !render(&app, 120, 30).contains("also copying"),
+            "empty background copy still drew a pane"
+        );
+
+        // Small terminals must not lose the transcript to it.
+        app.cw_bg = vec![super::BgStation { hz: 90.0, quality: 0.9, text: "DE JA1XYZ".into() }];
+        for (w, h) in [(40u16, 12u16), (80, 24), (200, 60)] {
+            let text = render(&app, w, h);
+            assert!(text.contains("copy"), "copy pane lost at {w}x{h}:\n{text}");
+        }
     }
 
     /// Scrolling the transcript shows older lines; zero stays pinned to live.

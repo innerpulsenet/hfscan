@@ -827,10 +827,19 @@ turned `CQ CQ DE ...` into `NQ CQ DE ...`. And `TONE_SEP_HZ` is 60, not the
 search's 40: the post-mix filter is 60–150 Hz wide, so two tones closer than
 that transcribe the same station twice, once well and once badly.
 
-**Not done: the TUI shows only the primary.** Background copy reaches
-pskreporter through `take_messages`, which is where the value is, and
-`take_background` exposes the raw streams. Putting a second station's text on
-screen is a question about panes and screen room, not about the decoder.
+**On screen.** The copy column splits: the lock's transcript on top, an
+`also copying` section under it with one line per background station, placed
+at its own frequency and carrying the tail of what it has sent. The section
+only exists when something is behind the lock, so the ordinary one-station
+case looks exactly as it did. The tuner's tone list marks each hit `>` for
+the lock, `·` for copied in the background, blank for found but not decoded —
+which is the first time that list has distinguished *seen* from *copied*.
+
+The copy floor moved with it. It used to gate every spot on `confidence()`,
+which describes the lock; with several stations running that is the wrong
+question, so `set_copy_floor` pushes the bar into the decoder and each tone
+is held to it by its own quality. Held-back copy is discarded as it goes
+rather than queued, so dropping the floor does not release a backlog.
 
 **Not CW, but owed. Done.** Both are on `decoders::channel` now
 (`bench_rtty_fading`, `bench_psk31_fading`), and the guess above was half

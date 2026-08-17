@@ -8,7 +8,7 @@
 
 use super::callscan::{CallScanner, utc_hhmmss};
 use super::cwlex::{self, Sym};
-use super::{CwView, Decoder, FtMessage};
+use super::{BgCopy, CwView, Decoder, FtMessage};
 use crate::dsp::{OnePole, Rotator, mix_decim_into};
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
@@ -439,6 +439,8 @@ pub struct CwDecoder {
     /// Searches to skip after a manual nudge so AFC does not fight the user.
     hold_tune: u32,
     hits: Vec<CwHit>,
+    /// Confidence a tone must reach before its copy leaves the decoder.
+    copy_floor: f32,
     search_buf: Vec<Complex32>,
     since_search: usize,
     fft: Arc<dyn Fft<f32>>,
@@ -932,6 +934,7 @@ impl CwDecoder {
             lock_score: 0.0,
             hold_tune: 0,
             hits: Vec::new(),
+            copy_floor: 0.0,
             search_buf: Vec::with_capacity(FFT_SIZE * 2),
             since_search: 0,
             fft,
@@ -979,14 +982,27 @@ impl CwDecoder {
     /// These are the stations Stage 4 exists to recover: they sit in the same
     /// 400 Hz passband as the primary and used to be discarded unheard.
     /// Returned as `(offset_hz, text)` so a caller can tell them apart.
-    #[allow(dead_code)]
-    pub fn take_background(&mut self) -> Vec<(f32, String)> {
-        let i = self.primary();
+    pub fn take_background(&mut self) -> Vec<BgCopy> {
+        let (i, floor) = (self.primary(), self.copy_floor);
         self.tones
             .iter_mut()
             .enumerate()
             .filter(|(k, t)| *k != i && !t.text.is_empty())
-            .map(|(_, t)| (t.mix_hz, std::mem::take(&mut t.text)))
+            .map(|(_, t)| BgCopy {
+                hz: t.mix_hz,
+                quality: t.quality.clamp(0.0, 1.0),
+                // Drained whether or not it clears the bar: a tone held back
+                // must not accumulate until it happens to pass and then emit
+                // a minute of stale copy in one go.
+                text: match t.quality >= floor {
+                    true => std::mem::take(&mut t.text),
+                    false => {
+                        t.text.clear();
+                        String::new()
+                    }
+                },
+            })
+            .filter(|b| !b.text.is_empty())
             .collect()
     }
 
@@ -1502,6 +1518,14 @@ impl Decoder for CwDecoder {
         Some(hz)
     }
 
+    fn set_copy_floor(&mut self, floor: f32) {
+        self.copy_floor = floor;
+    }
+
+    fn take_background(&mut self) -> Vec<BgCopy> {
+        CwDecoder::take_background(self)
+    }
+
     fn cw_view(&self) -> Option<CwView> {
         let t = self.cur();
         let span = (t.peak - t.floor).max(1e-9);
@@ -1519,6 +1543,7 @@ impl Decoder for CwDecoder {
             dit_ms: t.dit / t.env_rate * 1000.0,
             locked: self.locked,
             hits: self.hits.clone(),
+            live: self.tones.iter().map(|t| t.mix_hz).collect(),
         })
     }
 
@@ -1597,10 +1622,18 @@ impl Decoder for CwDecoder {
     /// own offset and its own SNR.
     fn take_messages(&mut self) -> Vec<FtMessage> {
         let stamp = utc_hhmmss();
-        let mut out = Vec::new();
+        let (mut out, floor) = (Vec::new(), self.copy_floor);
         for t in self.tones.iter_mut() {
             let (snr, hz) = (t.spot_snr(), t.mix_hz);
-            out.extend(t.scan.take_calls().into_iter().map(|call| FtMessage {
+            let calls = t.scan.take_calls();
+            // Each station is held to the bar by its own confidence. Gating
+            // the lot on the lock's would let a clean background station be
+            // suppressed by a poor primary, and a poor one ride out on a good
+            // primary — a spot is a claim about one station, not the passband.
+            if t.quality < floor {
+                continue;
+            }
+            out.extend(calls.into_iter().map(|call| FtMessage {
                 stamp: stamp.clone(),
                 snr_db: snr,
                 dt_sec: 0.0,

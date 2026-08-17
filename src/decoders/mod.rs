@@ -4,7 +4,6 @@
 pub mod callscan;
 pub mod channel;
 pub mod cw;
-mod cw_hsmm;
 pub mod ft8;
 pub mod psk31;
 pub mod rtty;
@@ -21,7 +20,7 @@ pub struct CwView {
     pub env: Vec<f32>,
     /// Key-down flag for each envelope sample.
     pub keyed: Vec<bool>,
-    /// Mark / space level estimates as 0..1 of the current span (display).
+    /// Slice thresholds as 0..1 of the current peak–floor span.
     pub on_thr: f32,
     pub off_thr: f32,
     /// Lock offset from the cursor, Hz.

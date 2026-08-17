@@ -4,7 +4,7 @@
 > regression-tested, and committed. The optional/later ideas in item 9 remain
 > explicitly deferred; they are not required for this plan's completion.
 > Successors: `weak-signal-plan-2.md` (done), `weak-signal-plan-3-cw.md`
-> (Stage 2 HSMM is on `main` and has not met that plan's acceptance bar).
+> (Stage 0 shipped; the Stage 2 HSMM was measured and reverted).
 >
 > Measured outcomes: impulse blanking 14.2 dB; tracked-floor candidate gate
 > 4.0 dB; frequency-dependent IQ correction 29.8 dB better than scalar in the

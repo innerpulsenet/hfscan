@@ -1458,15 +1458,18 @@ fn cw_band_score_grid() -> (Vec<(String, f32)>, f32) {
 /// The band grid as a gate, like `cw_score_does_not_regress` but for the
 /// conditions that actually break this decoder.
 ///
-/// The bar is low because the decoder is still fade-limited — Stage 0 was
-/// 43 % band against 90 % flat; Stage 2's HSMM is 42 % / 84 % and has not
-/// earned a raise. The gate exists so the number cannot quietly get worse
-/// while the flat grid is being tuned.
+/// The bar is low because the decoder is currently bad at this — 43 % against
+/// the flat grid's 90 — and that gap is the point of Stage 0 rather than
+/// something to hide. The gate exists so the number cannot quietly get worse
+/// while the flat grid is being tuned, which is exactly what has been
+/// happening: the flat grid moved three points this session for changes that
+/// this grid barely notices.
 ///
 /// Raise it as the detector is rebuilt. The interesting milestones are
 /// `chan moderate 12dB` reaching the high nineties, and `moderate 20dB`
-/// pulling clear of `moderate 6dB` — they are still ~49 % and ~41 %, which
-/// says fourteen decibels of extra signal buys almost nothing.
+/// pulling clear of `moderate 6dB` — today they are 49 % and 40 %, which says
+/// fourteen decibels of extra signal buys almost nothing and the decoder is
+/// limited by fading rather than by noise.
 #[test]
 fn cw_band_score_does_not_regress() {
     let (cells, mean) = cw_band_score_grid();

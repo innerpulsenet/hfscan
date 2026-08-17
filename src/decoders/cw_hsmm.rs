@@ -368,7 +368,12 @@ impl HsmmDecoder {
             mean_slice(&self.scratch.mu_m[..n]),
             mean_slice(&self.scratch.mu_s[..n]),
         );
-        let need_global = !self.have_t || self.since_global >= 6;
+        // §5.5: re-estimate the period on a schedule, and search only a
+        // narrow local grid between times. A sending station's WPM does not
+        // drift on a two-second timescale, and the full coarse grid is the
+        // single most expensive thing the decoder does — at every sixth
+        // window it was most of the CW budget. Twenty-four windows is ~14 s.
+        let need_global = !self.have_t || self.since_global >= 24;
         let mut candidates = if need_global {
             let coarse = period_grid(trellis_rate, true);
             let (t0, _, _) = self.best_period(&coarse, n, hint);
@@ -572,9 +577,14 @@ impl HsmmDecoder {
                 let mut best = NEG;
                 let mut best_d = dmin as u16;
                 let mut best_prev = IDLE as u8;
+                // §5.6, duration pruning: sample the duration range rather
+                // than walking it. The Gaussian is smooth over `d`, so
+                // twenty-eight probes locate its peak as well as fifty-six do
+                // and cost half as much. Going below about twenty starts to
+                // miss the peak on the long states and costs real copy.
                 let stride = {
                     let span = dmax.saturating_sub(dmin).max(1);
-                    (span / 56).max(1)
+                    (span / 28).max(1)
                 };
                 let mut d = dmin;
                 while d <= dmax && d <= t {

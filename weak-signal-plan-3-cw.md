@@ -2,9 +2,9 @@
 
 **Status:** Stage 0 complete. Stage 1 attempted five ways and rejected; none
 of it is in the tree. Stage 2 (the HSMM in §5) is in the tree and **has not met
-§6**: the band grid is at 49.25 % against a 60 % bar and the flat grid at
-84.52 % against 88 %. It is closer than it was, and the remaining gap is
-characterised in §7.8.
+§6**: the band grid is at 49.27 % against a 60 % bar and the flat grid at
+84.72 % against 88 %. §7.8 characterises the remaining gap and §7.10 records a
+round of attempts to close it, all of which failed against the same canaries.
 
 **This document is a handoff.** Sections 1–4 are context; section 5 is the
 specification Stage 2 followed; section 6 is still how to know you are done;
@@ -66,9 +66,10 @@ machine that recorded it before trusting any real-band number.
 
 | Instrument | What it measures | Stage 0 | Stage 2 | Stage 2 + EM |
 |---|---|---|---|---|
-| `bench_cw_score` (41 cells) | flat carrier, AWGN — the laboratory | **90.22 %** | **84.58 %** | **84.52 %** |
-| `bench_cw_band` (16 cells) | Watterson channel, QRM, static — the band | **43.54 %** | **41.84 %** | **49.25 %** |
-| `tests/cw_capture.rs` | token recall on the real 20m recording | **81.9 %** | **77.5 %** | **90.0 %** |
+| `bench_cw_score` (41 cells) | flat carrier, AWGN — the laboratory | **90.22 %** | **84.58 %** | **84.72 %** |
+| `bench_cw_band` (16 cells) | Watterson channel, QRM, static — the band | **43.54 %** | **41.84 %** | **49.27 %** |
+| `tests/cw_capture.rs` | token recall on the real 20m recording | **81.9 %** | **77.5 %** | **91.2 %** |
+| `bench_replay` end-to-end | realtime multiple, 16 channels | **71.67×** | **2.56×** | **3.04×** |
 
 Every figure in that table is a re-measurement, taken in one sitting on one
 machine with the capture present. Where it disagrees with a number quoted
@@ -484,7 +485,7 @@ work complete without running the instruments; it was measured and reverted
 | the band, 10dB | 15.3% | 9.0% | 15.1% |
 | the band, 4dB | — | 14.2% | 14.4% |
 | empty, qrm only | 100.0% | 100.0% | 100.0% |
-| **mean** | **43.54%** | **41.84%** | **49.25%** |
+| **mean** | **43.54%** | **41.84%** | **49.27%** |
 
 Dashes are cells the Stage 0 write-up did not quote. Every cell improved or
 held. `chan flutter` is off the floor but still a collapse. The 20 dB / 6 dB
@@ -511,8 +512,8 @@ All three `noise *` cells are at 100%. Do not merge anything that moves them.
 
 ### 7.3 `cw_capture`
 
-Token recall **90.0%**, against 81.9% at Stage 0 and 77.5% at Stage 2, with
-per-station density up on all four frequencies (18.9 / 5.3 / 2.4 / 4.9 against
+Token recall **91.2%**, against 81.9% at Stage 0 and 77.5% at Stage 2, with
+per-station density up on all four frequencies (20.5 / 5.4 / 2.4 / 4.9 against
 Stage 2's 18.3 / 5.2 / 0.8 / 4.9). Recall and density rising together is the
 one combination that is not an artefact of emitting more letters.
 
@@ -529,9 +530,9 @@ tion bug, not a detection one, and it is the most concrete lead in this file.
 | Speed / adjacent / clean-start canaries | green | pass | yes |
 | `empty, qrm only` | 100% | 100% | yes |
 | Flat `noise *` cells | 100% | 100% | yes |
-| `cw_capture` recall / density | ≥ 82%, density not down | 90.0%, density up | yes |
-| `bench_cw_band` | ≥ 60% | 49.25% | **no** |
-| `bench_cw_score` | ≥ 88% | 84.52% | **no** |
+| `cw_capture` recall / density | ≥ 82%, density not down | 91.2%, density up | yes |
+| `bench_cw_band` | ≥ 60% | 49.27% | **no** |
+| `bench_cw_score` | ≥ 88% | 84.72% | **no** |
 | `cw_copies_at_zero_db` | ≥ 60% at 0 dB | 35% | **no** |
 | `the_clean_station_is_copied_nearly_verbatim` | pass | fails on the `DE` word gap | **no** |
 | `spot_snr_follows_the_band` | pass | −2.2 dB weak vs 4.6 dB strong | **no** |
@@ -566,15 +567,24 @@ against the Stage 0 baseline in `20m_baseline_metrics.json`:
 | Stage 0 baseline | 20.28 MS/s | 71.67× | 1.4% |
 | Stage 2 | 0.11 MS/s | 2.56× | 39.1% |
 | Stage 2 + EM | 0.08 MS/s | 1.94× | 58.6% |
+| **+ §5.6 levers** | **0.13 MS/s** | **3.04×** | **32.9%** |
 
-The HSMM costs ~184× on CW demod and the EM pass another ~1.4× on top. §5.4
-budgeted "a few hundred times real time" and that is roughly where the decoder
-landed in isolation, but end-to-end the scanner is at 1.94× realtime with 16
-channels and 58% CPU. That is not enough headroom for the live TUI, and none of
-§5.6's levers (coarse-to-fine period search, less frequent `T` re-estimation,
-duration pruning, beam pruning) have been applied yet. Do this before any
-further accuracy work; it is also the cheapest remaining win, because the
-period grid is currently re-searched far more often than §5.5 asks for.
+Two of §5.6's levers are now applied, and both were free — every instrument
+came out level or better:
+
+- **Re-estimate `T` on a schedule.** The full coarse grid ran every sixth
+  window; it now runs every twenty-fourth (~14 s), with a narrow local grid in
+  between, which is what §5.5 asked for in the first place. A station's WPM
+  does not drift on a two-second timescale.
+- **Prune duration candidates.** The duration search walked up to fifty-six
+  probes per state per sample; twenty-eight locate the same Gaussian peak.
+  Below about twenty it starts missing the peak on the long states and costs
+  real copy (flat 84.4 %, band 48.7 % at eighteen).
+
+That is 1.94× → 3.04× end-to-end and 58.6 % → 32.9 % CPU, with flat and band
+both fractionally up and capture recall up 1.2 points. Still 24× short of the
+Stage 0 baseline, and the remaining levers (beam pruning on `δ`, a coarser
+trellis) have not been tried. The scanner is usable again but not comfortable.
 
 ### 7.7 The EM pass that was kept
 
@@ -596,15 +606,19 @@ slightly worse on the band.
 
 ### 7.8 Where the remaining gap is
 
-- **Band 49.25 → 60.** `chan flutter` (6.3%) and `the band` (15.1 / 14.4) are
+- **Band 49.27 → 60.** `chan flutter` (6.3%) and `the band` (15.1 / 14.4) are
   the three cells holding the mean down. Flutter is a fast-fading collapse; the
   band cells are the multi-station case Stage 4 is meant to address, and no
-  amount of single-tone work will fix them.
-- **Flat 84.52 → 88.** Entirely the −3 dB row and the slower +0 dB cells. This
-  is the noise wall, and §7.2 shows Stage 2 gave it back relative to Stage 0's
-  hard-decision chain. Worth understanding before adding anything.
-- **The `DE` word gap** (§7.3). Small, concrete, and it is the one test whose
-  failure says something is structurally wrong rather than merely weak.
+  amount of single-tone work will fix them. Note the arithmetic: lifting all
+  three to 60 % only reaches a mean of 59. **Band ≥ 60 is probably not
+  reachable without Stage 4**, and §6 was written before that was known.
+- **Flat 84.72 → 88.** Almost entirely the −3 dB row, which is 61 % of the
+  total deficit across all 41 cells and sits at 0–11 %. §7.10 diagnoses it: the
+  period estimator collapses to under half the true dit. Fix that and the gate
+  falls out; nothing else on the flat grid is worth more than a point.
+- **The `DE` word gap** (§7.3, §7.10). Small, concrete, present even at 15 dB,
+  and the one test whose failure says something is structurally wrong rather
+  than merely weak.
 
 ### 7.9 Rejected: the second Stage 2 round
 
@@ -632,6 +646,79 @@ survived (§7.7) is structural — it adds an inference pass, not a constant. On
 this decoder, tuning constants by hand has now failed across three rounds and
 roughly twenty attempts. Measure first, and run `bench_cw_score`'s `noise *`
 cells and `cw_capture`'s density column before believing any improvement.
+
+### 7.10 Rejected: one round of trying to close §6
+
+An attempt to reach band 60 % and flat 88 % from 49 / 85. Nothing in it
+survived. It is recorded in full because most of it looks obviously right, and
+because the diagnostics are worth more than the attempts.
+
+**What the −3 dB row actually is.** Not the gates, not the emission width — the
+period estimate collapses. Disabling both amplitude gates in `cw.rs` does not
+move the −3 dB cells at all (it only takes the `noise *` cells to zero), so
+they are not what is binding. Instrumented at 18 WPM (true dit 67 envelope
+samples), the search reports `t_best` of 62–70 at 3 dB, and at −3 dB it locks
+at **30** — under half — then wanders 24–38 for fourteen windows before finding
+72 near the end. `inst_q` reads 0.98 on that garbage, so the likelihood ratio
+against null is saturated and cannot be used to detect the condition. The
+mechanism is overfitting: a shorter period explains a noisy envelope with more,
+smaller elements, and the per-segment charge in `best_period` is a flat 3.5
+against an emission term that grows without bound as SNR drops.
+
+**`GapChar` and `GapWord` are dead states.** Instrumenting the committed
+decoder, *every* gap comes back labelled `Idle` — 1-dit element gaps, 3-dit
+character gaps and 7-dit word gaps alike. `Idle` is a per-sample geometric
+self-loop at ~0.002 nats/sample, so a 3-dit gap costs it ~0.4 against
+`GapChar`'s one-off ~3.1, and it wins everywhere. The explicit-duration grammar
+§5.1 specifies has never actually run. Charging a proper `Idle` entry cost
+(−12 nats) does fix the labelling — `GapChar` lands at 3.1–3.3 dits, `GapWord`
+at 7.1–7.4, and `t_dit` gets visibly more accurate — and it measures **worse**:
+flat 84.2 %, band 47.6 %. The tight duration Gaussians are less robust to real
+timing jitter than the geometric state that was accidentally doing the job.
+Do not "fix" this without measuring it.
+
+**The word-gap threshold is boxed in.** `WORD_GAP_DITS` is 4.6, the geometric
+mean of 3 and 7. Measured gaps run ~15 % short, because the matched boxcar and
+the post-mix filter smear mark energy into the silence on both sides, so a true
+7-dit word gap arrives as 4.0–4.5 and reads as a character gap. That is the
+`DE W1AW` / `DE NK9G` defect, and it is present at 15 dB, not just at the noise
+wall. Lowering the threshold to 4.0 fixes those and is worth **+1.4 flat**
+(86.10 %) — and it breaks `cw_decodes_farnsworth_timing` and
+`cw_decodes_bug_keyer_weighting`, because Farnsworth stretches character gaps
+on purpose and no fixed multiple of the dit separates a stretched character gap
+from a word gap. §7.5 hit the same wall at 3.9. **No constant works here.**
+
+| Attempt | Effect | Verdict |
+|---|---|---|
+| Emission sigma measured from the envelope (residual against the tracked level) instead of the fixed `VAR = 0.12` | flat 84.5 → 83.7, band 49.3 → 48.1 | rejected; the assumed constant beats the measured value |
+| Per-segment charge scaled by measured dispersion, so fragmentation costs more when the evidence is poor | flat 85.1 / band 49.9 at slope 110, but **breaks `cw_decodes_bug_keyer_weighting`** above slope ≈ 10; at slope 10 it is flat 84.4 / band 48.3 | rejected. The slope that helps the noise wall is the slope that eats a bug keyer's light dits. |
+| Flat per-segment charge raised (8 / 15 / 25 / 40 / 80) | −3 dB probe 0.00 → 0.27, grid mean 83.7 → 81.1 → 75.6 | rejected; helps the weak cells, costs more on the strong ones |
+| Median-of-7-windows period vote instead of the EMA | `speed 30->14wpm` 98 % → 84 % | rejected. A median resists a genuine speed change, and the low-SNR period error is a bias, not noise — 14 of 20 windows were short, so voting cannot fix it. |
+| `Idle` entry cost of −12 nats, restoring the §5.1 grammar | flat 84.2 %, band 47.6 % | rejected, see above |
+| Word-gap transition prior flattened 0.06 → 0.25 so durations decide | no effect on the failing gap | rejected |
+| `WORD_GAP_DITS` 4.6 → 4.0 | flat +1.4, two timing canaries fail, capture recall 91.2 → 83.8 | rejected, see above |
+
+**The pattern.** Every change that moved a grid broke a canary, and every
+change that kept the canaries green failed to move a grid. That is the same
+frontier §3 describes from five Stage 1 detectors, met again from a different
+direction. The canaries are load-bearing and not arbitrary:
+`cw_decodes_bug_keyer_weighting` is the one that catches anything which
+suppresses short elements, and it caught two separate attempts here.
+
+**Where the next real gain is.** Not in constants. Two structural leads, both
+untried:
+
+1. **An adaptive gap model.** Cluster the observed gap durations into
+   element / character / word rather than thresholding on `t_dit`, the way
+   `recluster` did for marks in Stage 0. That fixes the `DE W1AW` class of
+   defect without the Farnsworth trade, and §7.3 shows the word gap is the most
+   concrete failure left.
+2. **A period estimator that is not the decode objective.** The period is
+   currently chosen by the same score it overfits, which is why it collapses at
+   −3 dB. Anything independent — envelope autocorrelation, or a histogram of
+   level-crossing intervals accumulated over the whole over — used as a hard
+   prior rather than a hint would break that. `hint_dit` gestures at this but
+   is a hard slicer and is worthless at the SNR where it matters.
 
 ## 8. Later stages
 

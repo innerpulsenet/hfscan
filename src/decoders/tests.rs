@@ -646,15 +646,8 @@ fn gen_rtty_snr(text: &str, baud: f32, shift: f32, snr_scale: f32) -> Vec<Comple
     gen_rtty_faded(text, baud, shift, snr_scale, 1.0, 1.0)
 }
 
-fn gen_rtty_faded(
-    text: &str,
-    baud: f32,
-    shift: f32,
-    snr_scale: f32,
-    mark_amp: f32,
-    space_amp: f32,
-) -> Vec<Complex32> {
-    let sps = FS as f32 / baud;
+/// The ITA2 bit stream for `text`, framed as the decoder expects it.
+fn rtty_bits(text: &str, baud: f32) -> Vec<bool> {
     let mut bits: Vec<bool> = Vec::new();
     // idle mark so the decoder starts in a known state
     bits.extend(std::iter::repeat(true).take((baud as usize).max(20)));
@@ -681,6 +674,44 @@ fn gen_rtty_faded(
         bits.push(true);
     }
     bits.extend(std::iter::repeat(true).take(20));
+    bits
+}
+
+/// Noiseless, unmodulated-amplitude RTTY: the input a channel model takes.
+///
+/// `gen_rtty_faded` bakes its noise in, which is fine for a fixed tone
+/// imbalance but wrong once a channel is in circuit — the fading has to be
+/// applied to the signal alone, before the noise floor is added, or the
+/// "SNR" being swept is not one.
+fn gen_rtty_clean(text: &str, baud: f32, shift: f32) -> Vec<Complex32> {
+    modulate_rtty(&rtty_bits(text, baud), baud, shift)
+}
+
+/// FSK-modulate an arbitrary bit stream at unit amplitude, continuous phase.
+fn modulate_rtty(bits: &[bool], baud: f32, shift: f32) -> Vec<Complex32> {
+    let sps = FS as f32 / baud;
+    let mut out = Vec::new();
+    let mut phase = 0.0f32;
+    for &mark in bits {
+        let f = if mark { shift / 2.0 } else { -shift / 2.0 };
+        for _ in 0..sps as usize {
+            phase += 2.0 * PI * f / FS as f32;
+            out.push(Complex32::from_polar(1.0, phase));
+        }
+    }
+    out
+}
+
+fn gen_rtty_faded(
+    text: &str,
+    baud: f32,
+    shift: f32,
+    snr_scale: f32,
+    mark_amp: f32,
+    space_amp: f32,
+) -> Vec<Complex32> {
+    let sps = FS as f32 / baud;
+    let bits = rtty_bits(text, baud);
 
     let mut rng = 0x9e37_79b9u32;
     let mut out = Vec::new();
@@ -782,6 +813,142 @@ fn bench_rtty_matched_filter_fade() {
     }
 }
 
+// --------------------------------------------- RTTY through a real channel
+
+/// RTTY through a Watterson channel: fade the signal, *then* add the noise.
+///
+/// `snr_db` is the mean SNR in the 45.45 Hz bit bandwidth, mean being the
+/// operative word — the instantaneous value is what the channel decides.
+fn gen_rtty_channel(
+    text: &str,
+    baud: f32,
+    shift: f32,
+    cond: Condition,
+    snr_db: f32,
+    seed: u32,
+) -> Vec<Complex32> {
+    let mut sig = channel::watterson(
+        &gen_rtty_clean(text, baud, shift),
+        FS as f32,
+        cond,
+        seed,
+    );
+    let mut rng = seed ^ 0xa5a5_a5a5;
+    let n_scale = rtty_scale_for_snr(snr_db);
+    for s in sig.iter_mut() {
+        *s += Complex32::new(noise(&mut rng), noise(&mut rng)) * n_scale;
+    }
+    sig
+}
+
+const RTTY_FADE_SEEDS: [u32; 8] = [
+    0x1234_5678,
+    0x9e37_79b9,
+    0x0bad_f00d,
+    0x5eed_1234,
+    0xdead_beef,
+    0x0f0f_1e1e,
+    0xc0ff_ee11,
+    0x3141_5926,
+];
+const RTTY_FADE_MSG: &str = "RYRY RYRY CQ CQ DE W1AW W1AW K UR RST 599 QTH NEWINGTON";
+
+/// Mean copy across `RTTY_FADE_SEEDS` for one channel and SNR.
+fn rtty_fade_cell(cond: Condition, snr_db: f32) -> f32 {
+    let n = RTTY_FADE_SEEDS.len() as f32;
+    RTTY_FADE_SEEDS
+        .iter()
+        .map(|&seed| {
+            let sig = gen_rtty_channel(RTTY_FADE_MSG, 45.45, 170.0, cond, snr_db, seed);
+            accuracy(RTTY_FADE_MSG, &decode_rtty(&sig))
+        })
+        .sum::<f32>()
+        / n
+}
+
+/// An operator pausing mid-over must not cost the rest of the transmission.
+///
+/// This is the hazard a *short* per-tone hold buys: RTTY idles on mark, so
+/// through a long pause the space tone carries nothing and `space_peak`
+/// decays toward the noise. Come the next character, `es/space_peak` is
+/// inflated by however far it fell, and the discriminator reads spaces that
+/// are not there. The hold has to outlast a pause a real operator takes.
+#[test]
+fn rtty_recovers_after_a_long_idle_mark() {
+    const TAIL: &str = "DE W1AW W1AW K";
+    for idle_s in [2.0f32, 5.0, 10.0] {
+        let mut bits = rtty_bits("CQ CQ", 45.45);
+        bits.extend(std::iter::repeat(true).take((45.45 * idle_s) as usize));
+        bits.extend(rtty_bits(TAIL, 45.45));
+        let sig = modulate_rtty(&bits, 45.45, 170.0);
+        let mut rng = 0x1234_5678u32;
+        let n_scale = rtty_scale_for_snr(15.0);
+        let sig: Vec<Complex32> = sig
+            .iter()
+            .map(|s| s + Complex32::new(noise(&mut rng), noise(&mut rng)) * n_scale)
+            .collect();
+        let got = decode_rtty(&sig);
+        assert!(
+            accuracy(TAIL, got.split("CQ").last().unwrap_or("")) >= 0.6,
+            "{idle_s}s idle mark then {TAIL:?}: got {got:?}"
+        );
+    }
+}
+
+/// Copy against path and SNR, the instrument RTTY did not have.
+///
+/// A 170 Hz shift straddles the coherence bandwidth of every CCIR path here —
+/// `1/(2*pi*delay)` is 318 Hz at `CCIR_GOOD` and 80 Hz at `CCIR_POOR` — so
+/// the mark and space tones fade independently, which is the case the
+/// discriminator's per-tone max-hold has to survive and the case
+/// `gen_rtty_faded`'s static amplitudes cannot produce.
+#[test]
+#[ignore]
+fn bench_rtty_fading() {
+    println!("\n  RTTY copy vs path and SNR (in 45.45 Hz), mean of 4 seeds\n");
+    print!("{:>16}", "path");
+    for db in [20, 15, 12, 10, 8] {
+        print!("{:>8}", format!("{db}dB"));
+    }
+    println!();
+    for (name, cond) in [
+        ("flat", channel::FLAT),
+        ("good", channel::CCIR_GOOD),
+        ("moderate", channel::CCIR_MODERATE),
+        ("poor", channel::CCIR_POOR),
+        ("flutter", channel::CCIR_FLUTTER),
+    ] {
+        print!("{name:>16}");
+        for db in [20.0f32, 15.0, 12.0, 10.0, 8.0] {
+            print!("{:>8}", format!("{:.0}%", rtty_fade_cell(cond, db) * 100.0));
+        }
+        println!();
+    }
+}
+
+/// Fading, not noise, is what limits RTTY copy — so it needs a gate.
+///
+/// At 20 dB in the bit bandwidth the flat case is a solved problem: 100 %.
+/// What these two cells measure is the cost of the ionosphere alone at a
+/// level where noise costs nothing, which is where `PEAK_HOLD_S` was found
+/// and the only place a regression in the tone references will show.
+#[test]
+fn rtty_fading_copy_does_not_regress() {
+    for (name, cond, floor) in [
+        ("moderate", channel::CCIR_MODERATE, 0.72f32),
+        ("poor", channel::CCIR_POOR, 0.62),
+    ] {
+        let got = rtty_fade_cell(cond, 20.0);
+        assert!(
+            got >= floor,
+            "RTTY {name} at 20 dB copied {:.0}%, below the {:.0}% gate \
+             (was 77%/58% with the 1.5 s hold, 83%/74% with 0.3 s)",
+            got * 100.0,
+            floor * 100.0
+        );
+    }
+}
+
 #[test]
 fn rtty_decodes_baudot() {
     let msg = "RYRY CQ DE TEST";
@@ -846,6 +1013,16 @@ fn gen_psk31(text: &str, freq_offset: f32) -> Vec<Complex32> {
 }
 
 fn gen_psk31_snr(text: &str, freq_offset: f32, snr_scale: f32) -> Vec<Complex32> {
+    let clean = gen_psk31_clean(text, freq_offset);
+    let mut rng = 0xdead_beefu32;
+    clean
+        .iter()
+        .map(|&s| s + Complex32::new(noise(&mut rng), noise(&mut rng)) * snr_scale)
+        .collect()
+}
+
+/// Noiseless PSK31: the input a channel model takes.
+fn gen_psk31_clean(text: &str, freq_offset: f32) -> Vec<Complex32> {
     let sps = (FS as f32 / 31.25) as usize;
     let mut bits: Vec<bool> = Vec::new();
     // Idle: a run of 0 bits (continuous reversals) for the receiver to lock to.
@@ -888,13 +1065,11 @@ fn gen_psk31_snr(text: &str, freq_offset: f32, snr_scale: f32) -> Vec<Complex32>
         }
     }
 
-    let mut rng = 0xdead_beefu32;
     base.iter()
         .enumerate()
         .map(|(i, &v)| {
             let ph = 2.0 * PI * freq_offset * i as f32 / FS as f32;
             Complex32::from_polar(v.abs(), ph + if v < 0.0 { PI } else { 0.0 })
-                + Complex32::new(noise(&mut rng), noise(&mut rng)) * snr_scale
         })
         .collect()
 }
@@ -2158,6 +2333,96 @@ fn decode_psk(sig: &[Complex32], tune: f32) -> String {
     out.trim().to_string()
 }
 
+// -------------------------------------------- PSK31 through a real channel
+
+/// PSK31 through a Watterson channel: fade the signal, *then* add the noise.
+fn gen_psk31_channel(text: &str, cond: Condition, snr_db: f32, seed: u32) -> Vec<Complex32> {
+    let mut sig = channel::watterson(&gen_psk31_clean(text, 0.0), FS as f32, cond, seed);
+    let mut rng = seed ^ 0xa5a5_a5a5;
+    let n_scale = psk_scale_for_snr(snr_db);
+    for s in sig.iter_mut() {
+        *s += Complex32::new(noise(&mut rng), noise(&mut rng)) * n_scale;
+    }
+    sig
+}
+
+const PSK_FADE_MSG: &str = "CQ CQ DE W1AW W1AW PSE K UR RST 599 QTH NEWINGTON";
+
+/// Mean copy across `RTTY_FADE_SEEDS` for one channel and SNR.
+fn psk31_fade_cell(cond: Condition, snr_db: f32) -> f32 {
+    let n = RTTY_FADE_SEEDS.len() as f32;
+    RTTY_FADE_SEEDS
+        .iter()
+        .map(|&seed| {
+            let sig = gen_psk31_channel(PSK_FADE_MSG, cond, snr_db, seed);
+            accuracy(PSK_FADE_MSG, &decode_psk(&sig, 0.0))
+        })
+        .sum::<f32>()
+        / n
+}
+
+/// Copy against path and SNR — the question amplitude-immunity does not answer.
+///
+/// Normalising each symbol dump to unit magnitude (`psk31.rs`) genuinely does
+/// make the demodulator indifferent to how deep a fade goes. It says nothing
+/// about how fast the fade moves: PSK31 carries its data in the phase, and a
+/// Doppler spread rotates exactly that. `CCIR_FLUTTER`'s 5 Hz against a 31.25
+/// baud symbol rate is the case worth watching.
+#[test]
+#[ignore]
+fn bench_psk31_fading() {
+    println!("\n  PSK31 copy vs path and SNR (in 31.25 Hz), mean of 8 seeds\n");
+    print!("{:>16}", "path");
+    for db in [20, 15, 10, 8, 6] {
+        print!("{:>8}", format!("{db}dB"));
+    }
+    println!();
+    for (name, cond) in [
+        ("flat", channel::FLAT),
+        ("good", channel::CCIR_GOOD),
+        ("moderate", channel::CCIR_MODERATE),
+        ("poor", channel::CCIR_POOR),
+        ("flutter", channel::CCIR_FLUTTER),
+    ] {
+        print!("{name:>16}");
+        for db in [20.0f32, 15.0, 10.0, 8.0, 6.0] {
+            print!("{:>8}", format!("{:.0}%", psk31_fade_cell(cond, db) * 100.0));
+        }
+        println!();
+    }
+}
+
+/// The paths PSK31 can work, gated at a level where noise is not the limit.
+///
+/// `CCIR_FLUTTER` is deliberately not here. It copies 10 % at 20 dB and 10 %
+/// at 15 dB — a floor that does not move with SNR, which normally means a
+/// candidate is being vetoed rather than demodulated badly. It is not: the
+/// decoder locks, and on two seeds in three it locks within a hertz and still
+/// returns garbage. That is the mode meeting its own limit rather than a
+/// defect. A 5 Hz Doppler spread decorrelates the phase in roughly
+/// `1/(2*pi*5)` = 32 ms, which is one 31.25 baud symbol, so the channel is
+/// incoherent across the very interval the demodulator has to integrate over.
+/// Nothing in a tracking loop recovers that, and PSK31's reputation on
+/// auroral paths says the same thing. Do not spend effort on it — the one
+/// genuine wart is the AFC walking 20 Hz off on one seed in three while
+/// chasing the Doppler, and fixing that would not buy a character.
+#[test]
+fn psk31_fading_copy_does_not_regress() {
+    for (name, cond, floor) in [
+        ("good", channel::CCIR_GOOD, 0.88f32),
+        ("moderate", channel::CCIR_MODERATE, 0.78),
+        ("poor", channel::CCIR_POOR, 0.68),
+    ] {
+        let got = psk31_fade_cell(cond, 20.0);
+        assert!(
+            got >= floor,
+            "PSK31 {name} at 20 dB copied {:.0}%, below the {:.0}% gate",
+            got * 100.0,
+            floor * 100.0
+        );
+    }
+}
+
 fn decode_psk_dbg(sig: &[Complex32], tune: f32) -> (String, f32, bool) {
     let mut d = psk31::Psk31Decoder::new(FS);
     let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
@@ -3136,4 +3401,5 @@ fn bench_cw_fading() {
         println!();
     }
 }
+
 

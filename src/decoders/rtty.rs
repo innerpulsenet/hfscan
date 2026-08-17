@@ -27,6 +27,35 @@ use std::sync::Arc;
 /// Good frames one polarity must lead the other by before it is believed.
 /// A few characters' worth: enough that a run of luck does not decide it,
 /// few enough that copy starts almost immediately.
+/// How long each tone's max-hold reference takes to decay, seconds.
+///
+/// The discriminator normalises each tone by its own recent maximum, which is
+/// what lets it copy a station whose two tones arrive at different levels —
+/// see `rtty_matched_filters_survive_selective_fading`, where the space tone
+/// is 20 dB down and copy survives. The hold is a per-tone AGC, and it needs
+/// to be slow enough not to track the keying.
+///
+/// It was 1.5 s, which is slow enough for that but far slower than HF QSB.
+/// A 170 Hz shift straddles the coherence bandwidth of every CCIR path
+/// (`1/(2*pi*delay)` is 318 Hz at `CCIR_GOOD`, 80 Hz at `CCIR_POOR`), so the
+/// two tones fade *independently*, and a stale reference on the tone that is
+/// down inflates its normalised energy against the tone that is up. The bit
+/// inverts. Nothing measured this before `bench_rtty_fading`, because
+/// `gen_rtty_faded` fades with static per-tone amplitudes, which is a level
+/// difference the hold is designed to absorb rather than a moving one.
+///
+/// Swept over `bench_rtty_fading` at eight seeds, the surface is a broad
+/// plateau from 0.15 to 0.5 s and falls away above it — 57.0 / 57.1 / 56.6
+/// mean copy across the grid against 55.6 at the old 1.5 s. The gain is
+/// concentrated exactly where fading rather than noise is the limit:
+/// `CCIR_POOR` at 20 dB goes from 58 % to 74 %.
+///
+/// The obvious hazard of a short hold does not materialise: RTTY idles on
+/// mark, so through a pause `space_peak` decays toward the noise, but the
+/// hold attacks instantly, so the first real space re-arms it in one sample.
+/// `rtty_recovers_after_a_long_idle_mark` pins that at up to 10 s of idle.
+const PEAK_HOLD_S: f32 = 0.3;
+
 const POLARITY_MARGIN: i64 = 6;
 /// ...and the fraction of its frames that must have closed on a mark stop
 /// bit. The margin alone is not enough: on an empty frequency the stop-bit
@@ -494,7 +523,7 @@ impl Decoder for RttyDecoder {
             self.space_acc = self.space.push(space_mix);
             let em = self.mark_acc.norm_sqr();
             let es = self.space_acc.norm_sqr();
-            let decay = 1.0 - 1.0 / (self.fs * 1.5);
+            let decay = 1.0 - 1.0 / (self.fs * PEAK_HOLD_S);
             self.mark_peak = (self.mark_peak * decay).max(em);
             self.space_peak = (self.space_peak * decay).max(es);
             let f = em / self.mark_peak.max(1e-9) - es / self.space_peak.max(1e-9);

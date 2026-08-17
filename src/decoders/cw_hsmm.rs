@@ -31,6 +31,9 @@ const DIT_MIN_S: f32 = 0.024;
 const DIT_MAX_S: f32 = 0.24;
 
 const WIN_S: f32 = 2.5;
+/// Hard ceiling on retained envelope, regardless of commit progress. See
+/// `trim`.
+const MAX_WIN_S: f32 = 6.0;
 const STEP_S: f32 = 0.60;
 const LAG_S: f32 = 0.30;
 /// Wait for this much envelope before the first decode, so the period grid
@@ -278,13 +281,28 @@ impl HsmmDecoder {
     fn trim(&mut self) {
         let win = (WIN_S * self.env_rate) as usize;
         let now = self.origin + self.env.len() as u64;
-        let keep_from = self.committed.min(now.saturating_sub(win as u64));
+        // Normally keep everything back to `committed`, so a character that
+        // straddles a window is not cut in half.
+        let want = self.committed.min(now.saturating_sub(win as u64));
+        // But never keep more than `MAX_WIN_S`, whatever `committed` says.
+        // `commit_path` only advances through a character gap, a word gap or a
+        // long idle — an element gap does not count — so a signal that
+        // segments as unbroken keying (a stuck key, a tuning station, an
+        // unattended keyer) never commits at all. Without this floor the
+        // buffer grows without bound, every window costs O(len), and the
+        // decoder's cost per second of audio climbs linearly until it eats a
+        // core. Dropping uncommitted envelope loses copy for that stretch,
+        // which is the right trade against locking up the whole scanner.
+        let floor = now.saturating_sub((MAX_WIN_S * self.env_rate) as u64);
+        let keep_from = want.max(floor);
         if keep_from > self.origin {
             let drop = (keep_from - self.origin) as usize;
             let drop = drop.min(self.env.len());
             if drop > 0 {
                 self.env.drain(..drop);
                 self.origin += drop as u64;
+                // A forced drop can leave `committed` behind the buffer.
+                self.committed = self.committed.max(self.origin);
             }
         }
     }

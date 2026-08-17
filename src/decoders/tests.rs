@@ -3133,3 +3133,53 @@ fn bench_cw_fading() {
         println!();
     }
 }
+
+/// Unbroken keying must not make the decoder cost grow without bound.
+///
+/// `commit_path` only advances `committed` through a character gap, a word gap
+/// or a long idle. A signal that segments as marks separated by element gaps
+/// and nothing else — a stuck key, a station tuning up, an unattended keyer —
+/// never commits, and `trim` used to keep every uncommitted sample. The buffer
+/// grew for as long as the signal lasted, each window cost O(buffer), and the
+/// decoder's cost per second of audio climbed linearly until it saturated a
+/// core. Sixteen channels of that is the whole scanner locking up.
+#[test]
+fn cw_cost_does_not_grow_on_unbroken_keying() {
+    use std::time::Instant;
+    let fs = FS;
+    let mut d = cw::CwDecoder::new(fs);
+    let mut chain = crate::dsp::DecodeChain::new(fs, d.bandwidth(), fs);
+    chain.set_offset(CW_TONE as f64 + d.offset_shift());
+
+    let secs = 24usize;
+    let dit = (1.2 / 20.0 * fs as f32) as usize;
+    let w = 2.0 * std::f32::consts::PI * CW_TONE / fs as f32;
+    let mut sig = Vec::with_capacity(fs as usize * secs);
+    for i in 0..fs as usize * secs {
+        let a = if (i / dit) % 2 == 0 { 0.3 } else { 0.0 };
+        let p = w * i as f32;
+        sig.push(Complex32::new(p.cos() * a, p.sin() * a));
+    }
+
+    let mut audio = Vec::new();
+    let mut cost = Vec::with_capacity(secs);
+    for chunk in sig.chunks(fs as usize) {
+        let t0 = Instant::now();
+        chain.process(chunk, &mut audio);
+        let _ = d.process(&audio);
+        cost.push(t0.elapsed().as_secs_f64());
+    }
+
+    // Compare the last quarter against an early quarter rather than an
+    // absolute bound, so the test measures growth and not the machine.
+    let early: f64 = cost[secs / 4..secs / 2].iter().sum::<f64>() / (secs / 4) as f64;
+    let late: f64 = cost[secs * 3 / 4..].iter().sum::<f64>() / (secs / 4) as f64;
+    assert!(
+        late < early * 2.0,
+        "cost per second of audio grew {:.1}x over {secs}s of unbroken keying \
+         ({:.1} ms -> {:.1} ms); the envelope buffer is not being bounded",
+        late / early,
+        early * 1e3,
+        late * 1e3
+    );
+}

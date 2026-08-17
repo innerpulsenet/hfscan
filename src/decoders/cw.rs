@@ -286,8 +286,17 @@ impl CwDecoder {
         }
         for ev in evs {
             match ev {
-                MorseEvent::Dit => self.symbol.push('.'),
-                MorseEvent::Dah => self.symbol.push('-'),
+                // `push_symbol` already discards anything longer than the
+                // longest Morse codeword, but it only runs when a gap
+                // arrives. Cap here too so a run of marks with no gap cannot
+                // grow the string without bound.
+                MorseEvent::Dit | MorseEvent::Dah => {
+                    if self.symbol.len() >= 16 {
+                        self.symbol.clear();
+                    }
+                    self.symbol
+                        .push(if matches!(ev, MorseEvent::Dit) { '.' } else { '-' });
+                }
                 MorseEvent::CharGap => self.push_symbol(),
                 MorseEvent::WordGap => {
                     self.push_symbol();

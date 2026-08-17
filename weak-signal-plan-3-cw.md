@@ -17,7 +17,10 @@ section 5 is the specification Stage 2 followed; section 6 is the acceptance bar
 and **§6 is now known to be partly wrong** (see §7.8 — band ≥ 60 is probably
 unreachable without Stage 4, and §6 never set a CPU budget, which is the
 omission that allowed all of this). Section 7 is everything that was measured,
-including three rounds of work that were reverted.
+including three rounds of work that were reverted. **Stage 4 has since
+shipped (§8) with a CPU budget attached**; it recovers the multi-station cells
+on a throughput metric and leaves the lock-only mean where it was, so §7.8's
+arithmetic about reaching 60 still stands.
 
 ### If you pick Stage 2 up again
 
@@ -80,6 +83,7 @@ the HSMM or repeating it.
 |---|---|---|---|---|---|
 | `bench_cw_score` (41 cells) | flat carrier, AWGN — the laboratory | 90.22 % | 84.58 % | 84.72 % | **90.57 %** |
 | `bench_cw_band` (16 cells) | Watterson channel, QRM, static — the band | 43.54 % | 41.84 % | 49.27 % | **44.03 %** |
+| `bench_cw_band`, throughput | as above, but copied in *any* stream (Stage 4) | — | — | — | **46.90 %** |
 | `tests/cw_capture.rs` | token recall on the real 20m recording | 81.9 % | 77.5 % | 91.2 % | **88.1 %** |
 | `bench_replay` end-to-end | realtime multiple, 16 channels | 71.67× | 2.56× | 3.04× | **73.8×** |
 
@@ -163,8 +167,8 @@ loss. Both are fixed. Do not re-derive them.
   right rather than merely plausible: mean power preserved across an ensemble,
   fades deepen as conditions worsen, and tones 300 Hz apart fade independently
   (r < 0.8) — which is why it is two-path with a delay rather than one
-  multiplicative envelope. RTTY's ad-hoc `gen_rtty_faded` and PSK31 should both
-  move onto this module; neither has real fading today.
+  multiplicative envelope. RTTY and PSK31 are on it too now
+  (`bench_rtty_fading`, `bench_psk31_fading`) — see §8 for what that found.
 - **`bench_cw_band`** + `cw_band_score_does_not_regress` — the band grid.
 - **`bench_cw_fading`** — fade depth against copy, at fixed SNR.
 - **`tests/cw_capture.rs`** — token recall against the recording, with a

@@ -783,10 +783,33 @@ one above from the first commit.
 **Stage 4 — decode every tone.** Two to four stations sit in every 400 Hz
 passband and the decoder picks one and discards the rest.
 
-**Not CW, but owed:** `gen_rtty_faded` fakes fading with static per-tone
-amplitudes and PSK31 has none at all. Both should move onto
-`decoders::channel`, and both are probably hiding the same class of problem
-this round found in CW.
+**Not CW, but owed. Done.** Both are on `decoders::channel` now
+(`bench_rtty_fading`, `bench_psk31_fading`), and the guess above was half
+right.
+
+RTTY was hiding the same class of problem. A 170 Hz shift straddles the
+coherence bandwidth of every CCIR path, so the two tones fade independently,
+and the discriminator's per-tone max-hold held its reference for 1.5 s —
+long past the point where the tone that is down inverts against the tone that
+is up. `gen_rtty_faded` could not see it, because a static per-tone amplitude
+is exactly what a per-tone AGC is built to absorb. `PEAK_HOLD_S` is 0.3 s on a
+0.15–0.5 s plateau; `CCIR_POOR` at 20 dB went from 58 % to 74 %.
+
+PSK31 was not. Per-symbol normalisation makes it genuinely fade-depth-immune,
+and it holds up on good, moderate and poor paths. It does collapse to 10 % on
+`CCIR_FLUTTER` at every SNR, but that is the mode's limit, not a defect: 5 Hz
+of Doppler decorrelates the phase in about one 31.25 baud symbol, and the
+decoder was measured locking within a hertz and still returning garbage.
+**Do not spend a round on it.** The one genuine wart is the AFC walking 20 Hz
+off on one seed in three while chasing the Doppler, and fixing that would not
+buy a character.
+
+**Also found, unrelated to fading:** `spot_snr` referred its measurement to
+2500 Hz with a hardcoded 12.3 dB — the bandwidth of the *fixed* post-mix
+filter that `POST_MIX_K` had since made adaptive. Every CW spot was going out
+about 4 dB optimistic. Derived from `post_hz` now, with
+`cw_spot_snr_is_calibrated` asking the absolute question that
+`spot_snr_follows_the_band` does not.
 
 ---
 

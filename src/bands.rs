@@ -68,6 +68,19 @@ pub struct Band {
     /// almost every band back on a 192 kS/s span.
     pub dig_start: f64,
     pub dig_end: f64,
+    /// Where CW gives way to the narrowband data modes.
+    ///
+    /// `dig_start..dig_end` bounds everything worth decoding; this splits it.
+    /// Operators keep to the band plan, so a CW slot placed above this is
+    /// almost always pointed at something that is not CW — an SSB signal, a
+    /// data carrier, a beacon's data segment — and the decoder will still
+    /// produce characters from it, because a slicer fed anything at all
+    /// produces characters. Measured over the 20m capture, ten of the
+    /// twenty-seven roster rows sat above this line and not one carried a
+    /// callsign.
+    ///
+    /// From the IARU band plans, which is also where operators get them.
+    pub cw_end: f64,
 }
 
 /// Band the app opens on when nothing says otherwise. An index rather than a
@@ -86,6 +99,7 @@ pub const BANDS: &[Band] = &[
         ifgr: 56.0,
         dig_start: 1_800_000.0,
         dig_end: 1_850_000.0,
+        cw_end: 1_838_000.0,
     },
     Band {
         name: "80m",
@@ -97,6 +111,7 @@ pub const BANDS: &[Band] = &[
         ifgr: 52.0,
         dig_start: 3_500_000.0,
         dig_end: 3_600_000.0,
+        cw_end: 3_570_000.0,
     },
     Band {
         name: "60m",
@@ -108,6 +123,7 @@ pub const BANDS: &[Band] = &[
         ifgr: 56.0,
         dig_start: 5_330_000.0,
         dig_end: 5_405_000.0,
+        cw_end: 5_405_000.0,
     },
     Band {
         name: "40m",
@@ -119,6 +135,7 @@ pub const BANDS: &[Band] = &[
         ifgr: 56.0,
         dig_start: 7_000_000.0,
         dig_end: 7_100_000.0,
+        cw_end: 7_040_000.0,
     },
     Band {
         name: "30m",
@@ -130,6 +147,7 @@ pub const BANDS: &[Band] = &[
         ifgr: 56.0,
         dig_start: 10_100_000.0,
         dig_end: 10_150_000.0,
+        cw_end: 10_130_000.0,
     },
     Band {
         name: "20m",
@@ -141,6 +159,7 @@ pub const BANDS: &[Band] = &[
         ifgr: 48.0,
         dig_start: 14_000_000.0,
         dig_end: 14_150_000.0,
+        cw_end: 14_070_000.0,
     },
     Band {
         name: "17m",
@@ -152,6 +171,7 @@ pub const BANDS: &[Band] = &[
         ifgr: 48.0,
         dig_start: 18_068_000.0,
         dig_end: 18_115_000.0,
+        cw_end: 18_095_000.0,
     },
     Band {
         name: "15m",
@@ -163,6 +183,7 @@ pub const BANDS: &[Band] = &[
         ifgr: 48.0,
         dig_start: 21_000_000.0,
         dig_end: 21_150_000.0,
+        cw_end: 21_070_000.0,
     },
     Band {
         name: "12m",
@@ -174,6 +195,7 @@ pub const BANDS: &[Band] = &[
         ifgr: 48.0,
         dig_start: 24_890_000.0,
         dig_end: 24_930_000.0,
+        cw_end: 24_915_000.0,
     },
     Band {
         name: "10m",
@@ -185,6 +207,7 @@ pub const BANDS: &[Band] = &[
         ifgr: 40.0,
         dig_start: 28_000_000.0,
         dig_end: 28_200_000.0,
+        cw_end: 28_070_000.0,
     },
     Band {
         name: "6m",
@@ -196,6 +219,7 @@ pub const BANDS: &[Band] = &[
         ifgr: 40.0,
         dig_start: 50_240_000.0,
         dig_end: 50_360_000.0,
+        cw_end: 50_100_000.0,
     },
     Band {
         name: "2m",
@@ -207,6 +231,7 @@ pub const BANDS: &[Band] = &[
         ifgr: 56.0,
         dig_start: 144_000_000.0,
         dig_end: 144_300_000.0,
+        cw_end: 144_150_000.0,
     },
     Band {
         name: "WWV",
@@ -217,7 +242,10 @@ pub const BANDS: &[Band] = &[
         rfgr: 0.0,
         ifgr: 48.0,
         dig_start: 9_995_000.0,
+        // WWV is a time station, not an amateur band: nothing here is CW in
+        // the sense the decoder means, so the split does no work.
         dig_end: 10_005_000.0,
+        cw_end: 10_005_000.0,
     },
 ];
 

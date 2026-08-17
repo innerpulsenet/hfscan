@@ -1598,6 +1598,20 @@ impl Decoder for CwDecoder {
     /// How cleanly recent marks fell into the dit and dah buckets. Keying that
     /// is really noise through the slicer has random mark lengths, so they
     /// straddle the boundary and this collapses; well-sent CW sits near 1.
+    ///
+    /// It is a weaker signal than it looks. `quality` is `fit * snr_factor`,
+    /// and `fit` asks how well each mark matches the *tracked* clock — so a
+    /// clock that has collapsed onto noise fits the noise and rates it well.
+    /// On the live capture that produces rows reading 50–80 % and
+    /// transcribing `E E E I E EECEDCO`.
+    ///
+    /// Refusing confidence to a decoder whose clock has run to the 5 or
+    /// 50 WPM stop was tried against that, and measured no better than
+    /// nothing: those clocks wander a few WPM either side of the rail rather
+    /// than sitting on it, so the test almost never fires, and widening it
+    /// until it does is fitting a constant to one capture. What does work on
+    /// those rows is the band plan and a minimum length, both of which live
+    /// in the caller — see `bands::Band::cw_end` and `SignalRow`.
     fn confidence(&self) -> Option<f32> {
         Some(self.cur().quality.clamp(0.0, 1.0))
     }

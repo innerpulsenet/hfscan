@@ -845,6 +845,38 @@ which is the only red line in `bench_replay`. End-to-end is unchanged at
 goes. (PSK31 also flags there intermittently, swinging 53 → 45 MS/s across
 runs on code this work never touched; that one is the machine, not a change.)
 
+**Junk rows in the auto roster.** The largest complaint about the auto pane
+was not missed stations but invented ones: rows of plausible-looking nonsense
+crowding out the real copy. Two things fixed most of it, neither of them in
+the decoder.
+
+*The band plan.* `dig_start..dig_end` bounded everything worth decoding but
+did not say which mode goes where, so CW slots were placed across the data
+and SSB segments. A slicer fed SSB emits characters — that is what a slicer
+does — so each of those became a roster row. `Band::cw_end` splits the span
+per mode. Ten of twenty-seven rows on the capture sat above the CW segment
+and not one carried a callsign; removing them also freed slots that then
+found **KE4WLE**, a station the fleet had never had room for.
+
+*A minimum length.* Every row under five characters was noise, and every row
+carrying a callsign was well over it. `SignalRow::worth_showing` keeps them
+accumulating but off the pane.
+
+Together: **26–28 rows down to 18–19, and spots up from 6 to 7–8.** Less junk
+and more stations, because the junk was consuming the budget.
+
+*Measured and rejected*, so nobody re-derives them:
+
+| Discriminator | Real rows | Junk rows | Verdict |
+|---|---|---|---|
+| unmatched-pattern (`*`) share | 0–6 % | 16–19 % | rejected — NK9G's own row reads 47 % |
+| one-element (E/T) share | 4–41 % | 28–62 % | rejected — no separation |
+| clock railed at the 5/50 WPM stop | — | — | rejected — no measurable effect; railed clocks wander a few WPM off the stop rather than sitting on it, and widening the test until it fires is fitting a constant to one capture |
+
+The medium-length in-band junk that remains does not separate on any content
+measure tried. It is the same frontier §7.10 describes: what is left needs a
+detector that is structurally better, not a threshold.
+
 **CPU, the budget §6 never set.** 1.0 ms per second of audio for four tones
 against 0.4 ms for one — 0.1 % of a core. `bench_cw_cpu` prints it and
 `cw_cost_does_not_grow_on_a_busy_band` measures *growth* rather than absolute

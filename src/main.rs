@@ -197,6 +197,8 @@ const AUTO_LINE: usize = 48;
 /// at 53%, so the floor goes in the gap. See
 /// `decoders::tests::psk31_confidence_separates_copy_from_noise`.
 const COPY_FLOOR: f32 = 0.40;
+/// Characters a held row needs before it earns a line in the decode pane.
+const ROW_MIN_COPY: usize = 5;
 
 /// Longest transcript the auto pane keeps. Rows are fixed-height, so this is
 /// also how far back the pane can be scrolled.
@@ -254,6 +256,21 @@ impl SignalRow {
     }
 
     /// Add what just came off the decoder, keeping the buffer bounded.
+    /// Whether this row has enough copy to be worth a line of the pane.
+    ///
+    /// A row holding one or two characters after a minute is not a station
+    /// being copied badly, it is a slot pointed at something that is not a
+    /// signal. Measured over the 20m capture: every row under five characters
+    /// was noise, and every row carrying a callsign was well over it, so this
+    /// costs nothing that was ever readable.
+    ///
+    /// The row keeps accumulating either way — this decides what is shown,
+    /// not what is kept, so a station that starts slowly appears as soon as
+    /// it has said anything.
+    fn worth_showing(&self) -> bool {
+        self.copy.chars().filter(|c| !c.is_whitespace()).count() >= ROW_MIN_COPY
+    }
+
     fn push_copy(&mut self, text: &str) {
         self.copy.push_str(text);
         self.last_copy = Instant::now();
@@ -1283,7 +1300,9 @@ impl App {
     /// bound — the render clamps the offset to the wrapped length anyway.
     fn transcript_len(&self) -> usize {
         match self.mode {
-            Mode::Auto if self.auto_view == AutoView::Rows => self.rows.len(),
+            Mode::Auto if self.auto_view == AutoView::Rows => {
+                self.rows.iter().filter(|r| r.worth_showing()).count()
+            }
             Mode::Auto => self.decode_log.len(),
             // In FT modes the same offset scrolls the message table.
             Mode::Ft8 | Mode::Ft4 => self.ft_msgs.len(),
@@ -1674,7 +1693,21 @@ impl App {
         // span sized to the digital segment can still reach a little way into
         // the phone portion, and a slot spent trying to read CW out of an SSB
         // signal is a slot not spent on the one below it.
-        let decoded = bands::band_for(self.center).map(|b| (b.dig_start, b.dig_end));
+        // Each mode is only worked where the band plan puts it. A CW slot
+        // above `cw_end` is pointed at SSB, a data carrier or a beacon, and a
+        // slicer fed any of those still emits characters — that is where the
+        // roster's junk rows come from, not from the decoder being weak.
+        let seg = bands::band_for(self.center);
+        let allowed = |kind: identify::Kind, hz: f64| match seg {
+            None => true,
+            Some(b) => {
+                let hi = match kind {
+                    identify::Kind::Cw => b.cw_end,
+                    _ => b.dig_end,
+                };
+                hz >= b.dig_start && hz <= hi
+            }
+        };
         let mut found: Vec<&identify::Ident> = self
             .idents
             .iter()
@@ -1684,10 +1717,7 @@ impl App {
                     identify::Kind::Cw | identify::Kind::Rtty | identify::Kind::Psk31
                 )
             })
-            .filter(|i| {
-                let hz = self.center + i.offset_hz as f64;
-                decoded.is_none_or(|(lo, hi)| hz >= lo && hz <= hi)
-            })
+            .filter(|i| allowed(i.kind, self.center + i.offset_hz as f64))
             .collect();
         found.sort_by(|a, b| {
             b.snr_db
@@ -5409,8 +5439,15 @@ fn signal_rows_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
     let head = HEAD + if show_meta { 13 } else { 0 };
     let copy_width = width.saturating_sub(head).max(8);
 
-    app.rows
-        .iter()
+    let shown: Vec<&SignalRow> = app.rows.iter().filter(|r| r.worth_showing()).collect();
+    if shown.is_empty() {
+        return vec![Line::from(Span::styled(
+            "  age    kHz  mode    sig  speed  copy — nothing readable yet",
+            dim,
+        ))];
+    }
+    shown
+        .into_iter()
         .skip(app.msg_scroll.min(app.rows.len().saturating_sub(1)))
         .take(rows)
         .map(|r| {
@@ -6780,15 +6817,19 @@ mod tests {
     /// to this budget shrank it on exactly the bands that are busiest.
     #[test]
     fn auto_caps_slots_and_prefers_strong_signals() {
-        // Inside 40m's decoded stretch, since signals above it are now left
-        // to the phone operators who put them there.
+        // Inside 40m's *CW* stretch — signals above it are left to the phone
+        // and data operators who put them there, so spreading the test's
+        // signals across the whole decoded span would measure the band plan
+        // rather than the budget.
         let b = super::bands::BANDS
             .iter()
             .find(|b| b.name == "40m")
             .unwrap();
         let mut app = App::new(b.default, b.span, Mode::Auto);
+        let lo = (b.dig_start - b.default) as f32 + 500.0;
+        let step = ((b.cw_end - b.dig_start) as f32 - 1000.0) / 40.0;
         app.idents = (0..40)
-            .map(|i| ident(identify::Kind::Cw, -45_000.0 + i as f32 * 2250.0, i as f32))
+            .map(|i| ident(identify::Kind::Cw, lo + i as f32 * step, i as f32))
             .collect();
         app.reconcile_auto();
         let narrow = app.auto.iter().filter(|s| !s.pinned).count();
@@ -6806,12 +6847,98 @@ mod tests {
              and must not have been squeezed out by the narrowband fleet"
         );
         // The strongest ident was the last one (snr 39), so it must have a slot.
-        let strongest = b.default + (-45_000.0 + 39.0 * 2250.0);
+        let strongest = b.default as f32 + lo + 39.0 * step;
+        let strongest = strongest as f64;
         assert!(
             app.auto
                 .iter()
                 .any(|s| (s.dial_hz - strongest).abs() < 200.0),
             "cap dropped the strongest signal"
+        );
+    }
+
+    /// CW slots stay in the CW segment; data slots may use the whole span.
+    ///
+    /// The band plan is the strongest junk filter this app has. A slicer fed
+    /// SSB, a data carrier or a beacon still emits characters — that is what
+    /// a slicer does — so a CW slot placed above `cw_end` produces a roster
+    /// row of plausible-looking nonsense. Measured over the 20m capture, ten
+    /// of the twenty-seven rows sat above the CW segment and not one carried
+    /// a callsign; removing them also freed slots that then found KE4WLE.
+    #[test]
+    fn cw_slots_keep_to_the_cw_segment() {
+        let b = super::bands::BANDS
+            .iter()
+            .find(|b| b.name == "20m")
+            .unwrap();
+        assert!(b.cw_end < b.dig_end, "the split has to split something");
+        let mut app = App::new(b.default, b.span, Mode::Auto);
+        let at = |hz: f64| (hz - b.default) as f32;
+        // One CW signal in the CW segment, one above it in the data segment,
+        // and a data signal up there too. Both upper ones are in the span.
+        let cw_ok = b.cw_end - 10_000.0;
+        let cw_high = b.cw_end + 20_000.0;
+        assert!(
+            cw_high < b.dig_end && cw_high < b.default + b.span / 2.0,
+            "the high signal must be inside the decoded span to mean anything"
+        );
+        app.idents = vec![
+            ident(identify::Kind::Cw, at(cw_ok), 30.0),
+            ident(identify::Kind::Cw, at(cw_high), 30.0),
+            ident(identify::Kind::Psk31, at(cw_high), 30.0),
+        ];
+        app.reconcile_auto();
+        let cw: Vec<f64> = app
+            .auto
+            .iter()
+            .filter(|s| s.kind == identify::Kind::Cw)
+            .map(|s| s.dial_hz)
+            .collect();
+        assert!(
+            cw.iter().any(|d| (d - cw_ok).abs() < 200.0),
+            "a CW signal inside the CW segment lost its slot: {cw:?}"
+        );
+        assert!(
+            !cw.iter().any(|d| (d - cw_high).abs() < 200.0),
+            "a CW slot was placed above cw_end, where CW is not worked: {cw:?}"
+        );
+        // The data modes are still worked up there, which is the point of
+        // splitting the segment rather than shrinking the span.
+        assert!(
+            app.auto
+                .iter()
+                .any(|s| s.kind == identify::Kind::Psk31 && (s.dial_hz - cw_high).abs() < 200.0),
+            "the split also took the data slot with it"
+        );
+    }
+
+    /// A row holding a character or two is not a station.
+    #[test]
+    fn near_empty_rows_stay_out_of_the_pane() {
+        let mut app = App::new(14_060_000.0, 192_000.0, Mode::Auto);
+        row(&mut app, 14_010_000.0, identify::Kind::Cw, "E", 0);
+        row(&mut app, 14_020_000.0, identify::Kind::Cw, "eo", 0);
+        row(&mut app, 14_030_000.0, identify::Kind::Cw, "CQ DE W1AW K", 0);
+        let rect = ratatui::layout::Rect::new(0, 0, 90, 6);
+        let text: String = super::signal_rows_lines(&app, rect)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("14030.0"), "the real row is missing:\n{text}");
+        assert!(
+            !text.contains("14010.0") && !text.contains("14020.0"),
+            "a row with one or two characters took a line:\n{text}"
+        );
+        // Held, not discarded — a slow station still gets there.
+        assert_eq!(app.rows.len(), 3, "rows must keep accumulating");
+        app.rows[0].push_copy("CQ DE G4XYZ");
+        let text: String = super::signal_rows_lines(&app, rect)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(
+            text.contains("14010.0"),
+            "a row that grew past the bar never appeared:\n{text}"
         );
     }
 
@@ -7851,6 +7978,15 @@ mod tests {
 
     /// Auto decode over the real 20m capture, which is how this app is used.
     ///
+    /// Two content metrics were measured here and rejected, so that nobody
+    /// re-derives them. The share of unmatched patterns (`*`) looks like it
+    /// separates — junk rows ran 16–19 % against 2–6 % for rows carrying a
+    /// callsign — until NK9G's own row came back at 47 %, which is a real
+    /// QRP station fading. The share of one-element characters (E and T)
+    /// does not separate at all: real rows run 4–41 %, junk 28–62 %. Length
+    /// is the only content measure that divides cleanly on this capture, and
+    /// it only divides off the rows that say nothing whatsoever.
+    ///
     /// Everything else about Stage 4 is measured on synthesised bands. This
     /// runs the actual auto path — classifier, slot placement, channelizer,
     /// one CW decoder per slot — over sixty seconds of real 20m and prints
@@ -7887,21 +8023,19 @@ mod tests {
             app.auto.len(),
             app.rows.len()
         );
-        println!("          kHz     mode    sig   speed  copy");
-        for r in &app.rows {
-            let copy: String = r.copy.chars().take(52).collect();
-            // A row on no slot's dial is one Stage 4 recovered behind a lock.
-            let bg = !app
-                .auto
-                .iter()
-                .any(|s| (s.dial_hz - r.dial_hz).abs() < 120.0);
+        println!("          kHz  mode   sig  speed  chars  copy");
+        let shown = app.rows.iter().filter(|r| r.worth_showing()).count();
+        println!("  rows shown: {shown} of {}", app.rows.len());
+        for r in app.rows.iter().filter(|r| r.worth_showing()) {
+            let copy: String = r.copy.chars().take(56).collect();
+            let n = r.copy.chars().filter(|c| !c.is_whitespace()).count();
             println!(
-                "  {:>11.3} {} {:<5} {:>5} {:>7}  {:?}",
+                "  {:>11.3} {:<5} {:>4} {:>6} {:>4}  {:?}",
                 r.dial_hz / 1000.0,
-                if bg { "bg" } else { "  " },
                 r.mode,
                 r.signal,
                 r.speed,
+                n,
                 copy.trim()
             );
         }
@@ -8302,7 +8436,7 @@ mod tests {
                 &mut app,
                 14_000_000.0 + i as f64 * 1000.0,
                 identify::Kind::Cw,
-                "x",
+                "CQ DE W1AW K",
                 0,
             );
         }

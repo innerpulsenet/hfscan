@@ -853,11 +853,56 @@ worked example — `"CE TEST T EWH I ZW B"` → `"CQ TEST DE ZW5B"` — is only
 half reachable, because repairing `ZW B` into `ZW5B` means inventing a
 character inside a callsign. That is the line this module does not cross.
 
-The obvious next increment is positional: `DE` and `CQ` are followed by a
-callsign within a word or two, which is exactly the state machine
-`callscan.rs` already runs. Corrections supported by that context could afford
-a looser distance budget than the blind ones can, and it would let the
-`CORRECT_TO` list grow back without the false positives §9.2 describes. The
-`*`-into-a-guess idea from fldigi's SOM matcher becomes safe at the same
-point, and for the same reason.
+Positional context was the obvious next increment — `DE` and `CQ` are followed
+by a callsign within a word or two, which `callscan.rs` already models. It was
+built and measured and it does not pay; §9.4 records all three variants and
+what they cost.
+
+### 9.4 Rejected: positional context
+
+§9.3 proposed it and it was built three ways. All three measure neutral, so
+none of them is in the tree.
+
+The mechanism: hold one finished word back so a correction can see the word
+after it, then let `CQ` and `DE` be argued for by a following callsign, and
+activity names by a preceding `CQ` — the grammar `callscan.rs` already models.
+
+| Variant | flat | band | capture |
+|---|---:|---:|---:|
+| No context (in tree) | **90.57 %** | **44.03 %** | **88.1 %** |
+| Context widens the element budget by one | 90.73 % | 43.86 % | 88.1 % |
+| Context breaks ties, never widens the budget | 90.42 % | 44.12 % | 88.1 % |
+
+Capture recall is identical to the token in all three. Flat and band move by
+less than the seed noise, in opposite directions, depending on the variant.
+
+**Why it does not pay.** The blind distance-1 rule already takes the cases that
+exist — `CG` → `CQ` is distance 1 and needs no help. Candidates at distance 2
+that context could rescue turn out to be rare in real copy. And the errors
+actually left on the capture are not context problems: `ZWIIB` for `ZW5B` needs
+a character invented *inside* a callsign, and `NK9GFK9G` is a callsign sent
+twice with one letter wrong. Neither is reachable from the neighbours.
+
+**What it cost, which is the part worth remembering.** About 196 lines, and
+five new pieces of decoder state: a one-word hold, a separator flag, an
+end-of-over drain threshold, and `prev_word` / `over_start` tracking. It also
+introduced a bug that only a test caught. Moving the word separator to the
+front of the following word — needed because `text` is drained every block and
+cannot be asked what it ends with — delayed every word reaching `CallScanner`,
+which completes a word only on whitespace. Every spot fired a word late and
+`spot_snr_follows_the_band` failed at 7.0 dB of separation against a bar of 8.
+The fix is to separate the two streams: `text` takes its separator in front,
+`scan` takes one behind. If this is ever rebuilt, that asymmetry is the trap.
+
+**The budget-widening variant was also qualitatively worse**, which the
+aggregate numbers hide: on 14002.51 it turned `S EEE EIATWC5EE` into
+`S DE EIATWC5EE`, manufacturing a procedural word out of what is almost
+certainly noise. A second element of latitude is too much however good the
+context looks — the same finding as §9.2, from a different direction.
+
+**If it is picked up again**, do it for a correction that context genuinely
+decides rather than one it merely agrees with, and have the case in hand before
+building the plumbing. The word-hold machinery is the prerequisite for word
+merging (`C T` → `CQ`, a spurious word gap, which is a real observed error on
+14002.51) and that is a better reason to build it than context was.
 

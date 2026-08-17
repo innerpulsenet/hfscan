@@ -941,12 +941,35 @@ impl CwDecoder {
     }
 
     /// SNR in a 2500 Hz reference bandwidth, for the spot report.
+    ///
+    /// `mark_env/space_env` is measured through the post-mix filter, so it is
+    /// an SNR in *that* filter's noise bandwidth and has to be referred to
+    /// 2500 Hz before anyone else can read it.
+    ///
+    /// That correction used to be a hardcoded 12.3 dB, which is exactly
+    /// `10*log10(2500/147)` — the 147 Hz a four-pole filter at the old fixed
+    /// `POST_MIX_HZ` passes. `POST_MIX_K` later made the corner track the
+    /// keying, down to `POST_MIX_MIN_HZ`, and nothing here noticed: at 20 WPM
+    /// the filter now sits at 60 Hz, the correction should be 16.3 dB, and
+    /// every spot went out about 4 dB optimistic. Measured against
+    /// synthesised signals it read +1.7 dB at 25 dB SNR rising to +4.8 dB at
+    /// 0 dB, against a commit that had calibrated it to 1 dB.
+    ///
+    /// Deriving it from `post_hz` is what stops that happening again — the
+    /// term is not a constant of this decoder, it is a property of a filter
+    /// that moves.
     fn spot_snr(&self) -> f32 {
         if self.mark_env <= 0.0 || self.space_env <= 0.0 {
             return -24.0;
         }
         let ratio = (self.mark_env / self.space_env).max(1.0);
-        (20.0 * ratio.log10() - 1.05 - 12.3 - 3.2).clamp(-24.0, 20.0)
+        // The four-pole cascade passes 147 Hz of noise at a 150 Hz corner.
+        let enbw = self.post_hz * (147.0 / POST_MIX_HZ);
+        let to_2500 = 10.0 * (2500.0 / enbw.max(1.0)).log10();
+        // What is left is empirical, and stays empirical: `mark_env` carries
+        // the noise as well as the signal, so the ratio is (S+N)/N and reads
+        // high, most at the weak end where the correction matters most.
+        (20.0 * ratio.log10() - 1.05 - to_2500 - 3.2).clamp(-24.0, 20.0)
     }
 
     fn clear_lock_state(&mut self) {

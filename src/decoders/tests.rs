@@ -3403,3 +3403,48 @@ fn bench_cw_fading() {
 }
 
 
+
+/// The CW spot report has to stay calibrated to the filter in front of it.
+///
+/// `spot_snr` measures through the post-mix filter and refers the result to
+/// 2500 Hz. `POST_MIX_K` makes that filter's corner track the keying, so the
+/// correction is not a constant — and when it was written as one, adding the
+/// adaptive narrowing silently put every CW spot about 4 dB optimistic, with
+/// `spot_snr_follows_the_band` still passing throughout because it only asks
+/// that strong and weak differ.
+///
+/// This asks the harder question: that the number is right in absolute terms.
+/// A spot is a claim about the path, and one that reads 4 dB high is worse
+/// than no spot at all — it is the difference between a band someone works
+/// and a band someone believes they can work.
+#[test]
+fn cw_spot_snr_is_calibrated() {
+    const MSG: &str = "CQ CQ DE W1AW W1AW K UR RST 599 QTH NEWINGTON DE W1AW K";
+    // The reference bandwidth the report is in, against the one the test
+    // generator specifies its SNR in.
+    let to_2500 = 10.0 * (2500.0f32 / 400.0).log10();
+    for db in [15.0f32, 12.0, 10.0, 8.0, 6.0, 3.0] {
+        let sig = gen_cw(MSG, 20.0, scale_for_snr(db));
+        let mut d = cw::CwDecoder::new(FS);
+        let mut chain = crate::dsp::DecodeChain::new(FS, d.bandwidth(), FS);
+        chain.set_offset(CW_TONE as f64 + d.offset_shift());
+        let mut audio = Vec::new();
+        let mut best = f32::MIN;
+        for chunk in sig.chunks(4096) {
+            chain.process(chunk, &mut audio);
+            d.process(&audio);
+            for m in d.take_messages() {
+                best = best.max(m.snr_db);
+            }
+        }
+        assert!(best > f32::MIN, "{db:.0} dB: no spot to take an SNR from");
+        let want = db - to_2500;
+        assert!(
+            (best - want).abs() <= 2.0,
+            "{db:.0} dB in 400 Hz is {want:.1} dB in 2500 Hz; reported {best:.1} \
+             ({:+.1} dB). It read +4 dB high when the bandwidth correction was \
+             hardcoded against a filter that had since become adaptive.",
+            best - want
+        );
+    }
+}

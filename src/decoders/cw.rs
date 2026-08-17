@@ -131,6 +131,48 @@ const POST_MIX_MIN_HZ: f32 = 60.0;
 const ON_SPAN_K: f32 = 0.40;
 const OFF_SPAN_K: f32 = 0.30;
 
+/// The carrier-SNR ladder, as `peak/floor` ratios.
+///
+/// Three separate commits each added one of these to fix a different bug —
+/// the noise gate, the false-'E' bursts, and gating quality on carrier SNR —
+/// and none of them mentions the others. They were read once as three
+/// inconsistent references to the same quantity, which they are not, so what
+/// they actually are is written down here.
+///
+/// They form a squelch ladder, strict to open and progressively looser to
+/// hold, and the ordering `ARM > HOLD > DROP` is the only part that matters:
+///
+/// - `SNR_ARM` gates the key-up to key-down transition in `step_envelope`,
+///   and *only* that one — `OFF_SPAN_K` releases a mark that has already
+///   started. Below it no mark ever begins, so nothing downstream ever runs.
+/// - `SNR_HOLD` gates emitting a finished letter in `push_symbol`. It is
+///   looser than `SNR_ARM` on purpose and is not redundant with it, because
+///   `peak` decays over 2.5 s and `floor` attacks over 2 while a letter is
+///   being assembled: a letter that armed cleanly can finish under a signal
+///   that has since faded, and this decides how far it may fade first.
+/// - `SNR_DROP` is where `classify_mark` gives up, discards the clock and
+///   returns to warm-up.
+///
+/// `snr_factor` in `classify_mark` is the same ladder read as a ramp rather
+/// than a step, which is why it is derived here rather than written out: it
+/// has to reach full quality exactly where the slicer is willing to arm, and
+/// an independent literal would silently stop doing that the moment
+/// `SNR_ARM` moved.
+///
+/// None of the three has been swept. They are a plausible ladder that
+/// measures no worse than the alternatives tried, not a measured optimum —
+/// if they are ever tuned, tune them against `bench_cw_band`, together.
+const SNR_ARM: f32 = 2.8;
+const SNR_HOLD: f32 = 1.8;
+const SNR_DROP: f32 = 1.5;
+/// The `peak/floor` span over which quality ramps from nothing to full.
+const SNR_RAMP: f32 = SNR_ARM - 1.0;
+// The ordering is the invariant, so it fails the build rather than the band.
+// Inverting any pair silently strands a signal in a state it cannot leave:
+// HOLD above ARM discards letters the slicer was willing to start, and DROP
+// above HOLD re-warms the clock under a signal still good enough to copy.
+const _: () = assert!(SNR_ARM > SNR_HOLD && SNR_HOLD > SNR_DROP && SNR_DROP > 1.0);
+
 /// Cascaded complex one-poles: the post-mix channel filter.
 struct NarrowLpf {
     z: [Complex32; POST_MIX_POLES],
@@ -462,7 +504,7 @@ impl CwDecoder {
         }
         let sym = std::mem::take(&mut self.symbol);
         // Only emit symbols if there is carrier SNR
-        let snr_ok = self.peak > 1.8 * self.floor.max(1e-9);
+        let snr_ok = self.peak > SNR_HOLD * self.floor.max(1e-9);
         if !snr_ok {
             return;
         }
@@ -529,7 +571,7 @@ impl CwDecoder {
             let recent: Vec<f32> = self.marks.iter().copied().collect();
             let gaps: Vec<f32> = Vec::new();
             if morse_clock(&recent, &gaps).is_none() {
-                if self.peak < 1.5 * self.floor.max(1e-9) || self.quality < 0.05 {
+                if self.peak < SNR_DROP * self.floor.max(1e-9) || self.quality < 0.05 {
                     self.symbol.clear();
                     self.warmup.clear();
                     self.warming = true;
@@ -652,7 +694,7 @@ impl CwDecoder {
         } else {
             1.0 - (ratio - 1.0).abs().min(1.0)
         };
-        let snr_factor = ((self.peak / self.floor.max(1e-9) - 1.0) / 1.8).clamp(0.0, 1.0);
+        let snr_factor = ((self.peak / self.floor.max(1e-9) - 1.0) / SNR_RAMP).clamp(0.0, 1.0);
         let sample_q = fit * snr_factor;
 
         let dah_count = self.marks.iter().filter(|&&m| m >= 1.7 * self.dit).count();
@@ -972,7 +1014,7 @@ impl CwDecoder {
         let span = (self.peak - self.floor).max(1e-9);
         let on_thr = self.floor + ON_SPAN_K * span;
         let off_thr = self.floor + OFF_SPAN_K * span;
-        let snr_ok = self.peak > 2.8 * self.floor.max(1e-9);
+        let snr_ok = self.peak > SNR_ARM * self.floor.max(1e-9);
 
         let next = if self.key_down {
             env > off_thr
